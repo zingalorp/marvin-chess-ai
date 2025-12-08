@@ -1,0 +1,25 @@
+# Ignore everything
+*
+
+# Except these files...
+
+# Pre-processing scripts
+!profile_data.py
+!calculate_retention_rates.py
+!visualize_profile.py
+
+# Training scripts
+
+!process_pgn_v2.py
+!train_v2.py
+!dataset_v2.py
+!model_v2.py
+
+!.gitignore
+!README.md
+
+# Configuration files
+!requirements.txt
+
+
+
