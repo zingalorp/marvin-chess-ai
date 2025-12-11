@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", choices=["leela", "deep", "smolgen"], default="smolgen")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
-    parser.add_argument("--warmup", type=float, default=0, help="Fraction of training for LR warmup")
+    parser.add_argument("--warmup-steps", type=int, default=2000, help="Number of warmup steps for LR scheduler")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-wait", type=int, default=2)
     parser.add_argument("--profile-warmup", type=int, default=2)
@@ -349,8 +349,9 @@ def train_one_epoch(
                 elapsed = max(1e-6, time.perf_counter() - log_timer)
                 steps_since = max(1, global_step - last_log_step)
                 it_per_sec = steps_since / elapsed
+                samples_per_sec = it_per_sec * args.batch_size
                 print(
-                    f"[train] step {global_step:,} | {it_per_sec:.2f} it/s | loss {raw_loss.item():.3f} | "
+                    f"[train] step {global_step:,} | {it_per_sec:.2f} it/s ({samples_per_sec:,.0f} samp/s) | loss {raw_loss.item():.3f} | "
                     f"policy {loss_terms['policy'].item():.3f} | value {loss_terms['value'].item():.4f} | "
                     f"top1 {metrics['policy_top1'].item():.3f}"
                 )
@@ -524,22 +525,18 @@ def main() -> None:
     steps_per_epoch = max(1, math.ceil(approx_batches / args.grad_accum_steps))
     total_steps = args.epochs * steps_per_epoch
     
-    if args.warmup > 0:
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=args.lr,
-            total_steps=total_steps,
-            pct_start=args.warmup,
-            anneal_strategy='cos',
-            div_factor=25,
-            final_div_factor=1000,
-        )
-        print(f"[scheduler] OneCycleLR with {args.warmup*100:.0f}% warmup")
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=args.lr / 1000
-        )
-        print("[scheduler] CosineAnnealingLR (no warmup)")
+    # Linear warmup + cosine decay
+    warmup_steps = args.warmup_steps
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        # Cosine decay after warmup
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    print(f"[scheduler] Linear warmup ({warmup_steps} steps) + cosine decay")
     
     scaler = GradScaler(enabled=device.type == "cuda")
 
