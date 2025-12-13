@@ -14,9 +14,16 @@
 !train_v2.py
 !dataset_v2.py
 !model_v2.py
+!model_v2-1.py
+!train_v2-1.py
 
 !.gitignore
 !README.md
+
+# Inference scripts
+!inference/
+!inference/*.py
+
 
 # Configuration files
 !requirements.txt

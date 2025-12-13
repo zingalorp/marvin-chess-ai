@@ -68,8 +68,9 @@ def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
     # Board history: (8, 64) int64
     board_history = torch.from_numpy(sample.board_history).long()
     
-    # Time history: (8,) float32 - normalize by dividing by 60 (minutes)
-    time_history = torch.from_numpy(sample.time_history).float() / 60.0
+    # Time history: (8,) float32 - model expects most-recent first.
+    # Parquet rows from `process_pgn_v2.py` store time_history oldest->newest.
+    time_history = torch.from_numpy(sample.time_history[::-1].copy()).float() / 60.0
     
     # Repetition flags: (8,) float32
     rep_flags = torch.from_numpy(sample.repetition_flags).float()
@@ -114,15 +115,24 @@ def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
             legal_mask[move_idx] = True
     
     # Policy target
+    promo_target = 0
+    promo_file = 0
+    
     if sample.policy_is_resign:
         policy_target = RESIGN_MOVE_INDEX
-        legal_mask[RESIGN_MOVE_INDEX] = True  # Add to legal mask for cross-entropy
     elif sample.policy_is_flag:
         policy_target = FLAG_MOVE_INDEX
-        legal_mask[FLAG_MOVE_INDEX] = True  # Add to legal mask for cross-entropy
     else:
         from_sq, to_sq, promo = sample.policy_move
         policy_target = from_sq * 64 + to_sq
+        promo_target = promo
+        if 56 <= to_sq <= 63:
+            promo_file = to_sq - 56
+
+    # Always unmask Resign/Flag for training so the model learns to suppress them
+    legal_mask[RESIGN_MOVE_INDEX] = True
+    legal_mask[FLAG_MOVE_INDEX] = True
+
     policy_target = torch.tensor(policy_target, dtype=torch.long)
     
     # Value target (regression: 0=loss, 0.5=draw, 1=win)
@@ -136,10 +146,15 @@ def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
     # This makes the target invariant to time control
     # time_spent / clock_before, with 4th root scaling to compress range
     clock_before = max(1.0, sample.active_clock)  # Avoid division by zero
-    time_ratio = sample.time_target / clock_before
-    # Apply 4th root scaling (like v1's encode_time_bin) to compress range
-    # This gives more resolution to quick moves
-    time_target_scaled = time_ratio ** 0.25
+    
+    # Dequantization: Add uniform noise to time_target (which is integer seconds)
+    noise = torch.rand(1).item() - 0.5
+    noisy_time = max(0.0, sample.time_target + noise)
+    
+    time_ratio = noisy_time / clock_before
+    # Apply Square Root scaling (was 4th root) to compress range
+    # Square root is less aggressive at the low end than 4th root, better for noisy data
+    time_target_scaled = time_ratio ** 0.5
     time_target = torch.tensor(time_target_scaled, dtype=torch.float32)
     
     # Time classification target: 256 bins over [0, 1] range of scaled time
@@ -148,19 +163,20 @@ def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
     time_target_cls = torch.tensor(time_bin, dtype=torch.long)
     
     return {
-        "board_history": board_history,      # (8, 64) long
-        "time_history": time_history,        # (8,) float
-        "rep_flags": rep_flags,              # (8,) float
-        "castling": castling,                # (4,) float
-        "ep_mask": ep_mask,                  # (64,) float
-        "scalars": scalars,                  # (8,) float
-        "tc_cat": tc_cat,                    # () long
-        "legal_mask": legal_mask,            # (4098,) bool
-        "policy_target": policy_target,      # () long
-        "y_val": y_val,                      # () float (regression)
-        "y_val_cls": y_val_cls,              # () long (WDL class 0/1/2)
-        "time_target": time_target,          # () float - (time_spent/clock)^0.25
-        "time_target_cls": time_target_cls,  # () long (bin 0-255)
+        "board_history": torch.tensor(sample.board_history, dtype=torch.long),
+        "time_history": time_history,
+        "rep_flags": torch.tensor(sample.repetition_flags, dtype=torch.float32),
+        "castling": torch.tensor(sample.castling_rights, dtype=torch.float32),
+        "ep_mask": ep_mask,
+        "scalars": scalars,
+        "tc_cat": tc_cat,
+        "legal_mask": legal_mask,
+        "policy_target": policy_target,
+        "y_val": y_val,
+        "y_val_cls": y_val_cls,
+        "time_target_cls": time_target_cls,
+        "promo_target": torch.tensor(promo_target, dtype=torch.long),
+        "promo_file": torch.tensor(promo_file, dtype=torch.long),
     }
 
 
@@ -189,6 +205,15 @@ class StreamingDatasetV2(IterableDataset):
         self.shuffle_rows = shuffle_rows
         self.seed = seed
         self.read_batch_rows = read_batch_rows
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        # Used to vary shuffling across epochs while staying deterministic.
+        self.epoch = int(epoch)
+
+    def _epoch_seed(self, base_seed: int) -> int:
+        # Large odd multiplier to avoid small-cycle patterns.
+        return int(base_seed + self.epoch * 1_000_003)
 
     def _iter_files_for_worker(self) -> Iterable[str]:
         worker = get_worker_info()
@@ -201,7 +226,7 @@ class StreamingDatasetV2(IterableDataset):
 
         order = list(files)
         if self.shuffle_files:
-            rng = random.Random(seed)
+            rng = random.Random(self._epoch_seed(seed))
             rng.shuffle(order)
         return order
 
@@ -218,7 +243,7 @@ class StreamingDatasetV2(IterableDataset):
 
         # Deterministic RNG for this file
         file_hash = int(hashlib.md5(file_path.encode("utf-8")).hexdigest(), 16)
-        rng = np.random.default_rng(self.seed + (file_hash % 1000000))
+        rng = np.random.default_rng(self._epoch_seed(self.seed) + (file_hash % 1000000))
 
         for batch in parquet_file.iter_batches(batch_size=self.read_batch_rows):
             batch_len = batch.num_rows
@@ -363,6 +388,39 @@ def build_dataloaders_v2(
     return train_loader, val_loader
 
 
+def _split_files_deterministic(files: List[Path], val_fraction: float = 0.05) -> Tuple[List[Path], List[Path]]:
+    """Split files into train/val using deterministic hash-based assignment.
+    
+    Each file is assigned to train or val based on the MD5 hash of its name.
+    This ensures:
+    1. Repeatability - same files always go to same split
+    2. No data leakage - files are never in both splits
+    3. Approximate balance - hash distribution is uniform
+    
+    Args:
+        files: List of parquet files to split
+        val_fraction: Fraction of files to use for validation (default 5%)
+    
+    Returns:
+        (train_files, val_files) tuple
+    """
+    train_files = []
+    val_files = []
+    
+    for f in files:
+        # Hash the filename (not full path) for determinism
+        file_hash = int(hashlib.md5(f.name.encode('utf-8')).hexdigest(), 16)
+        # Use modulo to get a value in [0, 1)
+        hash_val = (file_hash % 100000) / 100000.0
+        
+        if hash_val < val_fraction:
+            val_files.append(f)
+        else:
+            train_files.append(f)
+    
+    return train_files, val_files
+
+
 def create_dataloader_v2(
     data_dir: str,
     split: str = "train",
@@ -372,13 +430,37 @@ def create_dataloader_v2(
     shuffle: bool = None,
     pin_memory: bool = True,
     prefetch_factor: int = None,
+    val_fraction: float = 0.05,
 ) -> DataLoader:
-    """Create a single dataloader for a split."""
+    """Create a single dataloader for a split.
     
-    split_dir = Path(data_dir) / split
-    files = sorted(split_dir.glob("*.parquet"))
+    Now splits the training data deterministically instead of using separate directories.
     
-    print(f"[dataset_v2] Found {len(files)} {split} files")
+    Args:
+        data_dir: Root directory containing train/ subdirectory
+        split: 'train' or 'val' - determines which split to load
+        val_fraction: Fraction of files to use for validation (default 5%)
+        Other args: standard DataLoader configuration
+    """
+    
+    # Always load from train directory and split deterministically
+    train_dir = Path(data_dir) / "train"
+    all_files = sorted(train_dir.glob("*.parquet"))
+    
+    if len(all_files) == 0:
+        raise FileNotFoundError(f"No parquet files found in {train_dir}")
+    
+    # Split files deterministically
+    train_files, val_files = _split_files_deterministic(all_files, val_fraction)
+    
+    if split == "train":
+        files = train_files
+    elif split == "val":
+        files = val_files
+    else:
+        raise ValueError(f"Unknown split: {split}. Use 'train' or 'val'.")
+    
+    print(f"[dataset_v2] Split: {split} | Files: {len(files)}/{len(all_files)} ({len(files)/len(all_files)*100:.1f}%)")
     
     is_train = split == "train"
     should_shuffle = shuffle if shuffle is not None else is_train
@@ -400,10 +482,23 @@ def create_dataloader_v2(
     )
 
 
-def count_samples(data_dir: str, split: str = "train") -> int:
-    """Estimate number of samples in a split by reading parquet metadata."""
-    split_dir = Path(data_dir) / split
-    files = sorted(split_dir.glob("*.parquet"))
+def count_samples(data_dir: str, split: str = "train", val_fraction: float = 0.05) -> int:
+    """Estimate number of samples in a split by reading parquet metadata.
+    
+    Now uses deterministic file splitting instead of separate directories.
+    """
+    train_dir = Path(data_dir) / "train"
+    all_files = sorted(train_dir.glob("*.parquet"))
+    
+    # Split files the same way as create_dataloader_v2
+    train_files, val_files = _split_files_deterministic(all_files, val_fraction)
+    
+    if split == "train":
+        files = train_files
+    elif split == "val":
+        files = val_files
+    else:
+        raise ValueError(f"Unknown split: {split}")
     
     total = 0
     for f in files:
