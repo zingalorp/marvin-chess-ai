@@ -18,6 +18,7 @@ class PolicyOutput:
     policy_prob: float
     is_resign: bool = False
     is_flag: bool = False
+    stats: Optional[dict] = None
 
 
 def _mirror_square(sq: int) -> int:

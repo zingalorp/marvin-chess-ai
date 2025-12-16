@@ -16,14 +16,42 @@ import time
 # Settings (Defaults)
 game_settings = {
     "temperature": 0.9,
-    "time_temperature": 1.0,
+    "time_temperature": 0.6,
     "top_p": 0.95,
-    "time_top_p": 0.95,
+    "time_top_p": 0.75,
     "human_elo": 1900,
     "engine_elo": 1900,
     "human_color": chess.WHITE,
     "ponder": False,
-    "use_real_time": False
+    "use_real_time": False,
+    "use_mode_time": False,
+    "use_expected_time": False,
+
+    # MCTS (disabled by default)
+    "use_mcts": False,
+    "mcts_simulations": 256,
+    "mcts_c_puct": 2.0,
+    "mcts_max_children": 48,
+    "mcts_root_dirichlet_alpha": 0.0,
+    "mcts_root_exploration_frac": 0.0,
+    "mcts_final_temperature": 0.0,
+    "mcts_max_depth": 96,
+    "mcts_adaptive": False,
+    "mcts_adaptive_scale": 500.0,
+    "show_mcts_stats": False,
+
+    # Overlays
+
+    # Attention viz
+    "show_attention": False,
+
+    # Attention viz settings
+    # - attn_layer: -1 => aggregate across all layers, else 0..N-1
+    # - attn_head_agg: 'avg' | 'max' | 'smolgen'
+    # - attn_focus: 'outbound' | 'inbound' (frontend rendering)
+    "attn_layer": -1,
+    "attn_head_agg": "avg",
+    "attn_focus": "outbound",
 }
 
 # Fixed Context
@@ -45,12 +73,13 @@ if str(repo_root) not in sys.path:
 from inference.model_loader import load_chessformer_v2
 from inference.encoding import ContextOptions, build_history_from_position, canonicalize, make_model_batch
 from inference.chessformer_policy import choose_move
+from inference.mcts import MCTSSettings, mcts_choose_move
 from inference.sampling import sample_from_logits
 
 print("Loading model...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-model_path = repo_root / 'checkpoints/chessformer_v2_smolgen_best2.pt'
+model_path = repo_root / 'checkpoints/chessformer_v2_smolgen_best.pt'
 if not model_path.exists():
     print(f"Warning: Model not found at {model_path}.")
 
@@ -64,6 +93,20 @@ model = loaded.model
 model.eval()
 print("Model loaded.")
 
+def _count_attn_layers(model: torch.nn.Module) -> int:
+    n = 0
+    for mod in model.modules():
+        if hasattr(mod, "last_attn_probs"):
+            n += 1
+    return n
+
+ATTN_NUM_LAYERS = _count_attn_layers(model)
+ATTN_HAS_SMOLGEN = bool(getattr(model, "smolgen", None) is not None)
+
+# Expose read-only attention metadata to the frontend via the settings blob.
+game_settings["attn_num_layers"] = int(ATTN_NUM_LAYERS)
+game_settings["attn_has_smolgen"] = bool(ATTN_HAS_SMOLGEN)
+
 # ==========================================
 # 2. ANALYSIS LOGIC
 # ==========================================
@@ -71,6 +114,82 @@ PROMO_INDEX = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
 rng = np.random.default_rng(67)
 
 def _mirror_square(sq: int) -> int: return sq ^ 56
+
+
+def _extract_attention_64(
+    model: torch.nn.Module,
+    *,
+    real_turn: chess.Color,
+    layer: int,
+    head_agg: str,
+) -> list[float] | None:
+    """Extract a 64x64 attention matrix according to visualization settings.
+
+    Returns flattened list length 4096 in *real* board square indexing (python-chess: a1=0..h8=63).
+    Requires the model's attention modules to have `last_attn_probs` populated from a just-completed forward.
+
+    head_agg:
+      - 'avg': average over heads (and over layers if layer == -1)
+      - 'max': elementwise max over heads (and over layers if layer == -1)
+      - 'smolgen': use smolgen bias only (softmax over bias), averaged over heads
+    """
+
+    head_agg = str(head_agg or "avg").lower().strip()
+    if head_agg not in ("avg", "max", "smolgen"):
+        head_agg = "avg"
+
+    # Smolgen-only view (pure dynamic bias).
+    if head_agg == "smolgen":
+        bias_h: torch.Tensor | None = None
+        for mod in model.modules():
+            b = getattr(mod, "last_smolgen_bias", None)
+            if b is None:
+                continue
+            if not torch.is_tensor(b) or b.ndim != 4 or b.shape[-2:] != (64, 64):
+                continue
+            bias_h = b[0].float()  # (H, 64, 64)
+            break
+
+        if bias_h is None:
+            return None
+
+        # Convert smolgen logits to attention probabilities.
+        probs_h = torch.softmax(bias_h, dim=-1)  # (H, 64, 64)
+        mat = probs_h.mean(dim=0)  # (64, 64)
+    else:
+        layers_h: list[torch.Tensor] = []
+        for mod in model.modules():
+            attn = getattr(mod, "last_attn_probs", None)
+            if attn is None:
+                continue
+            if not torch.is_tensor(attn) or attn.ndim != 4 or attn.shape[-2:] != (64, 64):
+                continue
+            layers_h.append(attn[0].float())  # (H, 64, 64)
+
+        if not layers_h:
+            return None
+
+        if int(layer) >= 0:
+            idx = int(layer)
+            if idx >= len(layers_h):
+                idx = len(layers_h) - 1
+            layers_h = [layers_h[idx]]
+
+        if head_agg == "avg":
+            mats = [a.mean(dim=0) for a in layers_h]  # (64,64) per layer
+            mat = torch.stack(mats, dim=0).mean(dim=0)
+        else:  # 'max'
+            mats = [a.max(dim=0).values for a in layers_h]  # (64,64) per layer
+            mat = mats[0]
+            for m in mats[1:]:
+                mat = torch.maximum(mat, m)
+
+    # Model uses canonical boards (mirrors when black-to-move). Convert back to real-square indexing.
+    if real_turn == chess.BLACK:
+        perm = torch.tensor([_mirror_square(i) for i in range(64)], device=mat.device, dtype=torch.long)
+        mat = mat.index_select(0, perm).index_select(1, perm)
+
+    return mat.detach().cpu().reshape(-1).tolist()
 def _softmax_1d(x: torch.Tensor) -> torch.Tensor:
     x = x.float() - torch.max(x)
     return torch.softmax(x, dim=0)
@@ -176,6 +295,15 @@ def analyze_position(
             (m_logits, v_raw, v_cls, v_err, t_logits, ss_logits, p_logits) = model(batch, return_promo=True)
             (m_logits_rf, *_rest) = model(batch_for_rf, return_promo=False)
 
+    attention64 = None
+    if bool(game_settings.get("show_attention", False)):
+        attention64 = _extract_attention_64(
+            model,
+            real_turn=board.turn,
+            layer=int(game_settings.get("attn_layer", -1)),
+            head_agg=str(game_settings.get("attn_head_agg", "avg")),
+        )
+
     m_logits = m_logits[0]
     promo_p = torch.softmax(p_logits[0].float(), dim=-1)
     
@@ -219,7 +347,7 @@ def analyze_position(
             real_mv = _canonical_to_real_move(mv, real_turn)
             try: label = board.san(real_mv)
             except: label = real_mv.uci()
-            policy_display.append({'label': label, 'prob': prob})
+            policy_display.append({'label': label, 'prob': prob, 'uci': real_mv.uci()})
 
     wdl = _softmax_1d(v_cls[0])
     
@@ -231,6 +359,14 @@ def analyze_position(
     # Time Distribution (Top X%)
     target_time_p = float(game_settings.get('time_top_p', 0.95))
     t_probs = time_p.cpu().numpy()
+
+    # Calculate raw stats (Temp=1.0) for "True" Model Opinion
+    t_probs_raw = torch.softmax(t_logits[0].float(), dim=0).cpu().numpy()
+    
+    # Mode (Argmax)
+    mode_bin = np.argmax(t_probs_raw)
+    mode_time_s = _time_bin_to_seconds(mode_bin, active_clock_s)
+
     t_sorted_idx = np.argsort(t_probs)[::-1]
     t_cumsum = np.cumsum(t_probs[t_sorted_idx])
     t_cutoff = np.searchsorted(t_cumsum, target_time_p) + 1
@@ -238,21 +374,42 @@ def analyze_position(
     t_active_idx.sort()
     
     time_dist = []
+    expected_time_s = 0.0
+    total_prob_mass = 0.0
+    
     for idx in t_active_idx:
         sec = _time_bin_to_seconds(idx, active_clock_s)
         prob = float(t_probs[idx])
         time_dist.append({'sec': sec, 'prob': prob})
+        
+        # Accumulate for expected time calculation (weighted by prob)
+        expected_time_s += prob * sec
+        total_prob_mass += prob
+        
+    # Normalize expected time by the total probability mass of the top-p subset
+    if total_prob_mass > 0:
+        expected_time_s /= total_prob_mass
 
     # Sample a time bin (like we sample moves), but with fixed temperature=1.
     # We re-use the app's top_p setting to avoid sampling extreme tails.
-    time_sample = sample_from_logits(
-        t_logits[0],
-        temperature=T_time,
-        top_p=target_time_p,
-        rng=rng,
-    )
-    time_sample_bin = int(time_sample.move_index)
-    time_sample_s = _time_bin_to_seconds(time_sample_bin, active_clock_s)
+    if game_settings.get("use_mode_time", False):
+        # Use Mode (Argmax) for deterministic behavior
+        time_sample_s = mode_time_s
+        time_sample_prob = float(t_probs_raw[mode_bin])
+    elif game_settings.get("use_expected_time", False):
+        # Use Expected Value (Mean of Top-P)
+        time_sample_s = expected_time_s
+        time_sample_prob = 1.0 # It's an aggregate, not a single bin prob
+    else:
+        time_sample = sample_from_logits(
+            t_logits[0],
+            temperature=T_time,
+            top_p=target_time_p,
+            rng=rng,
+        )
+        time_sample_bin = int(time_sample.move_index)
+        time_sample_s = _time_bin_to_seconds(time_sample_bin, active_clock_s)
+        time_sample_prob = float(time_sample.prob)
 
     # Note: `m_logits` is masked by legal_mask, which keeps resign/flag at -inf.
     # Use the analysis forward-pass logits where resign/flag are unmasked.
@@ -277,7 +434,10 @@ def analyze_position(
         'time_dist': time_dist,
         'time_top_p': target_time_p,
         'time_sample_s': float(time_sample_s),
-        'time_sample_prob': float(time_sample.prob),
+        'time_sample_prob': time_sample_prob,
+        'expected_time_s': expected_time_s,
+        'mode_time_s': mode_time_s,
+        'attention64': attention64,
     }
 
 def format_stats_html(data: dict) -> str:
@@ -297,21 +457,56 @@ def format_stats_html(data: dict) -> str:
     
     sampled = data.get('time_sample_s', None)
     sampled_prob = data.get('time_sample_prob', None)
+    expected_t = data.get('expected_time_s', None)
+    mode_t = data.get('mode_time_s', None)
     
     time_dist = data.get('time_dist', [])
     if time_dist:
         max_p = max(d['prob'] for d in time_dist) if time_dist else 1.0
         bars = []
-        for item in time_dist:
+        
+        # Find closest bin to mode_t to highlight it
+        mode_idx = -1
+        if mode_t is not None:
+            min_diff = float('inf')
+            for i, item in enumerate(time_dist):
+                diff = abs(item['sec'] - mode_t)
+                if diff < min_diff:
+                    min_diff = diff
+                    mode_idx = i
+
+        for i, item in enumerate(time_dist):
             h = (item['prob'] / max_p) * 100
-            bars.append(f"<div title='{item['sec']:.1f}s ({item['prob']:.1%})' style='flex:1; background:#2196F3; height:{h}%; border-radius:1px 1px 0 0; min-width:2px;'></div>")
+            color = '#2196F3'
+            if i == mode_idx:
+                color = '#ffeb3b' # Yellow for Mode
+            bars.append(f"<div title='{item['sec']:.1f}s ({item['prob']:.1%})' style='flex:1; background:{color}; height:{h}%; border-radius:1px 1px 0 0; min-width:2px;'></div>")
         
         start_t = time_dist[0]['sec']
         end_t = time_dist[-1]['sec']
         
+        marker_html = ""
+        # Show Expected marker (Orange, dashed)
+        if expected_t is not None:
+            closest_i = -1
+            min_diff = float('inf')
+            for i, item in enumerate(time_dist):
+                diff = abs(item['sec'] - expected_t)
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_i = i
+            
+            if closest_i >= 0:
+                N = len(time_dist)
+                pct = ((closest_i + 0.5) / N) * 100
+                marker_html += f"<div style='position:absolute; left:{pct}%; bottom:0; height:100%; width:1px; border-left:1px dashed #ff9800; opacity:0.9; pointer-events:none; z-index:9;' title='Expected: {expected_t:.1f}s'></div>"
+
         graph_html = f"""
-        <div style="display:flex; align-items:flex-end; height:60px; gap:1px; margin-top:8px; background:#111; padding:4px; border-radius:4px;">
-            {"".join(bars)}
+        <div style="position:relative; height:60px; margin-top:8px; background:#111; padding:4px; border-radius:4px;">
+            <div style="display:flex; align-items:flex-end; height:100%; gap:1px;">
+                {"".join(bars)}
+            </div>
+            {marker_html}
         </div>
         <div style="display:flex; justify-content:space-between; font-size:10px; color:#666; margin-top:2px; padding:0 2px;">
             <span>{start_t:.1f}s</span>
@@ -321,7 +516,12 @@ def format_stats_html(data: dict) -> str:
         
         sampled_txt = ""
         if sampled is not None:
-            sampled_txt = f"<div class='sub'>Sampled: <b style='color:#eee'>{sampled:.1f}s</b> <span style='color:#666'>({sampled_prob:.1%})</span></div>"
+            sampled_txt = f"<div class='sub'>Sampled: <b style='color:#eee'>{sampled:.1f}s</b> <span style='color:#666'>({sampled_prob:.1%})</span>"
+            if mode_t is not None:
+                sampled_txt += f" | Mode: <b style='color:#ffeb3b'>{mode_t:.1f}s</b>"
+            if expected_t is not None:
+                sampled_txt += f" | Exp: <span style='color:#ff9800'>{expected_t:.1f}s</span>"
+            sampled_txt += "</div>"
             
         time_top_p = data.get('time_top_p', 0.95)
         time_html = f"<div class='panel'><h3>Time Distribution ({time_top_p:.0%})</h3>{sampled_txt}{graph_html}</div>"
@@ -337,6 +537,57 @@ def format_stats_html(data: dict) -> str:
     </div>
     """
 
+def format_mcts_stats_html(stats: dict) -> str:
+    root_val = stats.get("root_value", 0.0)
+    children = stats.get("children", [])
+    
+    # Root Value (Static)
+    val_html = f"<div class='panel'><h3>MCTS Static Value</h3><div class='big-val'>{root_val:+.2f}</div></div>"
+    
+    # Children List
+    rows = ""
+    max_visits = children[0]['visits'] if children else 1
+    
+    # Header
+    rows += """
+    <div class='row' style='font-size:10px; color:#888; border-bottom:1px solid #333; padding-bottom:2px; margin-bottom:4px;'>
+        <span style='width:40px;'>Move</span>
+        <span style='flex:1;'>Visits</span>
+        <span style='width:30px; text-align:right;'>N</span>
+        <span style='width:40px; text-align:right;'>Q</span>
+        <span style='width:30px; text-align:right;'>P</span>
+    </div>
+    """
+
+    for child in children:
+        move = child['move']
+        visits = child['visits']
+        q = child['q']
+        prior = child['prior']
+        
+        # Bar for visits
+        width = (visits / max_visits) * 100
+        bar = f"<div style='background:#4caf50; width:{width}%; height:100%;'></div>"
+        
+        rows += f"""
+        <div class='row' style='font-size:11px; gap:4px;'>
+            <span class='lbl' style='width:40px; font-family:monospace;'>{move}</span>
+            <div class='bar-bg' style='flex:1;'>{bar}</div>
+            <span class='val' style='width:30px; text-align:right;'>{visits}</span>
+            <span class='val' style='width:40px; text-align:right; color:#aaa;'>{q:+.2f}</span>
+            <span class='val' style='width:30px; text-align:right; color:#666;'>{prior:.0%}</span>
+        </div>
+        """
+        
+    list_html = f"<div class='panel'><h3>MCTS Search ({len(children)})</h3><div class='policy-scroll' style='max-height:250px;'>{rows}</div></div>"
+    
+    return f"""
+    <div class="stats-grid">
+        <div style="grid-column: span 2">{list_html}</div>
+        {val_html}
+    </div>
+    """
+
 # ==========================================
 # 3. WEB SERVER & STATE
 # ==========================================
@@ -345,8 +596,15 @@ app = Flask(__name__)
 
 game_state = {
     "history": [], 
-    "cursor": 0
+    "cursor": 0,
+    # Cache per-position sampled time for the *current* position.
+    # Key: cursor index, Value: {fen, time_temperature, time_top_p, time_sample_s, time_sample_prob}
+    "pos_cache": {},
 }
+
+
+def _clear_pos_cache() -> None:
+    game_state["pos_cache"] = {}
 
 def get_board_at_cursor():
     board = chess.Board()
@@ -372,6 +630,47 @@ def prepare_response(board):
         opponent_clock_s=float(clocks[not board.turn]),
         time_history_s=time_hist,
     )
+
+    # Persist the sampled time for this position so navigating away/back doesn't resample.
+    # - If we're in history, show the sampled time that was *actually used* for the next move.
+    # - If we're at the latest position, cache the sampled time for the current position.
+    if cursor < len(game_state["history"]):
+        hist_item = game_state["history"][cursor]
+        if "pred_time_s" in hist_item:
+            current_stats["time_sample_s"] = float(hist_item["pred_time_s"])
+        if "pred_time_prob" in hist_item:
+            current_stats["time_sample_prob"] = float(hist_item["pred_time_prob"])
+    else:
+        cache = game_state.get("pos_cache", {})
+        entry = cache.get(cursor)
+        meta = {
+            "fen": fen,
+            "time_temperature": float(game_settings.get("time_temperature", 1.0)),
+            "time_top_p": float(game_settings.get("time_top_p", 0.95)),
+        }
+        if (
+            entry
+            and entry.get("fen") == meta["fen"]
+            and float(entry.get("time_temperature", -1.0)) == meta["time_temperature"]
+            and float(entry.get("time_top_p", -1.0)) == meta["time_top_p"]
+        ):
+            current_stats["time_sample_s"] = float(entry.get("time_sample_s", current_stats.get("time_sample_s", 0.0)))
+            current_stats["time_sample_prob"] = float(entry.get("time_sample_prob", current_stats.get("time_sample_prob", 0.0)))
+        else:
+            cache[cursor] = {
+                **meta,
+                "time_sample_s": float(current_stats.get("time_sample_s", 0.0)),
+                "time_sample_prob": float(current_stats.get("time_sample_prob", 0.0)),
+            }
+            game_state["pos_cache"] = cache
+
+    # If we are reviewing history, use the originally sampled time for this move
+    if cursor < len(game_state["history"]):
+        hist_item = game_state["history"][cursor]
+        if 'pred_time_s' in hist_item:
+            current_stats['time_sample_s'] = float(hist_item['pred_time_s'])
+        if 'pred_time_prob' in hist_item:
+            current_stats['time_sample_prob'] = float(hist_item['pred_time_prob'])
 
     # Attach display clocks in human/engine terms.
     human_color = game_settings["human_color"]
@@ -441,6 +740,7 @@ def prepare_response(board):
         "max_cursor": len(game_state["history"]),
         "is_game_over": board.is_game_over(),
         "result": board.result() if board.is_game_over() else "",
+        "attention64": current_stats.get("attention64"),
         "settings": game_settings
     })
 
@@ -471,6 +771,63 @@ def update_settings():
         
     if 'use_real_time' in data:
         game_settings['use_real_time'] = bool(data['use_real_time'])
+
+    if 'use_mode_time' in data:
+        game_settings['use_mode_time'] = bool(data['use_mode_time'])
+
+    if 'use_expected_time' in data:
+        game_settings['use_expected_time'] = bool(data['use_expected_time'])
+
+    # MCTS
+    if 'use_mcts' in data:
+        game_settings['use_mcts'] = bool(data['use_mcts'])
+    if 'mcts_simulations' in data:
+        game_settings['mcts_simulations'] = int(float(data['mcts_simulations']))
+    if 'mcts_c_puct' in data:
+        game_settings['mcts_c_puct'] = float(data['mcts_c_puct'])
+    if 'mcts_max_children' in data:
+        game_settings['mcts_max_children'] = int(float(data['mcts_max_children']))
+    if 'mcts_root_dirichlet_alpha' in data:
+        game_settings['mcts_root_dirichlet_alpha'] = float(data['mcts_root_dirichlet_alpha'])
+    if 'mcts_root_exploration_frac' in data:
+        game_settings['mcts_root_exploration_frac'] = float(data['mcts_root_exploration_frac'])
+    if 'mcts_final_temperature' in data:
+        game_settings['mcts_final_temperature'] = float(data['mcts_final_temperature'])
+    if 'mcts_max_depth' in data:
+        game_settings['mcts_max_depth'] = int(float(data['mcts_max_depth']))
+    if 'mcts_adaptive' in data:
+        game_settings['mcts_adaptive'] = bool(data['mcts_adaptive'])
+    if 'mcts_adaptive_scale' in data:
+        game_settings['mcts_adaptive_scale'] = float(data['mcts_adaptive_scale'])
+    if 'show_mcts_stats' in data:
+        game_settings['show_mcts_stats'] = bool(data['show_mcts_stats'])
+    if 'show_attention' in data:
+        game_settings['show_attention'] = bool(data['show_attention'])
+
+    if 'attn_layer' in data:
+        try:
+            game_settings['attn_layer'] = int(float(data['attn_layer']))
+        except Exception:
+            game_settings['attn_layer'] = int(game_settings.get('attn_layer', -1))
+
+    if 'attn_head_agg' in data:
+        v = str(data['attn_head_agg']).lower().strip()
+        if v not in ('avg', 'max', 'smolgen'):
+            v = 'avg'
+        # If smolgen is unavailable, fall back to avg.
+        if v == 'smolgen' and not bool(game_settings.get('attn_has_smolgen', False)):
+            v = 'avg'
+        game_settings['attn_head_agg'] = v
+
+    if 'attn_focus' in data:
+        v = str(data['attn_focus']).lower().strip()
+        if v not in ('outbound', 'inbound'):
+            v = 'outbound'
+        game_settings['attn_focus'] = v
+
+    # Sampling-related settings changes should reset the per-position sampled-time cache.
+    if any(k in data for k in ('time_temperature', 'time_top_p', 'use_real_time', 'use_mode_time', 'use_expected_time')):
+        _clear_pos_cache()
     
     print(f"DEBUG: Settings Updated: Ponder={game_settings.get('ponder')}, RealTime={game_settings.get('use_real_time')}")
 
@@ -510,6 +867,7 @@ def _play_engine_move(board):
     )
     stats_html = format_stats_html(engine_stats)
     engine_pred_time_s = float(engine_stats.get("time_sample_s", 0.0))
+    engine_pred_time_prob = float(engine_stats.get("time_sample_prob", 0.0))
     
     # 2. Ponder (Wait)
     if game_settings.get("ponder", False):
@@ -522,14 +880,46 @@ def _play_engine_move(board):
         active_inc_s=INC_S, opponent_inc_s=INC_S,
         halfmove_clock=int(board.halfmove_clock),
     )
-    _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
-    
-    out = choose_move(
-        model=model, board=board, board_history=bh, repetition_flags=rf,
-        ctx=ctx, temperature=game_settings['temperature'], top_p=game_settings['top_p'], 
-        time_history_s=time_hist_engine,
-        device=loaded.device, rng=rng
-    )
+    if bool(game_settings.get("use_mcts", False)):
+        sims = int(game_settings.get("mcts_simulations", 128))
+        cpuct = float(game_settings.get("mcts_c_puct", 1.5))
+        
+        if bool(game_settings.get("mcts_adaptive", False)):
+            scale = float(game_settings.get("mcts_adaptive_scale", 100.0))
+            # Adaptive Logic:
+            # Simulations = scale * predicted_time
+            # C_PUCT = base + (predicted_time / 20.0)
+            sims = max(16, int(scale * engine_pred_time_s))
+            cpuct = min(6.0, cpuct + (engine_pred_time_s / 20.0))
+
+        mcts_settings = MCTSSettings(
+            simulations=sims,
+            c_puct=cpuct,
+            max_children=int(game_settings.get("mcts_max_children", 48)),
+            max_depth=int(game_settings.get("mcts_max_depth", 96)),
+            root_dirichlet_alpha=float(game_settings.get("mcts_root_dirichlet_alpha", 0.0)),
+            root_exploration_frac=float(game_settings.get("mcts_root_exploration_frac", 0.0)),
+            final_temperature=float(game_settings.get("mcts_final_temperature", 0.0)),
+        )
+        out = mcts_choose_move(
+            model=model,
+            board=board,
+            ctx=ctx,
+            time_history_s=time_hist_engine,
+            device=loaded.device,
+            settings=mcts_settings,
+            rng=rng,
+        )
+        if out.stats and game_settings.get("show_mcts_stats", False):
+            stats_html = format_mcts_stats_html(out.stats)
+    else:
+        _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
+        out = choose_move(
+            model=model, board=board, board_history=bh, repetition_flags=rf,
+            ctx=ctx, temperature=game_settings['temperature'], top_p=game_settings['top_p'],
+            time_history_s=time_hist_engine,
+            device=loaded.device, rng=rng
+        )
     
     if out.is_resign:
         chosen_txt = "Resigns"
@@ -538,6 +928,7 @@ def _play_engine_move(board):
         game_state["history"].append({
             'uci': 'resign',
             'pred_time_s': engine_pred_time_s,
+            'pred_time_prob': engine_pred_time_prob,
             'prev_stats_html': full_prev_html
         })
     elif out.is_flag:
@@ -547,6 +938,7 @@ def _play_engine_move(board):
         game_state["history"].append({
             'uci': 'flag',
             'pred_time_s': engine_pred_time_s,
+            'pred_time_prob': engine_pred_time_prob,
             'prev_stats_html': full_prev_html
         })
     else:
@@ -562,6 +954,7 @@ def _play_engine_move(board):
         game_state["history"].append({
             'uci': out.move.uci(),
             'pred_time_s': engine_pred_time_s,
+            'pred_time_prob': engine_pred_time_prob,
             'prev_stats_html': full_prev_html
         })
         game_state["cursor"] += 1
@@ -587,6 +980,7 @@ def make_move():
 
         if move in board.legal_moves:
             game_state["history"] = game_state["history"][:game_state["cursor"]]
+            _clear_pos_cache()
 
             # Predict human move time from current position (top-1 bin).
             moves_uci_before = get_uci_list_at_cursor()
@@ -603,13 +997,16 @@ def make_move():
             
             if game_settings.get("use_real_time", False) and elapsed_s is not None:
                 human_pred_time_s = float(elapsed_s)
+                human_pred_time_prob = 1.0
             else:
                 human_pred_time_s = float(human_stats.get("time_sample_s", 0.0))
+                human_pred_time_prob = float(human_stats.get("time_sample_prob", 0.0))
             
             board.push(move)
             game_state["history"].append({
                 'uci': move.uci(),
                 'pred_time_s': human_pred_time_s,
+                'pred_time_prob': human_pred_time_prob,
                 'prev_stats_html': f"<div style='padding:10px; color:#aaa'>Human played <b>{board.pop().uci()}</b> ({human_pred_time_s:.1f}s)</div>"
             })
             board.push(move)
@@ -637,6 +1034,7 @@ def engine_move_endpoint():
 def reset():
     game_state["history"] = []
     game_state["cursor"] = 0
+    _clear_pos_cache()
     
     # Frontend will trigger engine move if needed
         
@@ -660,18 +1058,31 @@ HTML_TEMPLATE = """
         .container { display: flex; gap: 20px; max-width: 1300px; margin: 0 auto; align-items: flex-start; justify-content: center; }
         
         /* 1. Settings Panel */
-        .settings-panel { width: 240px; background: #181818; padding: 15px; border-radius: 8px; border: 1px solid #333; }
-        .setting-group { margin-bottom: 20px; }
-        .setting-label { font-size: 12px; font-weight: 600; color: #aaa; margin-bottom: 8px; display: flex; justify-content: space-between; }
-        .setting-val { color: #4caf50; }
-        input[type=range] { width: 100%; -webkit-appearance: none; background: #333; height: 4px; border-radius: 2px; outline: none; }
-        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #eee; border-radius: 50%; cursor: pointer; }
+        .settings-panel { width: 250px; background: #181818; padding: 12px; border-radius: 8px; border: 1px solid #333; max-height: 85vh; overflow-y: auto; }
+        .settings-panel::-webkit-scrollbar { width: 4px; }
+        .settings-panel::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+        .settings-panel::-webkit-scrollbar-track { background: #222; }
+
+        .setting-group { margin-bottom: 8px; }
+        .setting-label { font-size: 11px; font-weight: 600; color: #aaa; margin-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
+        .setting-val { color: #4caf50; font-family: monospace; font-size: 11px; }
+        input[type=range] { width: 100%; -webkit-appearance: none; background: #333; height: 4px; border-radius: 2px; outline: none; margin: 5px 0; display: block; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: #eee; border-radius: 50%; cursor: pointer; }
         
-        .lock-btn { cursor:pointer; font-size:11px; color:#666; display:flex; align-items:center; gap:6px; margin: -10px 0 15px 0; justify-content:flex-end; user-select:none; }
+        .section-header { font-size: 10px; font-weight: 700; color: #555; text-transform: uppercase; margin: 15px 0 8px 0; border-bottom: 1px solid #222; padding-bottom: 4px; letter-spacing: 0.5px; }
+        .section-header:first-of-type { margin-top: 0; }
+
+        .lock-btn { cursor:pointer; font-size:11px; color:#666; display:flex; align-items:center; gap:6px; margin: -6px 0 12px 0; justify-content:flex-end; user-select:none; }
         .lock-btn:hover { color:#999; }
         .lock-btn.active { color: #4caf50; }
         .lock-btn.active svg { fill: #4caf50; }
         .lock-btn svg { width:12px; height:12px; fill:#666; transition:fill 0.2s; }
+
+        /* Simple color blobs for Play-As control */
+        .color-blob { width:18px; height:18px; border-radius:50%; display:inline-block; box-sizing:border-box; }
+        .color-blob.white { background: #fff; border: 2px solid #ccc; }
+        /* Make black visible on the dark background by giving a light border and subtle outline */
+        .color-blob.black { background: #000; border: 2px solid rgba(255,255,255,0.9); box-shadow: 0 0 0 2px rgba(255,255,255,0.06); }
 
         /* 2. Board Area */
         #board-area { width: 500px; }
@@ -702,7 +1113,8 @@ HTML_TEMPLATE = """
         .chosen-move { padding: 8px; background: #2c2c2c; border-top: 1px solid #444; font-weight: bold; color: #4caf50; margin-top: 8px; }
         
         /* Controls */
-        .controls { display: flex; gap: 5px; justify-content: center; margin-top: 10px; }
+        /* Slight right offset so the arrow buttons sit visually centered under the board */
+        .controls { display: flex; gap: 5px; justify-content: center; margin-top: 10px; margin-left: 84px; }
         .btn { background: #333; color: white; border: none; padding: 8px 14px; cursor: pointer; border-radius: 4px; font-size: 16px; min-width: 40px;}
         .btn:hover { background: #444; }
         .btn-reset { font-size: 14px; background: #442222; }
@@ -713,6 +1125,13 @@ HTML_TEMPLATE = """
         #pgn-text { font-family: monospace; font-size: 12px; color: #aaa; line-height: 1.4; word-wrap: break-word; padding-right: 24px; white-space: pre-wrap; }
         .copy-btn { position: absolute; top: 5px; right: 5px; background: transparent; border: none; cursor: pointer; opacity: 0.4; font-size: 16px; transition: opacity 0.2s; }
         .copy-btn:hover { opacity: 1; }
+
+        /* Attention overlay (8x8 grid over board) */
+        #board-wrap { position: relative; width: 100%; }
+        #attn-overlay { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); pointer-events: none; }
+        .attn-cell { background: #4caf50; opacity: 0; }
+
+        
     </style>
 </head>
 <body>
@@ -720,40 +1139,103 @@ HTML_TEMPLATE = """
 <div class="container">
     <!-- LEFT: Settings -->
     <div class="settings-panel">
-        <div style="font-size:14px; font-weight:bold; margin-bottom:15px; border-bottom:1px solid #333; padding-bottom:5px;">MODEL SETTINGS</div>
+        <div class="section-header">Game Setup</div>
         
-        <div class="setting-group">
-            <div class="setting-label">Play As</div>
-            <select id="i-color" style="width:100%; background:#333; color:#eee; border:none; padding:4px; border-radius:4px;">
-                <option value="white">White</option>
-                <option value="black">Black</option>
-            </select>
+        <div class="setting-group" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <div class="setting-label" style="margin:0; flex:1">Play As</div>
+            <div style="display:flex; gap:8px; align-items:center;">
+                <div class="color-choice" id="i-color-white" data-color="white" title="Play as White" style="cursor:pointer; padding:4px; border-radius:4px; background:#222; border:1px solid #333;">
+                    <div class="color-blob white"></div>
+                </div>
+                <div class="color-choice" id="i-color-black" data-color="black" title="Play as Black" style="cursor:pointer; padding:4px; border-radius:4px; background:#111; border:1px solid #333;">
+                    <div class="color-blob black"></div>
+                </div>
+            </div>
         </div>
 
+        <div class="setting-group" style="margin-bottom:4px">
+            <div class="setting-label">Engine Elo <span id="v-eelo" class="setting-val">1900</span></div>
+            <input type="range" id="i-eelo" min="1000" max="2800" step="50" value="1900">
+        </div>
+
+        <div class="lock-btn" id="lock-toggle" onclick="toggleEloLock()">
+            <svg viewBox="0 0 24 24"><path d="M12 17a2 2 0 100-4 2 2 0 000 4zm6-9h-1V6a5 5 0 00-10 0v2H6a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V10a2 2 0 00-2-2zM9 6a3 3 0 116 0v2H9V6z"/></svg>
+            <span>Link Elos</span>
+        </div>
+
+        <div class="setting-group">
+            <div class="setting-label">Human Elo <span id="v-helo" class="setting-val">1900</span></div>
+            <input type="range" id="i-helo" min="1000" max="2800" step="50" value="1900">
+        </div>
+        
         <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
             <div class="setting-label" style="margin:0">
-                Ponder (Wait)
-                <span title="When enabled, the engine will wait for its predicted move time before responding, simulating 'thinking'." style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+                Ponder
+                <span title="Engine waits for predicted time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
             </div>
             <input type="checkbox" id="i-ponder">
         </div>
 
         <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
             <div class="setting-label" style="margin:0">
-                Use Real Time
-                <span title="When enabled, your actual think time will be subtracted from your clock instead of the model's predicted time for your move." style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+                Real Time
+                <span title="Use actual wall clock time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
             </div>
             <input type="checkbox" id="i-realtime">
         </div>
 
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Use Mode Time
+                <span title="Use most likely time (Mode) instead of sampling" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-modetime">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Use Expected Time
+                <span title="Use mean of top-p time distribution" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-exptime">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">Show Attention</div>
+            <input type="checkbox" id="i-attn" onchange="toggleAttnPanel()">
+        </div>
+
+        <div id="attn-params" style="display:none; margin-top:6px;">
+            <div class="setting-group">
+                <div class="setting-label">Layer</div>
+                <select id="i-attn-layer" style="width:100%"></select>
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Head Aggregation</div>
+                <select id="i-attn-agg" style="width:100%">
+                    <option value="avg">Average All Heads</option>
+                    <option value="max">Max Head</option>
+                    <option value="smolgen">Smolgen Only</option>
+                </select>
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Focus Mode</div>
+                <select id="i-attn-focus" style="width:100%">
+                    <option value="outbound">Outbound (from square)</option>
+                    <option value="inbound">Inbound (to square)</option>
+                </select>
+            </div>
+        </div>
+
+        
+
+        <div class="section-header">Sampling</div>
+
         <div class="setting-group">
             <div class="setting-label">Temperature <span id="v-temp" class="setting-val">0.9</span></div>
             <input type="range" id="i-temp" min="0" max="2.0" step="0.1" value="0.9">
-        </div>
-        
-        <div class="setting-group">
-            <div class="setting-label">Time Temp <span id="v-ttemp" class="setting-val">1.0</span></div>
-            <input type="range" id="i-ttemp" min="0.1" max="5.0" step="0.1" value="1.0">
         </div>
         
         <div class="setting-group">
@@ -762,36 +1244,85 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="setting-group">
-            <div class="setting-label">Time Top P <span id="v-ttopp" class="setting-val">0.95</span></div>
-            <input type="range" id="i-ttopp" min="0.5" max="1.0" step="0.01" value="0.95">
-        </div>
-        
-        <div style="height:10px"></div>
-
-        <div class="setting-group" style="margin-bottom:10px">
-            <div class="setting-label">Engine ELO <span id="v-eelo" class="setting-val">1900</span></div>
-            <input type="range" id="i-eelo" min="1000" max="2800" step="50" value="1900">
-        </div>
-
-        <div class="lock-btn" id="lock-toggle" onclick="toggleEloLock()">
-            <svg viewBox="0 0 24 24"><path d="M12 17a2 2 0 100-4 2 2 0 000 4zm6-9h-1V6a5 5 0 00-10 0v2H6a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V10a2 2 0 00-2-2zM9 6a3 3 0 116 0v2H9V6z"/></svg>
-            <span>Link ELOs</span>
+            <div class="setting-label">Time Temp <span id="v-ttemp" class="setting-val">1.0</span></div>
+            <input type="range" id="i-ttemp" min="0.1" max="5.0" step="0.1" value="1.0">
         </div>
 
         <div class="setting-group">
-            <div class="setting-label">Human ELO <span id="v-helo" class="setting-val">1900</span></div>
-            <input type="range" id="i-helo" min="1000" max="2800" step="50" value="1900">
-            <div style="font-size:10px; color:#666; margin-top:5px; line-height:1.2">
-                Elo affects both opponent prediction and own play depending on side to move.
+            <div class="setting-label">Time Top P <span id="v-ttopp" class="setting-val">0.95</span></div>
+            <input type="range" id="i-ttopp" min="0.5" max="1.0" step="0.01" value="0.95">
+        </div>
+
+        <div class="section-header">MCTS</div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">Enable MCTS</div>
+            <input type="checkbox" id="i-use-mcts" onchange="toggleMctsPanel()">
+        </div>
+
+        <div id="mcts-params">
+            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+                <div class="setting-label" style="margin:0">Show Stats</div>
+                <input type="checkbox" id="i-mcts-stats">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Simulations <span id="v-mcts-sims" class="setting-val">128</span></div>
+                <input type="range" id="i-mcts-sims" min="16" max="5000" step="16" value="128">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">C_PUCT <span id="v-mcts-cpuct" class="setting-val">1.5</span></div>
+                <input type="range" id="i-mcts-cpuct" min="0.2" max="6.0" step="0.1" value="1.5">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Max Children <span id="v-mcts-k" class="setting-val">48</span></div>
+                <input type="range" id="i-mcts-k" min="8" max="128" step="8" value="48">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Max Depth <span id="v-mcts-depth" class="setting-val">96</span></div>
+                <input type="range" id="i-mcts-depth" min="1" max="200" step="1" value="96">
+            </div>
+
+            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #333; padding-top:5px;">
+                <div class="setting-label" style="margin:0">Adaptive MCTS</div>
+                <input type="checkbox" id="i-mcts-adaptive" onchange="toggleAdaptivePanel()">
+            </div>
+            
+            <div id="adaptive-params" style="display:none; margin-bottom:10px; border-bottom:1px solid #333; padding-bottom:5px;">
+                <div class="setting-group">
+                    <div class="setting-label">Scaling Factor <span id="v-mcts-ascale" class="setting-val">100</span></div>
+                    <input type="range" id="i-mcts-ascale" min="10" max="1000" step="10" value="100">
+                </div>
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Root Noise (frac) <span id="v-mcts-frac" class="setting-val">0.0</span></div>
+                <input type="range" id="i-mcts-frac" min="0.0" max="0.5" step="0.05" value="0.0">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Root Noise (alpha) <span id="v-mcts-alpha" class="setting-val">0.0</span></div>
+                <input type="range" id="i-mcts-alpha" min="0.0" max="1.0" step="0.05" value="0.0">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Final Temp <span id="v-mcts-ft" class="setting-val">0.0</span></div>
+                <input type="range" id="i-mcts-ft" min="0.0" max="2.0" step="0.1" value="0.0">
             </div>
         </div>
-        
+
         <div id="engine-inputs"></div>
     </div>
 
     <!-- CENTER: Board -->
     <div id="board-area">
-        <div id="board"></div>
+            <div id="board-wrap">
+            <div id="board"></div>
+            <div id="attn-overlay"></div>
+        </div>
         <div class="controls">
             <button class="btn" onclick="nav('start')" title="Start"><<</button>
             <button class="btn" onclick="nav('prev')" title="Previous"><</button>
@@ -825,6 +1356,131 @@ var cursor = 0, max_cursor = 0;
 var eloLocked = false;
 var moveStartTime = 0;
 var humanColor = 'white'; // 'white' or 'black'
+var attention64 = null;
+var overlayOrientation = null;
+var attnFocusMode = 'outbound';
+ 
+
+function toggleMctsPanel() {
+    var checked = $('#i-use-mcts').is(':checked');
+    if (checked) {
+        $('#mcts-params').slideDown(200);
+        $('#i-temp, #i-topp, #i-ttemp, #i-ttopp, #i-ponder').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+        toggleAdaptivePanel();
+    } else {
+        $('#mcts-params').slideUp(200);
+        $('#i-temp, #i-topp, #i-ttemp, #i-ttopp, #i-ponder').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+    }
+}
+
+function toggleAttnPanel() {
+    var checked = $('#i-attn').is(':checked');
+    if (checked) {
+        $('#attn-params').slideDown(200);
+        updateAttnControlEnables();
+    } else {
+        $('#attn-params').slideUp(200);
+        clearAttentionOverlay();
+    }
+}
+
+function ensureAttnLayerOptions(numLayers) {
+    numLayers = parseInt(numLayers || 0, 10);
+    var $sel = $('#i-attn-layer');
+    if ($sel.data('builtFor') === numLayers) return;
+    $sel.empty();
+    $sel.append("<option value='-1'>All Layers</option>");
+    for (var i = 0; i < numLayers; i++) {
+        $sel.append("<option value='" + i + "'>Layer " + i + "</option>");
+    }
+    $sel.data('builtFor', numLayers);
+}
+
+function updateAttnControlEnables() {
+    var agg = $('#i-attn-agg').val();
+    var smolgenSelected = (agg === 'smolgen');
+    $('#i-attn-layer').prop('disabled', smolgenSelected).closest('.setting-group').css('opacity', smolgenSelected ? 0.5 : 1.0);
+}
+
+function toggleAdaptivePanel() {
+    var checked = $('#i-mcts-adaptive').is(':checked');
+    if (checked) {
+        $('#adaptive-params').slideDown(200);
+        $('#i-mcts-sims, #i-mcts-cpuct').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+    } else {
+        $('#adaptive-params').slideUp(200);
+        $('#i-mcts-sims, #i-mcts-cpuct').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+    }
+}
+
+function squareToIndex(sq) {
+    // a1=0 .. h8=63
+    var file = sq.charCodeAt(0) - 'a'.charCodeAt(0);
+    var rank = parseInt(sq[1], 10) - 1;
+    return rank * 8 + file;
+}
+
+function buildAttentionOverlay(orientation) {
+    if (overlayOrientation === orientation) return;
+    overlayOrientation = orientation;
+    var $o = $('#attn-overlay');
+    $o.empty();
+
+    var filesW = ['a','b','c','d','e','f','g','h'];
+    var filesB = ['h','g','f','e','d','c','b','a'];
+
+    if (orientation === 'white') {
+        for (var r = 8; r >= 1; r--) {
+            for (var f = 0; f < 8; f++) {
+                var sq = filesW[f] + r;
+                $o.append("<div class='attn-cell' data-square='" + sq + "'></div>");
+            }
+        }
+    } else {
+        for (var r2 = 1; r2 <= 8; r2++) {
+            for (var f2 = 0; f2 < 8; f2++) {
+                var sq2 = filesB[f2] + r2;
+                $o.append("<div class='attn-cell' data-square='" + sq2 + "'></div>");
+            }
+        }
+    }
+}
+
+function clearAttentionOverlay() {
+    $('#attn-overlay .attn-cell').css('opacity', 0);
+}
+
+ 
+
+
+
+function renderAttentionFromSquare(fromSq) {
+    if (!attention64 || attention64.length !== 4096) return;
+
+    var fromIdx = squareToIndex(fromSq);
+    var vals = new Array(64);
+
+    if (attnFocusMode === 'inbound') {
+        // Column: which query squares attend to this square.
+        for (var i = 0; i < 64; i++) vals[i] = attention64[i * 64 + fromIdx];
+    } else {
+        // Row: where this square attends.
+        var rowStart = fromIdx * 64;
+        for (var j = 0; j < 64; j++) vals[j] = attention64[rowStart + j];
+    }
+
+    var maxV = 0;
+    for (var k = 0; k < 64; k++) if (vals[k] > maxV) maxV = vals[k];
+    if (maxV <= 0) { clearAttentionOverlay(); return; }
+
+    $('#attn-overlay .attn-cell').each(function() {
+        var sq = $(this).attr('data-square');
+        if (!sq) return;
+        var idx = squareToIndex(sq);
+        var a = vals[idx] / maxV;
+        $(this).css('opacity', Math.max(0, Math.min(1, a)));
+    });
+}
 
 // Settings Logic
 function sendSettings() {
@@ -833,11 +1489,30 @@ function sendSettings() {
         time_temperature: $('#i-ttemp').val(),
         top_p: $('#i-topp').val(),
         time_top_p: $('#i-ttopp').val(),
+        use_mcts: $('#i-use-mcts').is(':checked'),
+        show_mcts_stats: $('#i-mcts-stats').is(':checked'),
+        show_attention: $('#i-attn').is(':checked'),
+
+        attn_layer: $('#i-attn-layer').val(),
+        attn_head_agg: $('#i-attn-agg').val(),
+        attn_focus: $('#i-attn-focus').val(),
+        
+        mcts_simulations: $('#i-mcts-sims').val(),
+        mcts_c_puct: $('#i-mcts-cpuct').val(),
+        mcts_max_children: $('#i-mcts-k').val(),
+        mcts_max_depth: $('#i-mcts-depth').val(),
+        mcts_adaptive: $('#i-mcts-adaptive').is(':checked'),
+        mcts_adaptive_scale: $('#i-mcts-ascale').val(),
+        mcts_root_exploration_frac: $('#i-mcts-frac').val(),
+        mcts_root_dirichlet_alpha: $('#i-mcts-alpha').val(),
+        mcts_final_temperature: $('#i-mcts-ft').val(),
         engine_elo: $('#i-eelo').val(),
         human_elo: $('#i-helo').val(),
-        human_color: $('#i-color').val(),
+        human_color: humanColor,
         ponder: $('#i-ponder').is(':checked'),
-        use_real_time: $('#i-realtime').is(':checked')
+        use_real_time: $('#i-realtime').is(':checked'),
+        use_mode_time: $('#i-modetime').is(':checked'),
+        use_expected_time: $('#i-exptime').is(':checked')
     };
     $('#v-temp').text(payload.temperature);
     $('#v-ttemp').text(payload.time_temperature);
@@ -845,6 +1520,15 @@ function sendSettings() {
     $('#v-ttopp').text(payload.time_top_p);
     $('#v-eelo').text(payload.engine_elo);
     $('#v-helo').text(payload.human_elo);
+
+    $('#v-mcts-sims').text(payload.mcts_simulations);
+    $('#v-mcts-cpuct').text(payload.mcts_c_puct);
+    $('#v-mcts-k').text(payload.mcts_max_children);
+    $('#v-mcts-depth').text(payload.mcts_max_depth);
+    $('#v-mcts-ascale').text(payload.mcts_adaptive_scale);
+    $('#v-mcts-frac').text(payload.mcts_root_exploration_frac);
+    $('#v-mcts-alpha').text(payload.mcts_root_dirichlet_alpha);
+    $('#v-mcts-ft').text(payload.mcts_final_temperature);
     
     humanColor = payload.human_color;
 
@@ -891,6 +1575,14 @@ $('#i-temp').on('input', function() { $('#v-temp').text($(this).val()); });
 $('#i-ttemp').on('input', function() { $('#v-ttemp').text($(this).val()); });
 $('#i-topp').on('input', function() { $('#v-topp').text($(this).val()); });
 $('#i-ttopp').on('input', function() { $('#v-ttopp').text($(this).val()); });
+$('#i-mcts-sims').on('input', function() { $('#v-mcts-sims').text($(this).val()); });
+$('#i-mcts-cpuct').on('input', function() { $('#v-mcts-cpuct').text($(this).val()); });
+$('#i-mcts-k').on('input', function() { $('#v-mcts-k').text($(this).val()); });
+$('#i-mcts-depth').on('input', function() { $('#v-mcts-depth').text($(this).val()); });
+$('#i-mcts-ascale').on('input', function() { $('#v-mcts-ascale').text($(this).val()); });
+$('#i-mcts-frac').on('input', function() { $('#v-mcts-frac').text($(this).val()); });
+$('#i-mcts-alpha').on('input', function() { $('#v-mcts-alpha').text($(this).val()); });
+$('#i-mcts-ft').on('input', function() { $('#v-mcts-ft').text($(this).val()); });
 
 $('#i-eelo').on('input', function() {
     var val = $(this).val();
@@ -910,7 +1602,32 @@ $('#i-helo').on('input', function() {
     }
 });
 
-$('#i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-eelo, #i-helo, #i-color, #i-ponder, #i-realtime').on('change', sendSettings);
+$('#i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-frac, #i-mcts-alpha, #i-mcts-ft, #i-eelo, #i-helo, #i-ponder, #i-realtime, #i-modetime, #i-exptime, #i-attn, #i-attn-layer, #i-attn-agg, #i-attn-focus').on('change', function() {
+    updateAttnControlEnables();
+    sendSettings();
+});
+
+// Attention overlay hover (delegated)
+$('#board').on('mouseenter', '.square-55d63', function() {
+    if (!$('#i-attn').is(':checked')) return;
+    if (!attention64) return;
+    var sq = $(this).attr('data-square');
+    if (!sq) return;
+    renderAttentionFromSquare(sq);
+});
+
+$('#board').on('mouseleave', function() {
+    clearAttentionOverlay();
+});
+
+// Color choice click handlers
+$('.color-choice').on('click', function() {
+    var c = $(this).data('color');
+    humanColor = c;
+    $('.color-choice').removeClass('selected').css('box-shadow','none');
+    $(this).addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
+    sendSettings();
+});
 
 // Board Logic
 function onDragStart (source, piece) { 
@@ -945,6 +1662,11 @@ function updateUI(data) {
     cursor = data.cursor; max_cursor = data.max_cursor;
     board.orientation(data.orientation);
     board.position(data.fen);
+
+    attention64 = data.attention64;
+    buildAttentionOverlay(data.orientation);
+
+    
     $('#current-stats').html(data.current_stats);
     $('#prev-engine-stats').html(data.prev_engine_stats);
     $('#pgn-text').text(data.pgn);
@@ -964,17 +1686,51 @@ function updateUI(data) {
         $('#i-ttemp').val(s.time_temperature); $('#v-ttemp').text(s.time_temperature);
         $('#i-topp').val(s.top_p); $('#v-topp').text(s.top_p);
         $('#i-ttopp').val(s.time_top_p); $('#v-ttopp').text(s.time_top_p);
+
+        $('#i-attn').prop('checked', !!s.show_attention);
+        ensureAttnLayerOptions(s.attn_num_layers || 0);
+        $('#i-attn-layer').val((s.attn_layer != null) ? String(s.attn_layer) : '-1');
+        $('#i-attn-agg').val(s.attn_head_agg || 'avg');
+        $('#i-attn-focus').val(s.attn_focus || 'outbound');
+        attnFocusMode = $('#i-attn-focus').val();
+        toggleAttnPanel();
+        if (!s.show_attention) clearAttentionOverlay();
+
+        $('#i-use-mcts').prop('checked', !!s.use_mcts);
+        toggleMctsPanel();
+        $('#i-mcts-stats').prop('checked', !!s.show_mcts_stats);
+        $('#i-mcts-sims').val(s.mcts_simulations); $('#v-mcts-sims').text(s.mcts_simulations);
+        $('#i-mcts-cpuct').val(s.mcts_c_puct); $('#v-mcts-cpuct').text(s.mcts_c_puct);
+        $('#i-mcts-k').val(s.mcts_max_children); $('#v-mcts-k').text(s.mcts_max_children);
+        $('#i-mcts-depth').val(s.mcts_max_depth || 96); $('#v-mcts-depth').text(s.mcts_max_depth || 96);
+        
+        $('#i-mcts-adaptive').prop('checked', !!s.mcts_adaptive);
+        toggleAdaptivePanel();
+        $('#i-mcts-ascale').val(s.mcts_adaptive_scale || 100); $('#v-mcts-ascale').text(s.mcts_adaptive_scale || 100);
+
+        $('#i-mcts-frac').val(s.mcts_root_exploration_frac); $('#v-mcts-frac').text(s.mcts_root_exploration_frac);
+        $('#i-mcts-alpha').val(s.mcts_root_dirichlet_alpha); $('#v-mcts-alpha').text(s.mcts_root_dirichlet_alpha);
+        $('#i-mcts-ft').val(s.mcts_final_temperature); $('#v-mcts-ft').text(s.mcts_final_temperature);
         $('#i-eelo').val(s.engine_elo); $('#v-eelo').text(s.engine_elo);
         $('#i-helo').val(s.human_elo); $('#v-helo').text(s.human_elo);
         
         $('#i-ponder').prop('checked', s.ponder);
         $('#i-realtime').prop('checked', s.use_real_time);
+        $('#i-modetime').prop('checked', s.use_mode_time);
+        $('#i-exptime').prop('checked', s.use_expected_time);
         
         var color = s.human_color ? 'white' : 'black';
-        $('#i-color').val(color);
         humanColor = color;
+        $('.color-choice').removeClass('selected').css('box-shadow','none');
+        if (color === 'white') {
+            $('#i-color-white').addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
+        } else {
+            $('#i-color-black').addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
+        }
     }
 }
+
+ 
 function resetGame() { 
     $.post('/reset', function(data) { 
         updateUI(data); 

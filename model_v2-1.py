@@ -428,6 +428,14 @@ class ShawAttention(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
 
+        # Debug/inference: populated with attention probabilities from the most recent forward.
+        # Shape: (B, n_heads, 64, 64)
+        self.last_attn_probs = None
+
+        # Debug/inference: populated with the smolgen dynamic bias logits from the most recent forward.
+        # Shape: (B, n_heads, 64, 64)
+        self.last_smolgen_bias = None
+
     def forward(self, x, rel_indices, smolgen_bias=None):
         B, L, D = x.shape
         H, d_k = self.n_heads, self.d_head
@@ -450,8 +458,15 @@ class ShawAttention(nn.Module):
         # Add smolgen dynamic attention bias if provided
         if smolgen_bias is not None:
             attn_scores = attn_scores + smolgen_bias
+            # Stash for inference-time visualization (detach to avoid holding graphs during training).
+            self.last_smolgen_bias = smolgen_bias.detach()
+        else:
+            self.last_smolgen_bias = None
         
         attn_probs = self.dropout(F.softmax(attn_scores, dim=-1))
+
+        # Stash for inference-time visualization. Keep on-device; caller can detach/cpu as needed.
+        self.last_attn_probs = attn_probs
         
         content_out = torch.matmul(attn_probs, v)
         rel_out = torch.einsum('bhij,ijd->bhid', attn_probs, r_v)
