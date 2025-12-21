@@ -126,6 +126,9 @@ class ContextOptions:
     opponent_clock_s: float = 300.0
     active_inc_s: float = 0.0
     opponent_inc_s: float = 0.0
+    # Optional: game base time (seconds) for time-control categorization.
+    # Training uses the *initial* base time from PGN TimeControl, not the remaining clock.
+    tc_base_s: float | None = None
     halfmove_clock: int = 0
 
 
@@ -192,8 +195,10 @@ def make_model_batch(
     )
 
     if tc_cat is None:
-        # Heuristic base: use active clock (current remaining); this is the best we have in UCI.
-        tc_cat = get_tc_category(ctx.active_clock_s, ctx.active_inc_s)
+        # Match `process_pgn_v2.get_tc_category`: duration = base + 40*inc.
+        # Use the game's base time when known; otherwise fall back to the largest remaining clock.
+        base_s = float(ctx.tc_base_s) if ctx.tc_base_s is not None else float(max(ctx.active_clock_s, ctx.opponent_clock_s))
+        tc_cat = get_tc_category(base_s, ctx.active_inc_s)
 
     castling = torch.tensor(
         [

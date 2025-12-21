@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -294,8 +294,13 @@ class MCTSSettings:
     root_exploration_frac: float = 0.0
     final_temperature: float = 0.0
 
+    # First Play Urgency (FPU): for unvisited children, use (parent_q - fpu_reduction)
+    # as the value term (in the *parent player's* perspective) instead of implicitly using 0.0.
+    # Set to 0.0 to keep legacy behavior.
+    fpu_reduction: float = 0.20
+
     # Leaf parallelism
-    leaf_batch_size: int = 32
+    leaf_batch_size: int = 1
     virtual_loss: float = 1.0
 
 
@@ -314,9 +319,12 @@ class _Node:
         return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
 
 
-def _select_child(node: _Node, *, c_puct: float) -> Tuple[chess.Move, _Node]:
+def _select_child(node: _Node, *, c_puct: float, fpu_reduction: float) -> Tuple[chess.Move, _Node]:
     assert node.children
     sqrt_n = np.sqrt(max(1, node.visit_count))
+
+    parent_q = node.q()
+    use_fpu = float(fpu_reduction) > 0.0
 
     best_move: Optional[chess.Move] = None
     best_child: Optional[_Node] = None
@@ -326,7 +334,15 @@ def _select_child(node: _Node, *, c_puct: float) -> Tuple[chess.Move, _Node]:
         u = c_puct * child.prior * (sqrt_n / (1 + child.visit_count))
         # `child.q()` is stored from the perspective of the player *to move at the child*.
         # At the parent, we choose moves for the current player, so we negate.
-        score = (-child.q()) + u
+        if use_fpu and child.visit_count == 0:
+            # FPU uses a pessimistic initial value for unvisited children.
+            # parent_q is from the parent's side-to-move; that's the value perspective we
+            # want for move selection at this node.
+            v_term = float(parent_q - fpu_reduction)
+        else:
+            v_term = float(-child.q())
+
+        score = v_term + u
         if score > best_score:
             best_score = score
             best_move = mv
@@ -377,13 +393,16 @@ def mcts_choose_move(
     device: torch.device,
     settings: MCTSSettings,
     rng: Optional[np.random.Generator] = None,
+    stop_check: Callable[[], bool] | None = None,
+    claim_draw: bool = False,
 ) -> PolicyOutput:
     """PUCT MCTS using (policy priors, WDL value) from the model."""
 
     if rng is None:
         rng = np.random.default_rng()
 
-    if board.is_game_over(claim_draw=True):
+    # Match `inference/app.py` behavior: keep playing in claimable-draw positions.
+    if board.is_game_over(claim_draw=bool(claim_draw)):
         return PolicyOutput(move=None, policy_prob=1.0)
 
     root_turn = board.turn
@@ -430,11 +449,16 @@ def mcts_choose_move(
 
     done = 0
     while done < sims:
+        if stop_check is not None and stop_check():
+            break
+
         batch_n = min(leaf_batch_size, sims - done)
 
         # Select up to `batch_n` leaves while applying virtual loss to discourage collisions.
         leaves: list[tuple[list[_Node], _Node, chess.Board, list[float] | None, Optional[float]]] = []
         for _ in range(batch_n):
+            if stop_check is not None and stop_check():
+                break
             node = root
             b = board.copy(stack=True)
             th = list(time_history_s) if time_history_s is not None else None
@@ -442,7 +466,11 @@ def mcts_choose_move(
 
             depth = 0
             while node.expanded and node.children and depth < max_depth:
-                mv, child = _select_child(node, c_puct=float(settings.c_puct))
+                mv, child = _select_child(
+                    node,
+                    c_puct=float(settings.c_puct),
+                    fpu_reduction=float(getattr(settings, "fpu_reduction", 0.0)),
+                )
                 b.push(mv)
                 if th is not None:
                     th = [float(getattr(node, "pred_time_s", 0.0))] + th[:-1]
@@ -518,7 +546,10 @@ def mcts_choose_move(
                 n.value_sum += v
                 v = -v
 
-        done += batch_n
+        if not leaves:
+            break
+
+        done += len(leaves)
 
     if not root.children:
         return PolicyOutput(move=None, policy_prob=1.0)

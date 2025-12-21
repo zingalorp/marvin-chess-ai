@@ -9,99 +9,48 @@ import chess.svg
 from flask import Flask, render_template_string, request, jsonify
 import time
 
+from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_S, START_CLOCK_S
+from inference.engine_logic import analyze_position as analyze_position_core
+from inference.engine_logic import choose_engine_move as choose_engine_move_core
+from inference.runtime import (
+    count_attn_layers,
+    default_device,
+    ensure_repo_on_syspath,
+    load_default_chessformer,
+    resolve_repo_root,
+)
+
 # ==========================================
 # 1. SETUP & MODEL LOADING
 # ==========================================
 
 # Settings (Defaults)
-game_settings = {
-    "temperature": 0.9,
-    "time_temperature": 0.6,
-    "top_p": 0.95,
-    "time_top_p": 0.75,
-    "human_elo": 1900,
-    "engine_elo": 1900,
-    "human_color": chess.WHITE,
-    "ponder": False,
-    "use_real_time": False,
-    "use_mode_time": False,
-    "use_expected_time": False,
-
-    # MCTS (disabled by default)
-    "use_mcts": False,
-    "mcts_simulations": 256,
-    "mcts_c_puct": 2.0,
-    "mcts_max_children": 48,
-    "mcts_root_dirichlet_alpha": 0.0,
-    "mcts_root_exploration_frac": 0.0,
-    "mcts_final_temperature": 0.0,
-    "mcts_max_depth": 96,
-    "mcts_adaptive": False,
-    "mcts_adaptive_scale": 500.0,
-    "show_mcts_stats": False,
-
-    # Overlays
-
-    # Attention viz
-    "show_attention": False,
-
-    # Attention viz settings
-    # - attn_layer: -1 => aggregate across all layers, else 0..N-1
-    # - attn_head_agg: 'avg' | 'max' | 'smolgen'
-    # - attn_focus: 'outbound' | 'inbound' (frontend rendering)
-    "attn_layer": -1,
-    "attn_head_agg": "avg",
-    "attn_focus": "outbound",
-}
-
-# Fixed Context
-START_CLOCK_S = 180.0
-INC_S = 0
+game_settings = dict(DEFAULT_GAME_SETTINGS)
 
 # Paths
-cwd = Path.cwd().resolve()
-if (cwd / 'model_v2-1.py').exists():
-    repo_root = cwd
-elif (cwd.parent / 'model_v2-1.py').exists():
-    repo_root = cwd.parent
-else:
-    repo_root = cwd 
+repo_root = resolve_repo_root()
+ensure_repo_on_syspath(repo_root)
 
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
-from inference.model_loader import load_chessformer_v2
 from inference.encoding import ContextOptions, build_history_from_position, canonicalize, make_model_batch
 from inference.chessformer_policy import choose_move
 from inference.mcts import MCTSSettings, mcts_choose_move
 from inference.sampling import sample_from_logits
 
 print("Loading model...")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = default_device()
 
-model_path = repo_root / 'checkpoints/chessformer_v2_smolgen_best.pt'
+model_path = repo_root / "inference/chessformer_v2_smolgen_best.pt"
 if not model_path.exists():
     print(f"Warning: Model not found at {model_path}.")
 
-loaded = load_chessformer_v2(
-    model_py_path=repo_root / 'model_v2-1.py',
-    config_name='smolgen',
-    checkpoint_path=model_path,
-    device=device,
-)
-model = loaded.model
-model.eval()
+loaded, model, _checkpoint_path = load_default_chessformer(repo_root=repo_root, device=device)
+device = loaded.device
 print("Model loaded.")
 
-def _count_attn_layers(model: torch.nn.Module) -> int:
-    n = 0
-    for mod in model.modules():
-        if hasattr(mod, "last_attn_probs"):
-            n += 1
-    return n
-
-ATTN_NUM_LAYERS = _count_attn_layers(model)
-ATTN_HAS_SMOLGEN = bool(getattr(model, "smolgen", None) is not None)
+# Handle torch.compile wrapper for metadata inspection
+orig_model = getattr(model, "_orig_mod", model)
+ATTN_NUM_LAYERS = count_attn_layers(model)
+ATTN_HAS_SMOLGEN = bool(getattr(orig_model, "smolgen", None) is not None)
 
 # Expose read-only attention metadata to the frontend via the settings blob.
 game_settings["attn_num_layers"] = int(ATTN_NUM_LAYERS)
@@ -111,7 +60,7 @@ game_settings["attn_has_smolgen"] = bool(ATTN_HAS_SMOLGEN)
 # 2. ANALYSIS LOGIC
 # ==========================================
 PROMO_INDEX = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
-rng = np.random.default_rng(67)
+rng = np.random.default_rng(DEFAULT_RNG_SEED)
 
 def _mirror_square(sq: int) -> int: return sq ^ 56
 
@@ -138,10 +87,12 @@ def _extract_attention_64(
     if head_agg not in ("avg", "max", "smolgen"):
         head_agg = "avg"
 
+    orig_model = getattr(model, "_orig_mod", model)
+
     # Smolgen-only view (pure dynamic bias).
     if head_agg == "smolgen":
         bias_h: torch.Tensor | None = None
-        for mod in model.modules():
+        for mod in orig_model.modules():
             b = getattr(mod, "last_smolgen_bias", None)
             if b is None:
                 continue
@@ -158,7 +109,7 @@ def _extract_attention_64(
         mat = probs_h.mean(dim=0)  # (64, 64)
     else:
         layers_h: list[torch.Tensor] = []
-        for mod in model.modules():
+        for mod in orig_model.modules():
             attn = getattr(mod, "last_attn_probs", None)
             if attn is None:
                 continue
@@ -213,8 +164,10 @@ def _apply_ply_clock(clock_s: float, *, spent_s: float, inc_s: float) -> float:
 
 def _clocks_at_cursor(cursor: int) -> dict[chess.Color, float]:
     """Return remaining clocks (seconds) for white/black at the given cursor."""
-    w = float(START_CLOCK_S)
-    b = float(START_CLOCK_S)
+    start_s = float(game_settings.get("start_clock_s", START_CLOCK_S))
+    inc_s = float(game_settings.get("inc_s", INC_S))
+    w = start_s
+    b = start_s
     hist = game_state.get("history", [])[:cursor]
     for ply_idx, item in enumerate(hist):
         uci = item.get("uci")
@@ -224,9 +177,9 @@ def _clocks_at_cursor(cursor: int) -> dict[chess.Color, float]:
             # Treat as a ply that consumes time but doesn't change board.
             pass
         if mover == chess.WHITE:
-            w = _apply_ply_clock(w, spent_s=spent, inc_s=INC_S)
+            w = _apply_ply_clock(w, spent_s=spent, inc_s=inc_s)
         else:
-            b = _apply_ply_clock(b, spent_s=spent, inc_s=INC_S)
+            b = _apply_ply_clock(b, spent_s=spent, inc_s=inc_s)
     return {chess.WHITE: w, chess.BLACK: b}
 
 def _canonical_to_real_move(move: chess.Move, real_turn: chess.Color) -> chess.Move:
@@ -255,190 +208,19 @@ def analyze_position(
     opponent_clock_s: float,
     time_history_s: list[float] | None = None,
 ) -> dict:
-    _final_board, board_history, repetition_flags = build_history_from_position(chess.Board(), moves_uci)
-    
-    if board.turn == game_settings["human_color"]:
-        active_elo = game_settings["human_elo"]
-        opp_elo = game_settings["engine_elo"]
-    else:
-        active_elo = game_settings["engine_elo"]
-        opp_elo = game_settings["human_elo"]
-
-    ctx = ContextOptions(
-        active_elo=active_elo, opponent_elo=opp_elo,
-        active_clock_s=active_clock_s, opponent_clock_s=opponent_clock_s,
-        active_inc_s=INC_S, opponent_inc_s=INC_S,
-        halfmove_clock=int(board.halfmove_clock),
-    )
-
-    batch = make_model_batch(
-        board=board,
-        board_history=board_history,
-        repetition_flags=repetition_flags,
-        time_history_s=time_history_s,
-        ctx=ctx,
+    return analyze_position_core(
+        model=model,
         device=loaded.device,
+        settings=game_settings,
+        rng=rng,
+        board=board,
+        moves_uci=moves_uci,
+        active_clock_s=active_clock_s,
+        opponent_clock_s=opponent_clock_s,
+        active_inc_s=float(game_settings.get("inc_s", INC_S)),
+        opponent_inc_s=float(game_settings.get("inc_s", INC_S)),
+        time_history_s=time_history_s,
     )
-
-    # For analysis only: unmask resign/flag so we can inspect their probabilities.
-    # We still keep them disabled for actual move selection elsewhere.
-    batch_for_rf = dict(batch)
-    if "legal_mask" in batch_for_rf:
-        lm = batch_for_rf["legal_mask"].clone()
-        if lm.shape[-1] > 4097:
-            lm[..., 4096] = True
-            lm[..., 4097] = True
-        batch_for_rf["legal_mask"] = lm
-
-    with torch.inference_mode():
-        with torch.autocast(device_type=loaded.device.type, enabled=(loaded.device.type == 'cuda')):
-            (m_logits, v_raw, v_cls, v_err, t_logits, ss_logits, p_logits) = model(batch, return_promo=True)
-            (m_logits_rf, *_rest) = model(batch_for_rf, return_promo=False)
-
-    attention64 = None
-    if bool(game_settings.get("show_attention", False)):
-        attention64 = _extract_attention_64(
-            model,
-            real_turn=board.turn,
-            layer=int(game_settings.get("attn_layer", -1)),
-            head_agg=str(game_settings.get("attn_head_agg", "avg")),
-        )
-
-    m_logits = m_logits[0]
-    promo_p = torch.softmax(p_logits[0].float(), dim=-1)
-    
-    # Effective Policy
-    canonical_board = canonicalize(board)
-    legal_moves_data = []
-
-    for mv in canonical_board.legal_moves:
-        base_idx = mv.from_square * 64 + mv.to_square
-        logit = float(m_logits[base_idx].item())
-        if mv.promotion is not None and 56 <= mv.to_square <= 63:
-            file_idx = mv.to_square - 56
-            p_idx = PROMO_INDEX.get(mv.promotion, 0)
-            promo_prob = float(promo_p[file_idx, p_idx].item())
-            logit += np.log(max(1e-8, promo_prob))
-        legal_moves_data.append({'move': mv, 'logit': logit})
-
-    if not legal_moves_data:
-        policy_display = []
-    else:
-        T = max(1e-4, game_settings['temperature'])
-        logits_vec = torch.tensor([x['logit'] for x in legal_moves_data], device=device)
-        logits_vec = logits_vec / T
-        probs_vec = torch.softmax(logits_vec, dim=0)
-        
-        sorted_probs, sorted_indices = torch.sort(probs_vec, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=0)
-        
-        target_p = game_settings['top_p']
-        cutoff_index = torch.searchsorted(cumulative_probs, target_p).item()
-        cutoff_index = min(len(sorted_probs) - 1, cutoff_index + 1)
-        
-        kept_indices = sorted_indices[:cutoff_index]
-        kept_probs = sorted_probs[:cutoff_index]
-        kept_probs = kept_probs / kept_probs.sum()
-        
-        policy_display = []
-        real_turn = board.turn
-        for i, prob in zip(kept_indices.tolist(), kept_probs.tolist()):
-            mv = legal_moves_data[i]['move']
-            real_mv = _canonical_to_real_move(mv, real_turn)
-            try: label = board.san(real_mv)
-            except: label = real_mv.uci()
-            policy_display.append({'label': label, 'prob': prob, 'uci': real_mv.uci()})
-
-    wdl = _softmax_1d(v_cls[0])
-    
-    # Apply Time Temperature
-    T_time = max(1e-4, float(game_settings.get('time_temperature', 1.0)))
-    t_logits_scaled = t_logits[0].float() / T_time
-    time_p = torch.softmax(t_logits_scaled - torch.max(t_logits_scaled), dim=0)
-
-    # Time Distribution (Top X%)
-    target_time_p = float(game_settings.get('time_top_p', 0.95))
-    t_probs = time_p.cpu().numpy()
-
-    # Calculate raw stats (Temp=1.0) for "True" Model Opinion
-    t_probs_raw = torch.softmax(t_logits[0].float(), dim=0).cpu().numpy()
-    
-    # Mode (Argmax)
-    mode_bin = np.argmax(t_probs_raw)
-    mode_time_s = _time_bin_to_seconds(mode_bin, active_clock_s)
-
-    t_sorted_idx = np.argsort(t_probs)[::-1]
-    t_cumsum = np.cumsum(t_probs[t_sorted_idx])
-    t_cutoff = np.searchsorted(t_cumsum, target_time_p) + 1
-    t_active_idx = t_sorted_idx[:t_cutoff]
-    t_active_idx.sort()
-    
-    time_dist = []
-    expected_time_s = 0.0
-    total_prob_mass = 0.0
-    
-    for idx in t_active_idx:
-        sec = _time_bin_to_seconds(idx, active_clock_s)
-        prob = float(t_probs[idx])
-        time_dist.append({'sec': sec, 'prob': prob})
-        
-        # Accumulate for expected time calculation (weighted by prob)
-        expected_time_s += prob * sec
-        total_prob_mass += prob
-        
-    # Normalize expected time by the total probability mass of the top-p subset
-    if total_prob_mass > 0:
-        expected_time_s /= total_prob_mass
-
-    # Sample a time bin (like we sample moves), but with fixed temperature=1.
-    # We re-use the app's top_p setting to avoid sampling extreme tails.
-    if game_settings.get("use_mode_time", False):
-        # Use Mode (Argmax) for deterministic behavior
-        time_sample_s = mode_time_s
-        time_sample_prob = float(t_probs_raw[mode_bin])
-    elif game_settings.get("use_expected_time", False):
-        # Use Expected Value (Mean of Top-P)
-        time_sample_s = expected_time_s
-        time_sample_prob = 1.0 # It's an aggregate, not a single bin prob
-    else:
-        time_sample = sample_from_logits(
-            t_logits[0],
-            temperature=T_time,
-            top_p=target_time_p,
-            rng=rng,
-        )
-        time_sample_bin = int(time_sample.move_index)
-        time_sample_s = _time_bin_to_seconds(time_sample_bin, active_clock_s)
-        time_sample_prob = float(time_sample.prob)
-
-    # Note: `m_logits` is masked by legal_mask, which keeps resign/flag at -inf.
-    # Use the analysis forward-pass logits where resign/flag are unmasked.
-    raw_policy_all = _softmax_1d(m_logits_rf[0])
-
-    # Value processing
-    # v_raw is logit, sigmoid gives 0-1 probability (win%)
-    win_prob = float(torch.sigmoid(v_raw[0].squeeze(-1)).item())
-    
-    # v_err is predicted squared error. Take sqrt to get std dev / error bar.
-    # Clamp to 0 just in case.
-    pred_sq_error = v_err[0].squeeze(-1).item()
-    error_bar = np.sqrt(max(0.0, pred_sq_error))
-
-    return {
-        'top_moves': policy_display,
-        'resign': float(raw_policy_all[4096].item()),
-        'flag': float(raw_policy_all[4097].item()),
-        'wdl': {'w': wdl[2].item(), 'd': wdl[1].item(), 'l': wdl[0].item()},
-        'value': win_prob,
-        'value_error': error_bar,
-        'time_dist': time_dist,
-        'time_top_p': target_time_p,
-        'time_sample_s': float(time_sample_s),
-        'time_sample_prob': time_sample_prob,
-        'expected_time_s': expected_time_s,
-        'mode_time_s': mode_time_s,
-        'attention64': attention64,
-    }
 
 def format_stats_html(data: dict) -> str:
     if not data: return "<div style='color:#666;padding:10px'><i>Evaluating...</i></div>"
@@ -766,8 +548,8 @@ def update_settings():
     if 'human_color' in data:
         game_settings['human_color'] = chess.WHITE if data['human_color'] == 'white' else chess.BLACK
     
-    if 'ponder' in data:
-        game_settings['ponder'] = bool(data['ponder'])
+    if 'simulate_thinking_time' in data:
+        game_settings['simulate_thinking_time'] = bool(data['simulate_thinking_time'])
         
     if 'use_real_time' in data:
         game_settings['use_real_time'] = bool(data['use_real_time'])
@@ -777,6 +559,12 @@ def update_settings():
 
     if 'use_expected_time' in data:
         game_settings['use_expected_time'] = bool(data['use_expected_time'])
+
+    if 'start_clock_s' in data:
+        game_settings['start_clock_s'] = float(data['start_clock_s'])
+    
+    if 'inc_s' in data:
+        game_settings['inc_s'] = float(data['inc_s'])
 
     # MCTS
     if 'use_mcts' in data:
@@ -829,7 +617,7 @@ def update_settings():
     if any(k in data for k in ('time_temperature', 'time_top_p', 'use_real_time', 'use_mode_time', 'use_expected_time')):
         _clear_pos_cache()
     
-    print(f"DEBUG: Settings Updated: Ponder={game_settings.get('ponder')}, RealTime={game_settings.get('use_real_time')}")
+    print(f"DEBUG: Settings Updated: SimulateThinkingTime={game_settings.get('simulate_thinking_time')}, RealTime={game_settings.get('use_real_time')}")
 
     board = get_board_at_cursor()
     
@@ -857,69 +645,28 @@ def _play_engine_move(board):
     time_hist_engine = _pred_time_history_s_at_cursor(cursor_engine)
     clocks_engine = _clocks_at_cursor(cursor_engine)
     
-    # 1. Analyze (for display stats)
-    engine_stats = analyze_position(
-        board,
-        moves_uci,
+    out, engine_stats, mcts_stats = choose_engine_move_core(
+        model=model,
+        device=loaded.device,
+        settings=game_settings,
+        rng=rng,
+        board=board,
+        moves_uci=moves_uci,
         active_clock_s=float(clocks_engine[board.turn]),
         opponent_clock_s=float(clocks_engine[not board.turn]),
+        active_inc_s=float(game_settings.get("inc_s", INC_S)),
+        opponent_inc_s=float(game_settings.get("inc_s", INC_S)),
         time_history_s=time_hist_engine,
+        stop_check=None,
+        allow_ponder_sleep=True,
     )
+
     stats_html = format_stats_html(engine_stats)
     engine_pred_time_s = float(engine_stats.get("time_sample_s", 0.0))
     engine_pred_time_prob = float(engine_stats.get("time_sample_prob", 0.0))
-    
-    # 2. Ponder (Wait)
-    if game_settings.get("ponder", False):
-        time.sleep(engine_pred_time_s)
 
-    # 3. Choose Move
-    ctx = ContextOptions(
-        active_elo=game_settings["engine_elo"], opponent_elo=game_settings["human_elo"],
-        active_clock_s=float(clocks_engine[board.turn]), opponent_clock_s=float(clocks_engine[not board.turn]),
-        active_inc_s=INC_S, opponent_inc_s=INC_S,
-        halfmove_clock=int(board.halfmove_clock),
-    )
-    if bool(game_settings.get("use_mcts", False)):
-        sims = int(game_settings.get("mcts_simulations", 128))
-        cpuct = float(game_settings.get("mcts_c_puct", 1.5))
-        
-        if bool(game_settings.get("mcts_adaptive", False)):
-            scale = float(game_settings.get("mcts_adaptive_scale", 100.0))
-            # Adaptive Logic:
-            # Simulations = scale * predicted_time
-            # C_PUCT = base + (predicted_time / 20.0)
-            sims = max(16, int(scale * engine_pred_time_s))
-            cpuct = min(6.0, cpuct + (engine_pred_time_s / 20.0))
-
-        mcts_settings = MCTSSettings(
-            simulations=sims,
-            c_puct=cpuct,
-            max_children=int(game_settings.get("mcts_max_children", 48)),
-            max_depth=int(game_settings.get("mcts_max_depth", 96)),
-            root_dirichlet_alpha=float(game_settings.get("mcts_root_dirichlet_alpha", 0.0)),
-            root_exploration_frac=float(game_settings.get("mcts_root_exploration_frac", 0.0)),
-            final_temperature=float(game_settings.get("mcts_final_temperature", 0.0)),
-        )
-        out = mcts_choose_move(
-            model=model,
-            board=board,
-            ctx=ctx,
-            time_history_s=time_hist_engine,
-            device=loaded.device,
-            settings=mcts_settings,
-            rng=rng,
-        )
-        if out.stats and game_settings.get("show_mcts_stats", False):
-            stats_html = format_mcts_stats_html(out.stats)
-    else:
-        _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
-        out = choose_move(
-            model=model, board=board, board_history=bh, repetition_flags=rf,
-            ctx=ctx, temperature=game_settings['temperature'], top_p=game_settings['top_p'],
-            time_history_s=time_hist_engine,
-            device=loaded.device, rng=rng
-        )
+    if mcts_stats and game_settings.get("show_mcts_stats", False):
+        stats_html = format_mcts_stats_html(mcts_stats)
     
     if out.is_resign:
         chosen_txt = "Resigns"
@@ -1155,7 +902,7 @@ HTML_TEMPLATE = """
 
         <div class="setting-group" style="margin-bottom:4px">
             <div class="setting-label">Engine Elo <span id="v-eelo" class="setting-val">1900</span></div>
-            <input type="range" id="i-eelo" min="1000" max="2800" step="50" value="1900">
+            <input type="range" id="i-eelo" min="1200" max="2600" step="50" value="1900">
         </div>
 
         <div class="lock-btn" id="lock-toggle" onclick="toggleEloLock()">
@@ -1165,15 +912,27 @@ HTML_TEMPLATE = """
 
         <div class="setting-group">
             <div class="setting-label">Human Elo <span id="v-helo" class="setting-val">1900</span></div>
-            <input type="range" id="i-helo" min="1000" max="2800" step="50" value="1900">
+            <input type="range" id="i-helo" min="1200" max="2600" step="50" value="1900">
+        </div>
+
+        <div class="section-header">Time Control</div>
+        
+        <div class="setting-group">
+            <div class="setting-label">Start Clock (s) <span id="v-startclock" class="setting-val">180</span></div>
+            <input type="range" id="i-startclock" min="10" max="600" step="10" value="180">
+        </div>
+
+        <div class="setting-group">
+            <div class="setting-label">Increment (s) <span id="v-inc" class="setting-val">0</span></div>
+            <input type="range" id="i-inc" min="0" max="30" step="1" value="0">
         </div>
         
         <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
             <div class="setting-label" style="margin:0">
-                Ponder
+                Simulate Thinking Time
                 <span title="Engine waits for predicted time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
             </div>
-            <input type="checkbox" id="i-ponder">
+            <input type="checkbox" id="i-simulate-thinking-time">
         </div>
 
         <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
@@ -1365,11 +1124,11 @@ function toggleMctsPanel() {
     var checked = $('#i-use-mcts').is(':checked');
     if (checked) {
         $('#mcts-params').slideDown(200);
-        $('#i-temp, #i-topp, #i-ttemp, #i-ttopp, #i-ponder').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+        $('#i-temp, #i-topp, #i-simulate-thinking-time').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
         toggleAdaptivePanel();
     } else {
         $('#mcts-params').slideUp(200);
-        $('#i-temp, #i-topp, #i-ttemp, #i-ttopp, #i-ponder').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+        $('#i-temp, #i-topp, #i-simulate-thinking-time').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
     }
 }
 
@@ -1509,10 +1268,12 @@ function sendSettings() {
         engine_elo: $('#i-eelo').val(),
         human_elo: $('#i-helo').val(),
         human_color: humanColor,
-        ponder: $('#i-ponder').is(':checked'),
+        simulate_thinking_time: $('#i-simulate-thinking-time').is(':checked'),
         use_real_time: $('#i-realtime').is(':checked'),
         use_mode_time: $('#i-modetime').is(':checked'),
-        use_expected_time: $('#i-exptime').is(':checked')
+        use_expected_time: $('#i-exptime').is(':checked'),
+        start_clock_s: $('#i-startclock').val(),
+        inc_s: $('#i-inc').val()
     };
     $('#v-temp').text(payload.temperature);
     $('#v-ttemp').text(payload.time_temperature);
@@ -1520,6 +1281,8 @@ function sendSettings() {
     $('#v-ttopp').text(payload.time_top_p);
     $('#v-eelo').text(payload.engine_elo);
     $('#v-helo').text(payload.human_elo);
+    $('#v-startclock').text(payload.start_clock_s);
+    $('#v-inc').text(payload.inc_s);
 
     $('#v-mcts-sims').text(payload.mcts_simulations);
     $('#v-mcts-cpuct').text(payload.mcts_c_puct);
@@ -1583,6 +1346,8 @@ $('#i-mcts-ascale').on('input', function() { $('#v-mcts-ascale').text($(this).va
 $('#i-mcts-frac').on('input', function() { $('#v-mcts-frac').text($(this).val()); });
 $('#i-mcts-alpha').on('input', function() { $('#v-mcts-alpha').text($(this).val()); });
 $('#i-mcts-ft').on('input', function() { $('#v-mcts-ft').text($(this).val()); });
+$('#i-startclock').on('input', function() { $('#v-startclock').text($(this).val()); });
+$('#i-inc').on('input', function() { $('#v-inc').text($(this).val()); });
 
 $('#i-eelo').on('input', function() {
     var val = $(this).val();
@@ -1602,7 +1367,7 @@ $('#i-helo').on('input', function() {
     }
 });
 
-$('#i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-frac, #i-mcts-alpha, #i-mcts-ft, #i-eelo, #i-helo, #i-ponder, #i-realtime, #i-modetime, #i-exptime, #i-attn, #i-attn-layer, #i-attn-agg, #i-attn-focus').on('change', function() {
+$('#i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-frac, #i-mcts-alpha, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-attn, #i-attn-layer, #i-attn-agg, #i-attn-focus, #i-startclock, #i-inc').on('change', function() {
     updateAttnControlEnables();
     sendSettings();
 });
@@ -1714,10 +1479,12 @@ function updateUI(data) {
         $('#i-eelo').val(s.engine_elo); $('#v-eelo').text(s.engine_elo);
         $('#i-helo').val(s.human_elo); $('#v-helo').text(s.human_elo);
         
-        $('#i-ponder').prop('checked', s.ponder);
+        $('#i-simulate-thinking-time').prop('checked', s.simulate_thinking_time);
         $('#i-realtime').prop('checked', s.use_real_time);
         $('#i-modetime').prop('checked', s.use_mode_time);
         $('#i-exptime').prop('checked', s.use_expected_time);
+        $('#i-startclock').val(s.start_clock_s || 180); $('#v-startclock').text(s.start_clock_s || 180);
+        $('#i-inc').val(s.inc_s || 0); $('#v-inc').text(s.inc_s || 0);
         
         var color = s.human_color ? 'white' : 'black';
         humanColor = color;
