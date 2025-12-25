@@ -1,7 +1,4 @@
-# Ignore everything
 *
-
-# Except these files...
 
 # Pre-processing scripts
 !profile_data.py
@@ -9,7 +6,6 @@
 !visualize_profile.py
 
 # Training scripts
-
 !process_pgn_v2.py
 !train_v2.py
 !dataset_v2.py
@@ -27,6 +23,9 @@
 
 # Configuration files
 !requirements.txt
+
+# lichess-bot related script
+!
 
 
 

@@ -96,6 +96,8 @@ class UciEngine:
             _Option("TopP", "string", str(self.settings["top_p"])),
             _Option("TimeTemperature", "string", str(self.settings["time_temperature"])),
             _Option("TimeTopP", "string", str(self.settings["time_top_p"])),
+            _Option("OpeningTemperature", "string", str(self.settings.get("opening_temperature", 1.2))),
+            _Option("OpeningLength", "spin", int(self.settings.get("opening_length", 10)), min=0, max=100),
             _Option("UseModeTime", "check", bool(self.settings["use_mode_time"])),
             _Option("UseExpectedTime", "check", bool(self.settings["use_expected_time"])),
             _Option("UseRealTime", "check", bool(self.settings.get("use_real_time", False))),
@@ -106,14 +108,21 @@ class UciEngine:
             _Option("InternalClock", "check", bool(self.settings.get("internal_clock", False))),
             _Option("DebugClocks", "check", bool(self.settings.get("debug_clocks", False))),
 
+            # Game time control (set by wrapper before game starts for accurate tc_cat)
+            # These are in seconds. If set, they override inference from first `go` clocks.
+            _Option("GameBaseTime", "string", str(self.settings.get("game_base_time_s", 0))),
+            _Option("GameIncrement", "string", str(self.settings.get("game_increment_s", 0))),
+
             # Controls whether the engine prints resign/flag probabilities each search.
             _Option("LogResignProbs", "check", bool(self.settings.get("log_resign_probs", False))),
             _Option("LogTimeHistory", "check", bool(self.settings.get("log_time_history", False))),
+            _Option("LogMctsStats", "check", bool(self.settings.get("log_mcts_stats", False))),
 
             # Human-like terminal behaviors (UCI has no standard resign/flag moves).
             # We expose these so wrappers can react to `info string action=...`.
             _Option("EnableResign", "check", bool(self.settings.get("enable_resign", False))),
             _Option("ResignThreshold", "string", str(self.settings.get("resign_threshold", 0.98))),
+            _Option("MinResignPly", "spin", int(self.settings.get("resign_min_ply", 20)), min=0, max=1000),
             _Option("EnableFlag", "check", bool(self.settings.get("enable_flag", False))),
             _Option("FlagThreshold", "string", str(self.settings.get("flag_threshold", 0.98))),
 
@@ -298,6 +307,10 @@ class UciEngine:
             set_setting("time_temperature", float(value))
         elif name_key == "timetopp":
             set_setting("time_top_p", float(value))
+        elif name_key == "openingtemperature":
+            set_setting("opening_temperature", float(value))
+        elif name_key == "openinglength":
+            set_setting("opening_length", int(float(value)))
         elif name_key == "usemodetime":
             set_setting("use_mode_time", _bool_from_uci(value))
         elif name_key == "useexpectedtime":
@@ -316,14 +329,29 @@ class UciEngine:
             set_setting("internal_clock", _bool_from_uci(value))
         elif name_key == "debugclocks":
             set_setting("debug_clocks", _bool_from_uci(value))
+        elif name_key == "gamebasetime":
+            # Game base time in seconds (initial clock, not remaining)
+            base_s = float(value)
+            set_setting("game_base_time_s", base_s)
+            # Also set start_clock_s so tc_cat is computed correctly
+            if base_s > 0:
+                set_setting("start_clock_s", base_s)
+        elif name_key == "gameincrement":
+            # Game increment in seconds
+            set_setting("game_increment_s", float(value))
         elif name_key == "logresignprobs":
             set_setting("log_resign_probs", _bool_from_uci(value))
         elif name_key == "logtimehistory":
             set_setting("log_time_history", _bool_from_uci(value))
+        elif name_key == "logmctsstats":
+            set_setting("log_mcts_stats", _bool_from_uci(value))
         elif name_key == "enableresign":
             set_setting("enable_resign", _bool_from_uci(value))
         elif name_key == "resignthreshold":
             set_setting("resign_threshold", float(value))
+        elif name_key == "minresignply":
+            # Minimum ply (half-moves) before the engine will announce resign.
+            set_setting("resign_min_ply", int(float(value)))
         elif name_key == "enableflag":
             set_setting("enable_flag", _bool_from_uci(value))
         elif name_key == "flagthreshold":
@@ -431,13 +459,13 @@ class UciEngine:
             )
 
         # At a `go` call, it's engine-to-move, so the last ply in the moves list is opponent's move.
-        # Update time history (oldest-first) if we have those entries.
+        # Only update the OPPONENT's time ([-1]) with real clock data, not the engine's ([-2]).
+        # The engine's predicted time should remain as predicted by the model, not overwritten
+        # with actual response time (which may be instant if SimulateThinkingTime=false).
+        # This prevents a feedback loop where fast engine response → model sees fast history → predicts fast.
         if len(self.pred_time_s_history) >= 1:
             last_mover = not self.board.turn  # opponent just moved
             self.pred_time_s_history[-1] = float(spent_w if last_mover == chess.WHITE else spent_b)
-        if len(self.pred_time_s_history) >= 2:
-            prev_mover = self.board.turn  # engine moved before opponent
-            self.pred_time_s_history[-2] = float(spent_w if prev_mover == chess.WHITE else spent_b)
 
     def _search_worker(
         self,
@@ -464,6 +492,10 @@ class UciEngine:
             opponent_clock_s = float(btime_s if board.turn == chess.WHITE else wtime_s)
             active_inc_s = float(winc_s if board.turn == chess.WHITE else binc_s)
             opponent_inc_s = float(binc_s if board.turn == chess.WHITE else winc_s)
+
+            if bool(self.settings.get("log_time_history", False)):
+                # Log clock context for debugging time prediction
+                self._print(f"info string clocks active={active_clock_s:.1f}s opp={opponent_clock_s:.1f}s inc={active_inc_s:.1f}s")
 
             out, engine_stats, _mcts_stats = choose_engine_move(
                 model=self.model,
@@ -496,13 +528,33 @@ class UciEngine:
             resign_thr = float(self.settings.get("resign_threshold", 0.98))
             flag_thr = float(self.settings.get("flag_threshold", 0.98))
 
-            if enable_resign and resign_p >= resign_thr:
+            # Respect a minimum ply threshold to avoid premature resignations
+            min_resign_ply = int(self.settings.get("resign_min_ply", 20))
+            current_ply = len(moves_uci)
+
+            if enable_resign and resign_p >= resign_thr and current_ply >= min_resign_ply:
                 self._print(f"info string action=resign resign_p={resign_p:.4f} flag_p={flag_p:.4f}")
-            if enable_flag and flag_p >= flag_thr:
+            if enable_flag and flag_p >= flag_thr and current_ply >= min_resign_ply:
                 self._print(f"info string action=flag resign_p={resign_p:.4f} flag_p={flag_p:.4f}")
             # Optional logging of probabilities even when thresholds are not met.
             if bool(self.settings.get("log_resign_probs", False)):
                 self._print(f"info string probs resign_p={resign_p:.4f} flag_p={flag_p:.4f}")
+
+            # Optional logging of lightweight MCTS diagnostics.
+            try:
+                if bool(self.settings.get("log_mcts_stats", False)) and isinstance(_mcts_stats, dict):
+                    mn = int(_mcts_stats.get("mcts_nodes", 0))
+                    mps = float(_mcts_stats.get("mcts_nodes_per_s", 0.0))
+                    self._print(f"info string mcts_nodes={mn} mps={mps:.1f}")
+            except Exception:
+                pass
+
+            # Log predicted time for debugging
+            if bool(self.settings.get("log_time_history", False)):
+                pred_t = float(engine_stats.get("time_sample_s", 0.0)) if isinstance(engine_stats, dict) else 0.0
+                mode_t = float(engine_stats.get("mode_time_s", 0.0)) if isinstance(engine_stats, dict) else 0.0
+                expected_t = float(engine_stats.get("expected_time_s", 0.0)) if isinstance(engine_stats, dict) else 0.0
+                self._print(f"info string pred_time sample={pred_t:.2f}s mode={mode_t:.2f}s expected={expected_t:.2f}s")
 
             # UCI GUIs generally require `bestmove` to be a legal move string.
             # The web app supports pseudo-moves (resign/flag) via `move=None`, but UCI does not.
@@ -584,25 +636,46 @@ class UciEngine:
             # Unknown token: skip.
             i += 1
 
+        # Determine the default clock to use when wtime/btime not provided.
+        # Prefer game_base_time_s (set via GameBaseTime option before game starts),
+        # then fall back to start_clock_s (inferred from first go), then START_CLOCK_S.
+        default_clock_s = float(self.settings.get("game_base_time_s", 0))
+        if default_clock_s <= 0:
+            default_clock_s = float(self.settings.get("start_clock_s", START_CLOCK_S))
+        default_clock_ms = int(default_clock_s * 1000)
+
         # Clocks are milliseconds in UCI.
-        wtime_ms = float(args.get("wtime", str(int(START_CLOCK_S * 1000))))
-        btime_ms = float(args.get("btime", str(int(START_CLOCK_S * 1000))))
+        wtime_ms = float(args.get("wtime", str(default_clock_ms)))
+        btime_ms = float(args.get("btime", str(default_clock_ms)))
         wtime_s = wtime_ms / 1000.0
         btime_s = btime_ms / 1000.0
 
-        # Increments (milliseconds). Used for model context if plumbed.
-        winc_s = float(args.get("winc", "0")) / 1000.0
-        binc_s = float(args.get("binc", "0")) / 1000.0
+        # Default increment to use when winc/binc not provided.
+        default_inc_s = float(self.settings.get("game_increment_s", 0))
+        default_inc_ms = int(default_inc_s * 1000)
 
-        # Capture the game's base time from the first `go` (UCI clocks are remaining time).
-        # This makes `tc_cat` match training's `process_pgn_v2.get_tc_category(base, inc)`.
+        # Increments (milliseconds). Used for model context if plumbed.
+        winc_s = float(args.get("winc", str(default_inc_ms))) / 1000.0
+        binc_s = float(args.get("binc", str(default_inc_ms))) / 1000.0
+
+        # Capture the game's base time for tc_cat calculation.
+        # Prefer the explicit GameBaseTime option (set by wrapper before game starts).
+        # Fall back to inferring from the first `go` clocks if not set.
         if not self._has_last_go:
-            self.settings["start_clock_s"] = float(max(wtime_s, btime_s))
+            explicit_base = float(self.settings.get("game_base_time_s", 0))
+            if explicit_base > 0:
+                # Already set via setoption GameBaseTime; don't override
+                pass
+            else:
+                # Infer from first go command (less accurate but better than nothing)
+                self.settings["start_clock_s"] = float(max(wtime_s, btime_s))
 
         if bool(self.settings.get("debug_clocks", False)):
             stm = "W" if self.board.turn == chess.WHITE else "B"
             active_clock_s = float(wtime_s if self.board.turn == chess.WHITE else btime_s)
             opponent_clock_s = float(btime_s if self.board.turn == chess.WHITE else wtime_s)
+            game_base = float(self.settings.get("game_base_time_s", 0))
+            game_inc = float(self.settings.get("game_increment_s", 0))
             self._print(
                 "info string uci_clocks "
                 f"stm={stm} wtime={wtime_s:.3f} btime={btime_s:.3f} "
@@ -610,7 +683,8 @@ class UciEngine:
                 f"winc={winc_s:.3f} binc={binc_s:.3f} "
                 f"use_real_time={bool(self.settings.get('use_real_time', False))} "
                 f"internal_clock={bool(self.settings.get('internal_clock', False))} "
-                f"start_clock_s={float(self.settings.get('start_clock_s', START_CLOCK_S)):.3f}"
+                f"start_clock_s={float(self.settings.get('start_clock_s', START_CLOCK_S)):.3f} "
+                f"game_base={game_base:.1f} game_inc={game_inc:.1f}"
             )
 
         # Robustness: if an adapter ever sends a missing/zero clock for one side,

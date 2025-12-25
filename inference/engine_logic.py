@@ -420,13 +420,22 @@ def choose_engine_move(
         mcts_stats = out.stats
     else:
         _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
+        
+        # Use opening temperature during opening phase for more varied openings
+        current_ply = len(moves_uci)
+        opening_length = int(settings.get("opening_length", 10))
+        if current_ply < opening_length:
+            effective_temperature = float(settings.get("opening_temperature", settings["temperature"]))
+        else:
+            effective_temperature = float(settings["temperature"])
+        
         out = choose_move(
             model=model,
             board=board,
             board_history=bh,
             repetition_flags=rf,
             ctx=ctx,
-            temperature=float(settings["temperature"]),
+            temperature=effective_temperature,
             top_p=float(settings["top_p"]),
             time_history_s=time_history_s,
             device=device,

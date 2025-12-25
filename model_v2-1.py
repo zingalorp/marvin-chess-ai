@@ -476,41 +476,7 @@ class ShawAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config, num_rel_pos):
-        super().__init__()
-        self.use_adaln = config.get('use_adaln', False)
-        d_model = config['d_model']
-        
-        self.norm1 = RMSNorm(d_model)
-        self.attn = ShawAttention(
-            d_model, config['n_heads'], config['d_head'], 
-            num_rel_pos, config['dropout']
-        )
-        self.norm2 = RMSNorm(d_model)
-        self.ff = SwiGLU(d_model, config['d_ff'], config['dropout'])
-        
-        # AdaLN modulation: generates scale/shift from context
-        if self.use_adaln:
-            context_dim = config.get('context_dim', 256)
-            self.adaln_mod = AdaLNModulation(context_dim, d_model)
-
-    def forward(self, x, rel_indices, smolgen_bias=None, context=None):
-        # Get AdaLN scale/shift if using adaptive normalization
-        if self.use_adaln and context is not None:
-            (scale1, shift1), (scale2, shift2) = self.adaln_mod(context)
-            norm1_cond = (scale1, shift1)
-            norm2_cond = (scale2, shift2)
-        else:
-            norm1_cond = None
-            norm2_cond = None
-        
-        x = x + self.attn(self.norm1(x, norm1_cond), rel_indices=rel_indices, smolgen_bias=smolgen_bias)
-        x = x + self.ff(self.norm2(x, norm2_cond))
-        return x
-
-
-class RefinedTransformerBlock(nn.Module):
-    """Transformer block with Mish activation and bias=False for attention (paper style)."""
+    """Transformer block with Mish activation and bias=False for attention."""
     def __init__(self, config, num_rel_pos):
         super().__init__()
         self.use_adaln = config.get('use_adaln', False)
@@ -708,10 +674,10 @@ class ChessformerV2(nn.Module):
         # Input encoder (per-square features only, globals handled by context encoder)
         self.input_encoder = PerSquareInputEncoder(config)
         
-        # Transformer body - using RefinedTransformerBlock with Mish activation
+        # Transformer body - using TransformerBlock with Mish activation
         self.rel_pos_gen = RelativePositionGenerator(config['max_rel_dist'])
         self.layers = nn.ModuleList([
-            RefinedTransformerBlock(config, self.rel_pos_gen.num_buckets)
+            TransformerBlock(config, self.rel_pos_gen.num_buckets)
             for _ in range(config['n_layers'])
         ])
         self.norm_f = RMSNorm(d_model)

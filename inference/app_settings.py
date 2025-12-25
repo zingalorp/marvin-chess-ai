@@ -9,6 +9,8 @@ DEFAULT_GAME_SETTINGS: dict = {
     "time_temperature": 0.6,
     "top_p": 0.95,
     "time_top_p": 0.75,
+    "opening_temperature": 1.2,
+    "opening_length": 10,
     "human_elo": 1900,
     "engine_elo": 1900,
     "human_color": chess.WHITE,

@@ -29,6 +29,15 @@ TC_BULLET = 0
 TC_BLITZ = 1
 TC_RAPID = 2
 
+# Known increment values the model was trained on (in seconds).
+# Rare increments are clamped to the nearest known value to improve generalization.
+KNOWN_INCREMENTS = [0, 1, 2, 3, 5, 10]
+
+
+def clamp_to_known_increment(inc_s: float) -> float:
+    """Clamp an increment to the nearest known value for better model generalization."""
+    return float(min(KNOWN_INCREMENTS, key=lambda x: abs(x - inc_s)))
+
 
 def get_tc_category(base_seconds: float, inc_seconds: float) -> int:
     # Same rule as `process_pgn_v2.get_tc_category`.
@@ -176,8 +185,13 @@ def make_model_batch(
 
     active_clock_norm = math.log1p(max(0.0, ctx.active_clock_s)) / 10.0
     opp_clock_norm = math.log1p(max(0.0, ctx.opponent_clock_s)) / 10.0
-    active_inc_norm = float(ctx.active_inc_s) / 30.0
-    opp_inc_norm = float(ctx.opponent_inc_s) / 30.0
+    
+    # Clamp increments to known values for better time prediction generalization.
+    # The model struggles with rare increment values it wasn't trained on.
+    clamped_active_inc = clamp_to_known_increment(ctx.active_inc_s)
+    clamped_opp_inc = clamp_to_known_increment(ctx.opponent_inc_s)
+    active_inc_norm = clamped_active_inc / 30.0
+    opp_inc_norm = clamped_opp_inc / 30.0
     hmc_norm = float(ctx.halfmove_clock) / 100.0
 
     scalars = torch.tensor(

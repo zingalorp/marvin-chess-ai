@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
+import time
 import torch
 import chess
 
@@ -447,7 +448,10 @@ def mcts_choose_move(
     leaf_batch_size = max(1, int(getattr(settings, "leaf_batch_size", 1)))
     vloss = float(getattr(settings, "virtual_loss", 1.0))
 
+    # Lightweight diagnostics counters (minimal overhead)
     done = 0
+    node_count = 1 + len(priors)  # count the root + immediate root children
+    start_time = time.time()
     while done < sims:
         if stop_check is not None and stop_check():
             break
@@ -533,6 +537,7 @@ def mcts_choose_move(
                     for mv2, p2 in priors2.items():
                         leaf_node.children[mv2] = _Node(p2)
                     leaf_node.expanded = True
+                    node_count += len(priors2)
 
             # Remove the virtual loss applied during selection.
             for n in path:
@@ -578,6 +583,15 @@ def mcts_choose_move(
         "root_value": root_value,
         "children": children_stats
     }
+    # Add lightweight MCTS diagnostics
+    try:
+        elapsed = max(1e-6, time.time() - start_time)
+        stats["mcts_nodes"] = int(node_count)
+        stats["mcts_nodes_per_s"] = float(node_count) / float(elapsed)
+    except Exception:
+        # Be conservative: diagnostics must never raise
+        stats["mcts_nodes"] = 0
+        stats["mcts_nodes_per_s"] = 0.0
 
     total = float(visits.sum())
     if total <= 0:
@@ -590,8 +604,28 @@ def mcts_choose_move(
         return PolicyOutput(move=mv, policy_prob=float(visits[idx] / total), stats=stats)
 
     t = float(settings.final_temperature)
+    # Temperature-adjusted distribution from visit counts.
     w = np.power(visits / total, 1.0 / max(1e-6, t))
-    w = w / float(w.sum() + 1e-12)
+
+    # Defensively sanitize the probability vector: replace NaN/inf, clamp negatives,
+    # and fall back to using visit-based weights or uniform sampling if necessary.
+    w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+    w[w < 0.0] = 0.0
+
+    w_sum = float(w.sum())
+    if not np.isfinite(w_sum) or w_sum <= 0.0:
+        # Fallback: prefer non-negative visit counts if available, else uniform.
+        vpos = np.nan_to_num(visits, nan=0.0, posinf=0.0, neginf=0.0)
+        vpos[vpos < 0.0] = 0.0
+        vsum = float(vpos.sum())
+        if np.isfinite(vsum) and vsum > 0.0:
+            w = vpos / vsum
+        else:
+            # Last resort: uniform over moves
+            w = np.ones_like(visits, dtype=np.float64) / float(len(visits))
+    else:
+        w = w / w_sum
+
     idx = int(rng.choice(len(moves), p=w))
     mv = moves[idx]
     return PolicyOutput(move=mv, policy_prob=float(w[idx]), stats=stats)
