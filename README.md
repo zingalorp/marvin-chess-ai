@@ -1,6 +1,6 @@
 # Marvin Chess
 
-A human-like chess transformer designed to mimic human play across skill levels (1200-2600 Elo). The model is time-aware, adapting its play based on remaining clock time, opponent rating, and time control.
+A human-like chess transformer designed to mimic human play across skill levels (1200-2500 Elo). The model is time-aware, adapting its play based on remaining clock time, opponent rating, and time control.
 
 ## Overview
 
