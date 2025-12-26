@@ -66,5 +66,5 @@ python train.py --data-dir data/
 ## Acknowledgments
 
 - [Lichess](https://lichess.org) for training data and bot infrastructure
-- [Leela Chess Zero](https://lczero.org) for Smolgen and architectural techniques
+- [Leela Chess Zero](https://lczero.org) for architectural techniques
 - [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework
