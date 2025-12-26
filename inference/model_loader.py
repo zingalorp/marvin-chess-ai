@@ -27,11 +27,11 @@ def _load_model_module(model_py_path: Path):
     return module
 
 
-def load_chessformer_v2(
+def load_chessformer(
     *,
     model_py_path: str | Path = "model.py",
     config_name: ConfigName = "smolgen",
-    checkpoint_path: str | Path = "inference/chessformer_v2_smolgen_best.pt",
+    checkpoint_path: str | Path = "inference/chessformer_smolgen_best.pt",
     device: str | torch.device = "cuda",
 ) -> LoadedModel:
     model_py_path = Path(model_py_path)
@@ -44,16 +44,16 @@ def load_chessformer_v2(
     module = _load_model_module(model_py_path)
 
     if config_name == "deep":
-        config = dict(module.CONFIG_V2_DEEP)
+        config = dict(module.CONFIG_DEEP)
     elif config_name == "leela":
-        config = dict(module.CONFIG_V2_LEELA)
+        config = dict(module.CONFIG_LEELA)
     elif config_name == "100m":
         config = dict(module.CONFIG_100M_BALANCED)
     else:
-        config = dict(module.CONFIG_V2_SMOLGEN)
+        config = dict(module.CONFIG_SMOLGEN)
 
     device = torch.device(device)
-    model = module.ChessformerV2(config).to(device)
+    model = module.Chessformer(config).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = ckpt.get("model", ckpt)

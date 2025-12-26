@@ -19,20 +19,20 @@ from torch.amp import GradScaler, autocast
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset import create_dataloader_v2, count_samples
+from dataset import create_dataloader, count_samples
 
 # Import model
 from model import (
-    ChessformerV2,
-    CONFIG_V2_LEELA,
-    CONFIG_V2_DEEP,
-    CONFIG_V2_SMOLGEN,
+    Chessformer,
+    CONFIG_LEELA,
+    CONFIG_DEEP,
+    CONFIG_SMOLGEN,
     CONFIG_100M_BALANCED,
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Chessformer V2 trainer")
+    parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
     parser.add_argument("--config", choices=["leela", "deep", "smolgen", "100m"], default="smolgen")
     parser.add_argument("--batch-size", type=int, default=512)
@@ -137,7 +137,7 @@ def move_batch_to_device(batch: Dict, device: torch.device, non_blocking: bool =
 
 def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_weight=0.1,
                    value_cls_weight=0.3, start_square_weight=0.1, value_error_weight=0.1, promo_weight=0.1):
-    """Compute losses for V2 model outputs.
+    """Compute losses for model outputs.
     
     Args:
         outputs: tuple of (move_logits [B, 4098], value_out [B, 1], 
@@ -491,7 +491,7 @@ def train_one_epoch(
                     best_val_loss = val_stats['loss']
                     save_checkpoint(
                         model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
-                        Path(args.checkpoint_dir) / f"chessformer_v2_{args.config}_best.pt",
+                        Path(args.checkpoint_dir) / f"chessformer_{args.config}_best.pt",
                         args.config, run_dir
                     )
 
@@ -527,7 +527,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "global_step": global_step,
         "best_val_loss": best_val_loss,
         "config": config_name,
-        "version": "v2",
+        "version": "1.0",
     }
     if scheduler is not None:
         checkpoint["scheduler"] = scheduler.state_dict()
@@ -578,17 +578,17 @@ def main() -> None:
         raise ValueError("--grad-accum-steps must be >= 1")
 
     if args.config == "deep":
-        config = copy.deepcopy(CONFIG_V2_DEEP)
+        config = copy.deepcopy(CONFIG_DEEP)
     elif args.config == "smolgen":
-        config = copy.deepcopy(CONFIG_V2_SMOLGEN)
+        config = copy.deepcopy(CONFIG_SMOLGEN)
     elif args.config == "100m":
         config = copy.deepcopy(CONFIG_100M_BALANCED)
     else:  # leela
-        config = copy.deepcopy(CONFIG_V2_LEELA)
+        config = copy.deepcopy(CONFIG_LEELA)
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
 
-    model = ChessformerV2(config).to(device)
+    model = Chessformer(config).to(device)
     if args.compile_model:
         try:
             model = torch.compile(model, mode="max-autotune")
@@ -600,7 +600,7 @@ def main() -> None:
     pin_memory = device.type == "cuda"
     non_blocking = pin_memory
     
-    train_loader = create_dataloader_v2(
+    train_loader = create_dataloader(
         args.data_dir, split='train',
         batch_size=args.batch_size,
         shuffle=True,
@@ -608,7 +608,7 @@ def main() -> None:
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
-    val_loader = create_dataloader_v2(
+    val_loader = create_dataloader(
         args.data_dir, split='val',
         batch_size=args.batch_size,
         shuffle=False,
@@ -673,7 +673,7 @@ def main() -> None:
         run_dir = Path(resumed_run_dir)
     else:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        run_dir = Path(args.log_dir) / f"chessformer_v2_{args.config}_{timestamp}"
+        run_dir = Path(args.log_dir) / f"chessformer_{args.config}_{timestamp}"
 
     writer = SummaryWriter(run_dir)
     if start_epoch == 1:
@@ -721,12 +721,12 @@ def main() -> None:
             for name, value in val_stats.items():
                 writer.add_scalar(f"val/{name}", value, epoch)
 
-            ckpt_path = Path(args.checkpoint_dir) / f"chessformer_v2_{args.config}_epoch{epoch:02d}.pt"
+            ckpt_path = Path(args.checkpoint_dir) / f"chessformer_{args.config}_epoch{epoch:02d}.pt"
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, ckpt_path, args.config, run_dir)
             
             if val_stats['loss'] < best_val_loss:
                 best_val_loss = val_stats['loss']
-                best_path = Path(args.checkpoint_dir) / f"chessformer_v2_{args.config}_best.pt"
+                best_path = Path(args.checkpoint_dir) / f"chessformer_{args.config}_best.pt"
                 save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, best_path, args.config, run_dir)
 
     writer.close()

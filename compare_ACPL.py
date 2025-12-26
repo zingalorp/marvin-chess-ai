@@ -10,7 +10,7 @@ provided the script will attempt to use `stockfish` on PATH.
 
 Usage examples:
   python compare_ACPL.py --parquet data/val_balanced.parquet --num-games 2000 \
-      --engine-path /usr/bin/stockfish --model-py model.py --checkpoint inference/chessformer_v2_smolgen_best.pt
+      --engine-path /usr/bin/stockfish --model-py model.py --checkpoint inference/chessformer_smolgen_best.pt
 
 Notes:
 - The script picks the model's top policy move (argmax over legal moves)
@@ -245,7 +245,7 @@ def main():
     p.add_argument("--engine-time", type=float, default=0.05, help="Engine time per position in seconds (or use --engine-depth)")
     p.add_argument("--engine-depth", type=int, default=None, help="Engine depth (overrides engine-time if set)")
     p.add_argument("--model-py", default="model.py")
-    p.add_argument("--checkpoint", default="inference/chessformer_v2_smolgen_best.pt")
+    p.add_argument("--checkpoint", default="inference/chessformer_smolgen_best.pt")
     p.add_argument("--config-name", default="smolgen")
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -264,7 +264,7 @@ def main():
     print("Columns:", cols)
 
     print("Loading model... This may take a few seconds.")
-    loaded = model_loader.load_chessformer_v2(
+    loaded = model_loader.load_chessformer(
         model_py_path=args.model_py,
         config_name=args.config_name,
         checkpoint_path=args.checkpoint,

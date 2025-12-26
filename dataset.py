@@ -15,10 +15,10 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 __all__ = [
-    "StreamingDatasetV2",
+    "StreamingDataset",
     "BalancedValDataset",
-    "build_dataloaders_v2",
-    "create_dataloader_v2",
+    "build_dataloaders",
+    "create_dataloader",
     "create_balanced_val_loader",
     "count_samples",
 ]
@@ -30,8 +30,8 @@ NUM_POLICY_OUTPUTS = 4098  # 64*64 + resign + flag
 
 
 @dataclass
-class SampleV2:
-    """A single training sample from v2 data."""
+class Sample:
+    """A single training sample."""
     # Board history: (8, 64) - 8 board states, each with 64 piece codes
     board_history: np.ndarray
     # Legal moves: list of (from, to, promo) tuples
@@ -62,8 +62,8 @@ class SampleV2:
     time_target: float
 
 
-def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
-    """Convert a SampleV2 to model input tensors."""
+def _sample_to_tensors(sample: Sample) -> Dict[str, torch.Tensor]:
+    """Convert a Sample to model input tensors."""
     
     # Board history: (8, 64) int64
     board_history = torch.from_numpy(sample.board_history).long()
@@ -180,7 +180,7 @@ def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
     }
 
 
-def _collate_v2(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+def _collate(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """Collate a batch of samples."""
     return {
         key: torch.stack([s[key] for s in samples])
@@ -188,8 +188,8 @@ def _collate_v2(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     }
 
 
-class StreamingDatasetV2(IterableDataset):
-    """Streaming dataset for v2 parquet data."""
+class StreamingDataset(IterableDataset):
+    """Streaming dataset for parquet data."""
     
     def __init__(
         self,
@@ -265,7 +265,7 @@ class StreamingDatasetV2(IterableDataset):
                 print(f"[dataset] Error processing batch in {file_path}: {e}")
                 continue
 
-    def _extract_sample(self, batch, idx: int) -> Optional[SampleV2]:
+    def _extract_sample(self, batch, idx: int) -> Optional[Sample]:
         """Extract a single sample from a batch at the given index."""
         try:
             # Board history: nested array (8, 64)
@@ -313,7 +313,7 @@ class StreamingDatasetV2(IterableDataset):
             y_val = float(batch["y_val"][idx].as_py())
             time_target = float(batch["time_target"][idx].as_py())
 
-            return SampleV2(
+            return Sample(
                 board_history=board_history,
                 legal_moves=legal_moves,
                 time_history=time_history,
@@ -339,28 +339,28 @@ class StreamingDatasetV2(IterableDataset):
             return None
 
 
-def build_dataloaders_v2(
+def build_dataloaders(
     train_dir: str,
     val_dir: str,
     batch_size: int = 256,
     num_workers: int = 4,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Build train and validation dataloaders for v2 data."""
+    """Build train and validation dataloaders."""
     
     train_files = sorted(Path(train_dir).glob("*.parquet"))
     val_files = sorted(Path(val_dir).glob("*.parquet"))
     
     print(f"[dataset] Found {len(train_files)} train files, {len(val_files)} val files")
     
-    train_ds = StreamingDatasetV2(
+    train_ds = StreamingDataset(
         [str(f) for f in train_files],
         shuffle_files=True,
         shuffle_rows=True,
         seed=seed,
     )
     
-    val_ds = StreamingDatasetV2(
+    val_ds = StreamingDataset(
         [str(f) for f in val_files],
         shuffle_files=False,
         shuffle_rows=False,
@@ -371,7 +371,7 @@ def build_dataloaders_v2(
         train_ds,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=_collate_v2,
+        collate_fn=_collate,
         pin_memory=True,
         prefetch_factor=2 if num_workers > 0 else None,
     )
@@ -380,7 +380,7 @@ def build_dataloaders_v2(
         val_ds,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=_collate_v2,
+        collate_fn=_collate,
         pin_memory=True,
         prefetch_factor=2 if num_workers > 0 else None,
     )
@@ -421,7 +421,7 @@ def _split_files_deterministic(files: List[Path], val_fraction: float = 0.05) ->
     return train_files, val_files
 
 
-def create_dataloader_v2(
+def create_dataloader(
     data_dir: str,
     split: str = "train",
     batch_size: int = 256,
@@ -465,7 +465,7 @@ def create_dataloader_v2(
     is_train = split == "train"
     should_shuffle = shuffle if shuffle is not None else is_train
     
-    ds = StreamingDatasetV2(
+    ds = StreamingDataset(
         [str(f) for f in files],
         shuffle_files=should_shuffle,
         shuffle_rows=should_shuffle,
@@ -476,7 +476,7 @@ def create_dataloader_v2(
         ds,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=_collate_v2,
+        collate_fn=_collate,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
@@ -490,7 +490,7 @@ def count_samples(data_dir: str, split: str = "train", val_fraction: float = 0.0
     train_dir = Path(data_dir) / "train"
     all_files = sorted(train_dir.glob("*.parquet"))
     
-    # Split files the same way as create_dataloader_v2
+    # Split files the same way as create_dataloader
     train_files, val_files = _split_files_deterministic(all_files, val_fraction)
     
     if split == "train":
@@ -577,7 +577,7 @@ class BalancedValDataset(torch.utils.data.Dataset):
         # policy_move is stored as numpy array [from, to, promo]
         policy_move = row["policy_move"]
         
-        sample = SampleV2(
+        sample = Sample(
             board_history=self.board_history_list[idx],
             legal_moves=self.legal_moves_list[idx],
             time_history=self.time_history_list[idx],
@@ -628,6 +628,6 @@ def create_balanced_val_loader(
         batch_size=batch_size,
         shuffle=False,  # No need to shuffle validation
         num_workers=num_workers,
-        collate_fn=_collate_v2,
+        collate_fn=_collate,
         pin_memory=pin_memory,
     )

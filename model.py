@@ -33,7 +33,7 @@ class Mish(nn.Module):
 
 # Deep+wide config with 1x FFN: tests Leela's hypothesis at ~20M params
 # Same capacity as SMALL but trades FFN width for more layers and wider d_model
-CONFIG_V2_DEEP = {
+CONFIG_DEEP = {
     "d_model": 448,           # Wider than SMALL (384 -> 448)
     "n_layers": 14,           # Deeper than SMALL (8 -> 14)
     "n_heads": 14,            # 448 / 32 = 14
@@ -50,7 +50,7 @@ CONFIG_V2_DEEP = {
 }
 
 # Leela-style config: 1x FFN but with post-embedding FFN layer
-CONFIG_V2_LEELA = {
+CONFIG_LEELA = {
     "d_model": 384,
     "n_layers": 8,
     "n_heads": 48,            # More heads with smaller d_head
@@ -69,8 +69,7 @@ CONFIG_V2_LEELA = {
 
 # Smolgen config: 1.5x FFN + dynamic attention biases
 # This allows 1.5x FFN to work by making attention position-content-aware
-# 
-CONFIG_V2_SMOLGEN = {
+CONFIG_SMOLGEN = {
     "d_model": 448,           # Wider to compensate for 1x FFN
     "n_layers": 12,           # 10 layers (between 8 and 12)
     "n_heads": 14,            # 448 / 32 = 14
@@ -651,7 +650,7 @@ class PerSquareInputEncoder(nn.Module):
         return x
 
 
-class ChessformerV2(nn.Module):
+class Chessformer(nn.Module):
     """
     Chessformer model with AdaLN (Adaptive Layer Normalization) for global context conditioning.
     
@@ -885,7 +884,7 @@ def count_parameters(model):
 
 if __name__ == "__main__":
     # Test the model
-    model = ChessformerV2(CONFIG_V2_SMOLGEN)
+    model = Chessformer(CONFIG_SMOLGEN)
     print(f"Total Trainable Parameters: {count_parameters(model):,}")
     
     # Create dummy batch
@@ -911,5 +910,5 @@ if __name__ == "__main__":
     
     # Test 100M config
     print("\n--- Testing 100M Config ---")
-    model_100m = ChessformerV2(CONFIG_100M_BALANCED)
+    model_100m = Chessformer(CONFIG_100M_BALANCED)
     print(f"100M Config Trainable Parameters: {count_parameters(model_100m):,}")

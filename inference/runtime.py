@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from inference.model_loader import LoadedModel, load_chessformer_v2
+from inference.model_loader import LoadedModel, load_chessformer
 
 
 def resolve_repo_root(*, cwd: Path | None = None) -> Path:
@@ -34,9 +34,9 @@ def load_default_chessformer(*, repo_root: Path | None = None, device: torch.dev
     device = device or default_device()
 
     model_py_path = repo_root / "model.py"
-    checkpoint_path = repo_root / "inference/chessformer_v2_smolgen_best.pt"
+    checkpoint_path = repo_root / "inference/chessformer_smolgen_best.pt"
 
-    loaded = load_chessformer_v2(
+    loaded = load_chessformer(
         model_py_path=model_py_path,
         config_name="smolgen",
         checkpoint_path=checkpoint_path,
