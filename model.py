@@ -912,3 +912,5 @@ if __name__ == "__main__":
     print("\n--- Testing 100M Config ---")
     model_100m = Chessformer(CONFIG_100M_BALANCED)
     print(f"100M Config Trainable Parameters: {count_parameters(model_100m):,}")
+    model_smolgen = Chessformer(CONFIG_SMOLGEN)
+    print(f"Smolgen Config Trainable Parameters: {count_parameters(model_smolgen):,}")

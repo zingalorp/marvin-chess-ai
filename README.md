@@ -14,6 +14,10 @@ The architecture uses techniques from [Leela Chess Zero](https://lczero.org/blog
 
 Context conditioning (Elo, clock, time control) is injected via Adaptive Layer Normalization.
 
+## Results
+
+![Move Matching Accuracy](docs/accuracy_comparison.png)
+
 ## Contents
 
 - `model.py`, `train.py`, `dataset.py`, `process_pgn.py` - Training pipeline
@@ -25,7 +29,7 @@ Context conditioning (Elo, clock, time control) is injected via Adaptive Layer N
 ### `inference/app.py` 
 GUI for prediction distributions, adjustable parameter tweaking, experimenting and playing against the model.
 
-![Web Interface](docs/app_screenshot.png)
+![Web Interface](docs/app_screenshot_.png)
 
 ## Installation
 
