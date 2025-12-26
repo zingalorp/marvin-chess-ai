@@ -22,7 +22,8 @@ class PolicyOutput:
 
 
 def _mirror_square(sq: int) -> int:
-    # Same as `sq ^ 56` used in `process_pgn.py`.\n    return sq ^ 56", "oldString": "def _mirror_square(sq: int) -> int:\n    # Same as `sq ^ 56` used in `process_pgn_v2.py`.\n    return sq ^ 56
+    # Same as `sq ^ 56` used in `process_pgn.py`.
+    return sq ^ 56
 
 
 def _canonical_to_real_move(move: chess.Move, real_turn: chess.Color) -> chess.Move:

@@ -137,6 +137,9 @@ class UciEngine:
             _Option("MCTSAdaptive", "check", bool(self.settings["mcts_adaptive"])),
             _Option("MCTSAdaptiveScale", "string", str(self.settings["mcts_adaptive_scale"])),
             _Option("MCTSFPU", "string", str(self.settings.get("mcts_fpu_reduction", 0.0))),
+            _Option("MCTSContempt", "string", str(self.settings.get("mcts_contempt", 0.15))),
+            _Option("MCTSSimulateTime", "check", bool(self.settings.get("mcts_simulate_time", False))),
+            _Option("MCTSStartPly", "spin", int(self.settings.get("mcts_start_ply", 0)), min=0, max=100),
         ]
 
     def _print(self, line: str) -> None:
@@ -378,6 +381,12 @@ class UciEngine:
             set_setting("mcts_adaptive_scale", float(value))
         elif name_key == "mctsfpu":
             set_setting("mcts_fpu_reduction", float(value))
+        elif name_key == "mctscontempt":
+            set_setting("mcts_contempt", float(value))
+        elif name_key == "mctssimulatetime":
+            set_setting("mcts_simulate_time", _bool_from_uci(value))
+        elif name_key == "mctsstartply":
+            set_setting("mcts_start_ply", int(float(value)))
 
         # Echo back what option was set so wrappers and logs can verify it took effect.
         try:

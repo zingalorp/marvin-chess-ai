@@ -1,63 +1,66 @@
 # Marvin Chess
 
-A Human-Like Chess Transformer designed to mimic human behavior across the 1200-2600 ELO range.
+A human-like chess transformer designed to mimic human play across skill levels (1200-2600 Elo). The model is time-aware, adapting its play based on remaining clock time, opponent rating, and time control.
 
-The goal is to reach SOTA human move-matching accuracy. 
-Basically [Allie](https://arxiv.org/pdf/2410.03893) on a diet, using techniques described by the [Leela team](https://lczero.org/blog/2024/02/transformer-progress/).
+## Overview
 
-This model predicts:
-- **Move played** - policy head with resign/flag support
-- **Time spent** - 256-bin classification head  
-- **Game value** - WDL (Win/Draw/Loss) prediction
+Marvin is trained on millions of [Lichess](https://lichess.org) games to predict moves, time usage, and game outcomes. The goal is an engine that plays like a human - natural moves, realistic mistakes, and appropriate time management for the emulated skill level.
 
-## Project Structure
+The architecture uses techniques from [Leela Chess Zero](https://lczero.org/blog/2024/02/transformer-progress/) (Smolgen, 1.5x FFN) in a ~32M parameter transformer with three output heads:
 
-```
-marvin-chess/
-├── model.py          # ChessformerV2 model architecture
-├── train.py          # Training script
-├── dataset.py        # DataLoader for parquet training data
-├── process_pgn.py    # PGN preprocessing to parquet format
-├── inference/        # Inference runtime and UCI engine
-│   ├── uci_engine.py # UCI protocol implementation
-│   ├── app.py        # Flask web app for play/analysis
-│   └── ...
-├── lichess-bot/      # lichess-bot with custom modifications
-└── marvin_wrapper.sh # Wrapper script for lichess-bot
-```
+- **Policy**: Move probabilities (4096 from-to squares + resign + flag)
+- **Time**: 256-bin classification for thinking time
+- **Value**: Win/Draw/Loss probabilities
 
-## Quick Start
+Context conditioning (Elo, clock, time control) is injected via Adaptive Layer Normalization.
 
-### Play in a notebook
-See `notebooks/play_vs_chessformer_v2.ipynb`
+## Contents
 
-### UCI Engine
+- `model.py`, `train.py`, `dataset.py`, `process_pgn.py` - Training pipeline
+- `inference/app.py` - Web interface for play/analysis
+- `inference/uci_engine.py` - UCI protocol for chess GUIs
+- `inference/mcts.py` - MCTS with WDL evaluation
+- `lichess-bot/` - Modified [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for online play
+
+### `inference/app.py` 
+GUI for prediction distributions, adjustable parameter tweaking, experimenting and playing against the model.
+
+![Web Interface](docs/app_screenshot.png)
+
+## Installation
+
+Tested on Linux/WSL with Python 3.10+.
+
 ```bash
-python -m inference.uci_engine
+git clone https://github.com/zingalorp/marvin.git
+cd marvin
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### Web Interface
+## Usage
+
+**Web interface:**
 ```bash
 python -m inference.app
 ```
 
-### lichess-bot Integration
-The `lichess-bot/` directory contains a modified version of [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) with:
-- Custom time control filtering (`extra_game_handlers.py`)
-- Resign/flag action support (`lib/engine_wrapper.py`)
-
-Setup:
-1. Copy `lichess-bot/config.example.yml` to `lichess-bot/config.yml`
-2. Add your Lichess OAuth2 token
-3. Update paths to point to your installation
-4. Run: `cd lichess-bot && python lichess-bot.py`
-
-## Training
-
+**UCI engine:**
 ```bash
-# Preprocess PGN files
-python process_pgn.py --input data/raw/*.pgn --output data_v2/
-
-# Train model
-python train.py --config smolgen --data-dir data_v2/
+python -m inference.uci_engine
 ```
+
+**Training:**
+```bash
+python process_pgn.py --input data/raw/*.pgn --output data/
+python train.py --data-dir data/
+```
+
+**Lichess bot:** See `lichess-bot/config.example.yml` for setup.
+
+## Acknowledgments
+
+- [Lichess](https://lichess.org) for training data and bot infrastructure
+- [Leela Chess Zero](https://lczero.org) for Smolgen and architectural techniques
+- [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework

@@ -33,7 +33,7 @@ from tqdm import tqdm
 # CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
 INPUT_DIR = Path("data/raw")
-OUTPUT_ROOT = Path("data_v2")
+OUTPUT_ROOT = Path("data")
 HISTORY_LEN = 8
 CHUNK_SIZE = 250_000
 

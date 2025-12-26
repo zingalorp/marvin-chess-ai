@@ -34,6 +34,9 @@ DEFAULT_GAME_SETTINGS: dict = {
     "mcts_max_depth": 96,
     "mcts_adaptive": False,
     "mcts_adaptive_scale": 500.0,
+    "mcts_contempt": 0.15,  # Penalize draws to avoid drawish positions when ahead
+    "mcts_simulate_time": False,  # Simulate remaining thinking time after MCTS completes
+    "mcts_start_ply": 0,  # Ply at which MCTS kicks in (0 = from start, higher = skip opening for variety)
     "show_mcts_stats": False,
 
     # Overlays

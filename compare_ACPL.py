@@ -1,7 +1,7 @@
 """compare_ACPL.py
 
 Compute Average Centipawn Loss (ACPL) and CPL variance for a model
-versus a dataset of human games (e.g. `data_v2/val_balanced.parquet`).
+versus a dataset of human games (e.g. `data/val_balanced.parquet`).
 
 The script is intentionally defensive: it probes the parquet to find
 useful columns, can operate per-game or per-position, and uses Stockfish
@@ -9,7 +9,7 @@ via `python-chess` for centipawn evaluations. If no engine path is
 provided the script will attempt to use `stockfish` on PATH.
 
 Usage examples:
-  python compare_ACPL.py --parquet data_v2/val_balanced.parquet --num-games 2000 \
+  python compare_ACPL.py --parquet data/val_balanced.parquet --num-games 2000 \
       --engine-path /usr/bin/stockfish --model-py model.py --checkpoint inference/chessformer_v2_smolgen_best.pt
 
 Notes:
@@ -237,7 +237,7 @@ def iterate_games_or_positions(pq_path: Path, *, min_elo: int, max_elo: int) -> 
 
 def main():
     p = argparse.ArgumentParser(description="Compare ACPL between dataset and model")
-    p.add_argument("--parquet", required=True, help="Path to val_parquet (e.g. data_v2/val_balanced.parquet)")
+    p.add_argument("--parquet", required=True, help="Path to val_parquet (e.g. data/val_balanced.parquet)")
     p.add_argument("--num-games", type=int, default=4000, help="Number of games (or positions) to sample")
     p.add_argument("--min-elo", type=int, default=2400)
     p.add_argument("--max-elo", type=int, default=2500)

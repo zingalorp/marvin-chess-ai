@@ -119,6 +119,7 @@ def _evaluate_position(
     root_turn: chess.Color,
     time_history_s: list[float] | None,
     device: torch.device,
+    contempt: float = 0.0,
 ) -> Tuple[Dict[chess.Move, float], float, float]:
     """Returns (priors over legal real moves, value for side-to-move, expected ponder time seconds)."""
 
@@ -144,7 +145,9 @@ def _evaluate_position(
 
     # NOTE: The model's WDL head is ordered as [Loss, Draw, Win].
     wdl = torch.softmax(v_cls[0].float(), dim=-1)
-    value = float((wdl[2] - wdl[0]).item())  # win - loss
+    # Apply contempt: penalize draws to avoid drawish positions when ahead
+    # value = P(win) - P(loss) - contempt * P(draw)
+    value = float((wdl[2] - wdl[0] - contempt * wdl[1]).item())
 
     # Deterministic expected ponder time (seconds) for the side-to-move at this node.
     # This is used to fill simulated time_history entries downstream.
@@ -193,6 +196,7 @@ def _evaluate_positions_batch(
     root_turn: chess.Color,
     time_histories_s: list[list[float] | None],
     device: torch.device,
+    contempt: float = 0.0,
 ) -> Tuple[list[Dict[chess.Move, float]], list[float], list[float]]:
     """Batched version of `_evaluate_position`.
 
@@ -237,7 +241,8 @@ def _evaluate_positions_batch(
 
     promo_p = torch.softmax(promo_logits.float(), dim=-1)  # (B,8,4)
     wdl = torch.softmax(v_cls.float(), dim=-1)  # (B,3) ordered [L,D,W]
-    values = (wdl[:, 2] - wdl[:, 0]).detach().cpu().numpy().astype(np.float64).tolist()
+    # Apply contempt: value = P(win) - P(loss) - contempt * P(draw)
+    values = (wdl[:, 2] - wdl[:, 0] - contempt * wdl[:, 1]).detach().cpu().numpy().astype(np.float64).tolist()
 
     # Deterministic expected ponder time for each board (seconds).
     # Need per-board active_clock_s after side-to-move alignment.
@@ -294,6 +299,13 @@ class MCTSSettings:
     root_dirichlet_alpha: float = 0.0
     root_exploration_frac: float = 0.0
     final_temperature: float = 0.0
+
+    # Contempt: adjusts how draws are valued relative to wins/losses.
+    # value = P(win) - P(loss) - contempt * P(draw)
+    # Positive contempt penalizes draws, making the engine prefer sharper positions
+    # when it has an advantage. Typical values: 0.0 (neutral), 0.1-0.3 (slight contempt).
+    # Leela uses ~0.1 by default when playing weaker opponents.
+    contempt: float = 0.15
 
     # First Play Urgency (FPU): for unvisited children, use (parent_q - fpu_reduction)
     # as the value term (in the *parent player's* perspective) instead of implicitly using 0.0.
@@ -418,6 +430,7 @@ def mcts_choose_move(
         root_turn=root_turn,
         time_history_s=time_history_s,
         device=device,
+        contempt=float(settings.contempt),
     )
     root.pred_time_s = float(root_time_s)
 
@@ -517,6 +530,7 @@ def mcts_choose_move(
                 root_turn=root_turn,
                 time_histories_s=eval_th,
                 device=device,
+                contempt=float(settings.contempt),
             )
 
         # Commit expansions + backups, removing virtual loss first.

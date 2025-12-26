@@ -33,7 +33,7 @@ from model import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer V2 trainer")
-    parser.add_argument("--data-dir", default="data_v2", help="Root directory containing train/val/test splits")
+    parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
     parser.add_argument("--config", choices=["leela", "deep", "smolgen", "100m"], default="smolgen")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)

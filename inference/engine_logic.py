@@ -349,7 +349,16 @@ def choose_engine_move(
 
     engine_pred_time_s = float(engine_stats.get("time_sample_s", 0.0))
 
-    if allow_ponder_sleep and bool(settings.get("simulate_thinking_time", False)):
+    # For non-MCTS mode: simulate thinking time before returning
+    # For MCTS mode: we handle timing after MCTS completes (see below)
+    use_mcts = bool(settings.get("use_mcts", False))
+    current_ply = len(moves_uci)
+    mcts_start_ply = int(settings.get("mcts_start_ply", 0))
+    
+    # Skip MCTS for early plies to allow varied openings
+    use_mcts_this_move = use_mcts and (current_ply >= mcts_start_ply)
+
+    if allow_ponder_sleep and bool(settings.get("simulate_thinking_time", False)) and not use_mcts_this_move:
         # In the web app, this is an intentional delay. In UCI, we want to be
         # responsive to `stop`/new `position`, so make it interruptible.
         if stop_check is None:
@@ -373,8 +382,12 @@ def choose_engine_move(
     )
 
     mcts_stats = None
-
-    if bool(settings.get("use_mcts", False)):
+    use_mcts = bool(settings.get("use_mcts", False))
+    mcts_start_ply = int(settings.get("mcts_start_ply", 0))
+    current_ply = len(moves_uci)
+    
+    # Check if we should use MCTS (enabled and past start ply)
+    if use_mcts and current_ply >= mcts_start_ply:
         sims = int(settings.get("mcts_simulations", 128))
         cpuct = float(settings.get("mcts_c_puct", 1.5))
 
@@ -404,8 +417,12 @@ def choose_engine_move(
             root_exploration_frac=float(settings.get("mcts_root_exploration_frac", 0.0)),
             final_temperature=float(settings.get("mcts_final_temperature", 0.0)),
             fpu_reduction=float(settings.get("mcts_fpu_reduction", 0.0)),
+            contempt=float(settings.get("mcts_contempt", 0.15)),
         )
 
+        # Track MCTS execution time for timing simulation
+        mcts_start_time = time.time()
+        
         out = mcts_choose_move(
             model=model,
             board=board,
@@ -418,11 +435,18 @@ def choose_engine_move(
             claim_draw=False,
         )
         mcts_stats = out.stats
+        
+        mcts_elapsed_s = time.time() - mcts_start_time
+        
+        # Simulate remaining thinking time after MCTS if enabled
+        if bool(settings.get("mcts_simulate_time", False)):
+            remaining_time = engine_pred_time_s - mcts_elapsed_s
+            if remaining_time > 0:
+                time.sleep(remaining_time)
     else:
         _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
         
         # Use opening temperature during opening phase for more varied openings
-        current_ply = len(moves_uci)
         opening_length = int(settings.get("opening_length", 10))
         if current_ply < opening_length:
             effective_temperature = float(settings.get("opening_temperature", settings["temperature"]))
