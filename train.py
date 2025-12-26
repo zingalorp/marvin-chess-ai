@@ -1,4 +1,4 @@
-"""Trainer for Chessformer V2 using the new per-token input encoding and legal move masking."""
+"""Trainer for Chessformer using per-token input encoding and legal move masking."""
 
 from __future__ import annotations
 
@@ -19,20 +19,16 @@ from torch.amp import GradScaler, autocast
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset_v2 import create_dataloader_v2, count_samples
+from dataset import create_dataloader_v2, count_samples
 
-# Import from model_v2-1 using importlib due to hyphen in filename
-import importlib.util
-import sys
-_spec = importlib.util.spec_from_file_location("model_v2_1", "model_v2-1.py")
-_model_module = importlib.util.module_from_spec(_spec)
-sys.modules["model_v2_1"] = _model_module
-_spec.loader.exec_module(_model_module)
-ChessformerV2 = _model_module.ChessformerV2
-CONFIG_V2_LEELA = _model_module.CONFIG_V2_LEELA
-CONFIG_V2_DEEP = _model_module.CONFIG_V2_DEEP
-CONFIG_V2_SMOLGEN = _model_module.CONFIG_V2_SMOLGEN
-CONFIG_100M_BALANCED = _model_module.CONFIG_100M_BALANCED
+# Import model
+from model import (
+    ChessformerV2,
+    CONFIG_V2_LEELA,
+    CONFIG_V2_DEEP,
+    CONFIG_V2_SMOLGEN,
+    CONFIG_100M_BALANCED,
+)
 
 
 def parse_args() -> argparse.Namespace:

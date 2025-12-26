@@ -19,7 +19,7 @@ class LoadedModel:
 
 
 def _load_model_module(model_py_path: Path):
-    spec = importlib.util.spec_from_file_location("marvin_model_v2_1", model_py_path)
+    spec = importlib.util.spec_from_file_location("marvin_model", model_py_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load module spec from {model_py_path}")
     module = importlib.util.module_from_spec(spec)
@@ -29,7 +29,7 @@ def _load_model_module(model_py_path: Path):
 
 def load_chessformer_v2(
     *,
-    model_py_path: str | Path = "model_v2-1.py",
+    model_py_path: str | Path = "model.py",
     config_name: ConfigName = "smolgen",
     checkpoint_path: str | Path = "inference/chessformer_v2_smolgen_best.pt",
     device: str | torch.device = "cuda",

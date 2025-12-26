@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-High-performance PGN processor (v2) with:
+High-performance PGN processor with:
 - Bucket quotas for data balancing (elo, ply, clock)
 - Stratified train/val/test splits
 - Flag/resign move as policy targets
@@ -666,7 +666,7 @@ def main():
         effective_quota = args.bucket_quota
         quota_mode = f"{args.bucket_quota:,} per worker (max {args.bucket_quota * args.num_workers:,} global)"
     
-    print(f"=== PGN Processor v2 (Fast) ===")
+    print(f"=== PGN Processor ===")
     print(f"Input: {INPUT_DIR.resolve()}")
     print(f"Output: {OUTPUT_ROOT.resolve()}")
     print(f"Workers: {args.num_workers}")

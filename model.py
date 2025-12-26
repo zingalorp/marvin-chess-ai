@@ -1,8 +1,8 @@
 """
-Chessformer v2 - Model architecture aligned with LEVEL_UP_PLAN.md
+Chessformer - Human-like chess transformer model.
 
-Key changes from v1:
-- Per-token input encoding (board history + metadata concatenated per square)
+Architecture features:
+- Per-token input encoding (board history + metadata per square)
 - Absolute position embeddings (per-square learned embeddings)
 - Policy head with 1/sqrt(d_model) scaling
 - Legal move masking
@@ -130,10 +130,9 @@ class RMSNorm(nn.Module):
 
 class ContextEncoder(nn.Module):
     """
-    Encode global context (ELO, time, move count) into a style vector.
+    Encode global context (ELO, time, move count) into a conditioning vector.
     
-    This is like the text encoder in Stable Diffusion - it produces a
-    conditioning vector that modulates the network's behavior via AdaLN.
+    Produces a vector that modulates the network's behavior via AdaLN.
     
     Inputs (8 scalars):
     - player_elo: Normalized to ~[0.1, 0.9] for 1200-2500 range
@@ -654,11 +653,9 @@ class PerSquareInputEncoder(nn.Module):
 
 class ChessformerV2(nn.Module):
     """
-    Chessformer v2 with LEVEL_UP_PLAN architecture changes.
+    Chessformer model with AdaLN (Adaptive Layer Normalization) for global context conditioning.
     
-    Now with AdaLN (Adaptive Layer Normalization) for global context conditioning.
-    ELO and time act as "style vectors" that modulate the network's behavior,
-    similar to how text prompts control Stable Diffusion.
+    ELO and time modulate the network's behavior via conditional normalization.
     """
     def __init__(self, config):
         super().__init__()
@@ -756,7 +753,7 @@ class ChessformerV2(nn.Module):
     def forward(self, batch, return_promo=False):
         """
         Args:
-            batch: dict with keys from dataset_v2
+            batch: dict with keys from dataset
             return_promo: if True, also return promotion logits
         
         Returns:

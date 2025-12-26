@@ -1,4 +1,4 @@
-"""Dataset for Marvin Chess v2 data format with board history and legal moves."""
+"""Dataset for Marvin Chess with board history and legal moves."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def _sample_to_tensors(sample: SampleV2) -> Dict[str, torch.Tensor]:
     board_history = torch.from_numpy(sample.board_history).long()
     
     # Time history: (8,) float32 - model expects most-recent first.
-    # Parquet rows from `process_pgn_v2.py` store time_history oldest->newest.
+    # Parquet rows from `process_pgn.py` store time_history oldest->newest.
     time_history = torch.from_numpy(sample.time_history[::-1].copy()).float() / 60.0
     
     # Repetition flags: (8,) float32
@@ -238,7 +238,7 @@ class StreamingDatasetV2(IterableDataset):
         try:
             parquet_file = pq.ParquetFile(file_path)
         except Exception as exc:
-            print(f"[dataset_v2] Failed to open {file_path}: {exc}")
+            print(f"[dataset] Failed to open {file_path}: {exc}")
             return
 
         # Deterministic RNG for this file
@@ -262,7 +262,7 @@ class StreamingDatasetV2(IterableDataset):
                     if sample is not None:
                         yield _sample_to_tensors(sample)
             except Exception as e:
-                print(f"[dataset_v2] Error processing batch in {file_path}: {e}")
+                print(f"[dataset] Error processing batch in {file_path}: {e}")
                 continue
 
     def _extract_sample(self, batch, idx: int) -> Optional[SampleV2]:
@@ -351,7 +351,7 @@ def build_dataloaders_v2(
     train_files = sorted(Path(train_dir).glob("*.parquet"))
     val_files = sorted(Path(val_dir).glob("*.parquet"))
     
-    print(f"[dataset_v2] Found {len(train_files)} train files, {len(val_files)} val files")
+    print(f"[dataset] Found {len(train_files)} train files, {len(val_files)} val files")
     
     train_ds = StreamingDatasetV2(
         [str(f) for f in train_files],
@@ -460,7 +460,7 @@ def create_dataloader_v2(
     else:
         raise ValueError(f"Unknown split: {split}. Use 'train' or 'val'.")
     
-    print(f"[dataset_v2] Split: {split} | Files: {len(files)}/{len(all_files)} ({len(files)/len(all_files)*100:.1f}%)")
+    print(f"[dataset] Split: {split} | Files: {len(files)}/{len(all_files)} ({len(files)/len(all_files)*100:.1f}%)")
     
     is_train = split == "train"
     should_shuffle = shuffle if shuffle is not None else is_train
@@ -525,10 +525,10 @@ class BalancedValDataset(torch.utils.data.Dataset):
         self.parquet_path = parquet_path
         
         # Load entire table into memory
-        print(f"[dataset_v2] Loading balanced validation set from {parquet_path}...")
+        print(f"[dataset] Loading balanced validation set from {parquet_path}...")
         table = pq.read_table(parquet_path)
         self.num_samples = len(table)
-        print(f"[dataset_v2] Loaded {self.num_samples:,} validation samples")
+        print(f"[dataset] Loaded {self.num_samples:,} validation samples")
         
         # Convert to pandas for easier indexing
         self.df = table.to_pandas()

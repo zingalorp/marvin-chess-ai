@@ -1,31 +1,64 @@
 *
 
-# Pre-processing scripts
+# ============================
+# Core Scripts (Include)
+# ============================
+
+# Model and training
+!model.py
+!train.py
+!dataset.py
+
+# Data preprocessing
+!process_pgn.py
 !profile_data.py
 !calculate_retention_rates.py
 !visualize_profile.py
 
-# Training scripts
-!process_pgn_v2.py
-!train_v2.py
-!dataset_v2.py
-!model_v2.py
-!model_v2-1.py
-!train_v2-1.py
+# Evaluation
+!compare_ACPL.py
 
-!.gitignore
-!README.md
-
-# Inference scripts
+# ============================
+# Inference (Include)
+# ============================
 !inference/
 !inference/*.py
 
+# ============================
+# Lichess-bot integration (Include)
+# ============================
+# Note: lichess-bot is a separate git repo with custom modifications.
+# Include only the custom/modified files and example configs.
+!lichess-bot/
+!lichess-bot/extra_game_handlers.py
+!lichess-bot/lib/
+!lichess-bot/lib/engine_wrapper.py
+!lichess-bot/lib/model.py
+!lichess-bot/config.example.yml
 
-# Configuration files
+# Wrapper script for UCI engine
+!marvin_wrapper.sh
+
+# ============================
+# Documentation & Config (Include)
+# ============================
+!.gitignore
+!README.md
 !requirements.txt
 
-# lichess-bot related script
-!
+# ============================
+# Exclude (Implicit with * at top)
+# ============================
+# - checkpoints/ (large model files)
+# - data/ and data_v2/ (large training data)
+# - runs/ (tensorboard logs)
+# - __pycache__/ (Python cache)
+# - venv/ (virtual environments)
+# - old_scripts/ (deprecated code)
+# - goodversions/ (backup code)
+# - notebooks/ (experimental notebooks)
+# - *.pt files (except those in inference/)
+# - *.parquet files (training data)
 
 
 

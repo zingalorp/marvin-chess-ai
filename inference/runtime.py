@@ -10,9 +10,9 @@ from inference.model_loader import LoadedModel, load_chessformer_v2
 
 def resolve_repo_root(*, cwd: Path | None = None) -> Path:
     cwd = (cwd or Path.cwd()).resolve()
-    if (cwd / "model_v2-1.py").exists():
+    if (cwd / "model.py").exists():
         return cwd
-    if (cwd.parent / "model_v2-1.py").exists():
+    if (cwd.parent / "model.py").exists():
         return cwd.parent
     return cwd
 
@@ -33,7 +33,7 @@ def load_default_chessformer(*, repo_root: Path | None = None, device: torch.dev
 
     device = device or default_device()
 
-    model_py_path = repo_root / "model_v2-1.py"
+    model_py_path = repo_root / "model.py"
     checkpoint_path = repo_root / "inference/chessformer_v2_smolgen_best.pt"
 
     loaded = load_chessformer_v2(

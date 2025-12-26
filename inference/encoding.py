@@ -15,7 +15,7 @@ HISTORY_LEN = 8
 NUM_SQUARES = 64
 NUM_POLICY_OUTPUTS = 4098
 
-# Must match `process_pgn_v2.py`
+# Must match `process_pgn.py`
 PIECE_MAP = {
     chess.PAWN: 1,
     chess.KNIGHT: 2,
@@ -177,7 +177,7 @@ def make_model_batch(
     # During inference, we mask them out so the model only picks legal chess moves.
     # The raw logits at indices 4096/4097 can still be read for analysis/display.
 
-    # --- Scalars (must match dataset_v2.py normalization) ---
+    # --- Scalars (must match dataset.py normalization) ---
     active_elo_norm = (ctx.active_elo - 1900) / 700.0
     opp_elo_norm = (ctx.opponent_elo - 1900) / 700.0
     ply_norm = board.fullmove_number * 2 - (0 if board.turn == chess.WHITE else 1)
