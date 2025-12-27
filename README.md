@@ -29,7 +29,7 @@ Context conditioning (Elo, clock, time control) is injected via Adaptive Layer N
 ### `inference/app.py` 
 GUI for prediction distributions, live parameter tweaking, experimenting, and playing against the model.
 
-![Web Interface](docs/app_screenshot_.png)
+![Web Interface](docs/app_screenshot.png)
 
 ## Installation
 
@@ -82,5 +82,5 @@ Pretrained model weights are available on [Hugging Face](https://huggingface.co/
 - [Lichess](https://lichess.org) for training data and bot infrastructure
 - [Leela Chess Zero](https://lczero.org) for architectural techniques
 - [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework
-- [Chessground](https://github.com/lichess-org/chessground) for the web board UI (used under its license)
+- [Chessground](https://github.com/lichess-org/chessground) for the web board UI
 
