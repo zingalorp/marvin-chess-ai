@@ -63,8 +63,24 @@ python train.py --data-dir data/
 
 **Lichess bot:** See `lichess-bot/config.example.yml` for setup.
 
+## Play on Lichess
+
+You can also play against the Marvin bots on Lichess:
+
+- [Marvin-1200](https://lichess.org/@/marvin-1200)
+- [Marvin-1600](https://lichess.org/@/marvin-1600)
+- [Marvin-2000](https://lichess.org/@/marvin-2000)
+- [Marvin-2400](https://lichess.org/@/marvin-2400)
+- [Marvin-GM](https://lichess.org/@/marvin-GM)
+
+## Model Weights
+
+Pretrained model weights are available on [Hugging Face](https://huggingface.co/holymolyyy/marvin).
+
 ## Acknowledgments
 
 - [Lichess](https://lichess.org) for training data and bot infrastructure
 - [Leela Chess Zero](https://lczero.org) for architectural techniques
 - [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework
+- [Chessground](https://github.com/lichess-org/chessground) for the web board UI (used under its license)
+

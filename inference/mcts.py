@@ -408,6 +408,7 @@ def mcts_choose_move(
     rng: Optional[np.random.Generator] = None,
     stop_check: Callable[[], bool] | None = None,
     claim_draw: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> PolicyOutput:
     """PUCT MCTS using (policy priors, WDL value) from the model."""
 
@@ -569,6 +570,28 @@ def mcts_choose_move(
             break
 
         done += len(leaves)
+        
+        # Call progress callback with current stats
+        if progress_callback is not None and root.children:
+            try:
+                progress_stats = []
+                for m in root.children:
+                    child = root.children[m]
+                    progress_stats.append({
+                        "move": m.uci(),
+                        "visits": child.visit_count,
+                        "q": -child.q() if child.visit_count > 0 else 0.0,
+                        "prior": child.prior
+                    })
+                progress_stats.sort(key=lambda x: x["visits"], reverse=True)
+                progress_callback({
+                    "done": done,
+                    "total": sims,
+                    "root_value": root_value,
+                    "children": progress_stats[:20]  # Limit to top 20 for efficiency
+                })
+            except Exception:
+                pass  # Progress callback must never break MCTS
 
     if not root.children:
         return PolicyOutput(move=None, policy_prob=1.0)

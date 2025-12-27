@@ -323,6 +323,7 @@ def choose_engine_move(
     time_history_s: list[float] | None,
     stop_check: Callable[[], bool] | None = None,
     allow_ponder_sleep: bool = True,
+    mcts_progress_callback: Callable[[dict], None] | None = None,
 ) -> tuple[PolicyOutput, dict, dict | None]:
     """Implements the engine selection path from `_play_engine_move` in `inference/app.py`.
 
@@ -433,6 +434,7 @@ def choose_engine_move(
             rng=rng,
             stop_check=stop_check,
             claim_draw=False,
+            progress_callback=mcts_progress_callback,
         )
         mcts_stats = out.stats
         

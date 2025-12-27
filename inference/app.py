@@ -1,12 +1,14 @@
 import sys
 import json
 import logging
+import queue
+import threading
 from pathlib import Path
 import numpy as np
 import torch
 import chess
 import chess.svg
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template, render_template_string, request, jsonify, Response
 import time
 
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_S, START_CLOCK_S
@@ -384,6 +386,24 @@ game_state = {
     "pos_cache": {},
 }
 
+# MCTS progress streaming
+mcts_progress_queue = queue.Queue()
+mcts_progress_lock = threading.Lock()
+mcts_final_stats = None  # Store final stats for display after MCTS completes
+
+
+def _mcts_progress_callback(stats: dict) -> None:
+    """Called by MCTS during search to report progress."""
+    global mcts_final_stats
+    try:
+        # Non-blocking put - if queue is full, skip this update
+        mcts_progress_queue.put_nowait(stats)
+        # Also store as final stats (will be overwritten each iteration)
+        with mcts_progress_lock:
+            mcts_final_stats = stats
+    except queue.Full:
+        pass
+
 
 def _clear_pos_cache() -> None:
     game_state["pos_cache"] = {}
@@ -462,6 +482,11 @@ def prepare_response(board):
     }
     current_html = format_stats_html(current_stats)
     
+    # Extract top move UCI for arrow drawing
+    top_move_uci = None
+    if current_stats.get('top_moves') and len(current_stats['top_moves']) > 0:
+        top_move_uci = current_stats['top_moves'][0].get('uci')
+    
     # Construct Engine Inputs HTML
     if board.turn == game_settings["human_color"]:
         act_color = "White" if board.turn == chess.WHITE else "Black"
@@ -511,6 +536,20 @@ def prepare_response(board):
     
     pgn_str = pgn_board.variation_san(full_moves)
 
+    # Get legal moves as UCI strings for Chessground
+    legal_moves = [move.uci() for move in board.legal_moves]
+    
+    # Get last move for highlighting
+    last_move = None
+    if game_state["cursor"] > 0:
+        last_item = game_state["history"][game_state["cursor"] - 1]
+        last_uci = last_item.get('uci', '')
+        if last_uci and last_uci not in ('resign', 'flag'):
+            last_move = [last_uci[:2], last_uci[2:4]]
+    
+    # Check if in check
+    in_check = board.is_check()
+
     return jsonify({
         "fen": fen,
         "orientation": "white" if game_settings["human_color"] == chess.WHITE else "black",
@@ -523,12 +562,16 @@ def prepare_response(board):
         "is_game_over": board.is_game_over(),
         "result": board.result() if board.is_game_over() else "",
         "attention64": current_stats.get("attention64"),
-        "settings": game_settings
+        "settings": game_settings,
+        "legal_moves": legal_moves,
+        "last_move": last_move,
+        "in_check": in_check,
+        "top_move_uci": top_move_uci
     })
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template('index.html')
 
 @app.route('/state', methods=['GET'])
 def get_state():
@@ -538,6 +581,10 @@ def get_state():
 @app.route('/settings', methods=['POST'])
 def update_settings():
     data = request.json
+    
+    if 'auto_play' in data:
+        game_settings['auto_play'] = bool(data['auto_play'])
+    
     game_settings['temperature'] = float(data.get('temperature', game_settings['temperature']))
     game_settings['time_temperature'] = float(data.get('time_temperature', game_settings.get('time_temperature', 1.0)))
     game_settings['top_p'] = float(data.get('top_p', game_settings['top_p']))
@@ -589,6 +636,8 @@ def update_settings():
         game_settings['mcts_adaptive_scale'] = float(data['mcts_adaptive_scale'])
     if 'show_mcts_stats' in data:
         game_settings['show_mcts_stats'] = bool(data['show_mcts_stats'])
+    if 'show_arrows' in data:
+        game_settings['show_arrows'] = bool(data['show_arrows'])
     if 'show_attention' in data:
         game_settings['show_attention'] = bool(data['show_attention'])
 
@@ -645,6 +694,11 @@ def _play_engine_move(board):
     time_hist_engine = _pred_time_history_s_at_cursor(cursor_engine)
     clocks_engine = _clocks_at_cursor(cursor_engine)
     
+    # Use progress callback if MCTS is enabled and show_mcts_stats is on
+    progress_cb = None
+    if game_settings.get("use_mcts", False) and game_settings.get("show_mcts_stats", False):
+        progress_cb = _mcts_progress_callback
+    
     out, engine_stats, mcts_stats = choose_engine_move_core(
         model=model,
         device=loaded.device,
@@ -659,6 +713,7 @@ def _play_engine_move(board):
         time_history_s=time_hist_engine,
         stop_check=None,
         allow_ponder_sleep=True,
+        mcts_progress_callback=progress_cb,
     )
 
     stats_html = format_stats_html(engine_stats)
@@ -771,11 +826,52 @@ def make_move():
 
 @app.route('/engine_move', methods=['POST'])
 def engine_move_endpoint():
+    global mcts_final_stats
+    # Clear any previous MCTS stats
+    with mcts_progress_lock:
+        mcts_final_stats = None
+    # Drain the queue
+    while not mcts_progress_queue.empty():
+        try:
+            mcts_progress_queue.get_nowait()
+        except queue.Empty:
+            break
+    
     board = get_board_at_cursor()
     # Only play if it is NOT the human's turn (i.e. it is engine's turn)
     if not board.is_game_over() and board.turn != game_settings['human_color']:
         _play_engine_move(board)
     return get_state()
+
+
+@app.route('/mcts_progress')
+def mcts_progress_stream():
+    """SSE endpoint for streaming MCTS progress updates."""
+    def generate():
+        while True:
+            try:
+                # Wait for new progress with timeout
+                stats = mcts_progress_queue.get(timeout=0.1)
+                yield f"data: {json.dumps(stats)}\n\n"
+            except queue.Empty:
+                # Send keepalive
+                yield f": keepalive\n\n"
+    
+    return Response(generate(), mimetype='text/event-stream', headers={
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    })
+
+
+@app.route('/mcts_stats')
+def get_mcts_stats():
+    """Get the final MCTS stats after search completes."""
+    with mcts_progress_lock:
+        if mcts_final_stats:
+            return jsonify(mcts_final_stats)
+        return jsonify(None)
+
 
 @app.route('/reset', methods=['POST'])
 def reset():
@@ -786,758 +882,6 @@ def reset():
     # Frontend will trigger engine move if needed
         
     return get_state()
-
-# ==========================================
-# 4. FRONTEND TEMPLATE
-# ==========================================
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ChessFormer Web</title>
-    <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
-    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
-    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
-    <style>
-        body { background-color: #0e0e0e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; }
-        
-        .container { display: flex; gap: 20px; max-width: 1300px; margin: 0 auto; align-items: flex-start; justify-content: center; }
-        
-        /* 1. Settings Panel */
-        .settings-panel { width: 250px; background: #181818; padding: 12px; border-radius: 8px; border: 1px solid #333; max-height: 85vh; overflow-y: auto; }
-        .settings-panel::-webkit-scrollbar { width: 4px; }
-        .settings-panel::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
-        .settings-panel::-webkit-scrollbar-track { background: #222; }
-
-        .setting-group { margin-bottom: 8px; }
-        .setting-label { font-size: 11px; font-weight: 600; color: #aaa; margin-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
-        .setting-val { color: #4caf50; font-family: monospace; font-size: 11px; }
-        input[type=range] { width: 100%; -webkit-appearance: none; background: #333; height: 4px; border-radius: 2px; outline: none; margin: 5px 0; display: block; }
-        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: #eee; border-radius: 50%; cursor: pointer; }
-        
-        .section-header { font-size: 10px; font-weight: 700; color: #555; text-transform: uppercase; margin: 15px 0 8px 0; border-bottom: 1px solid #222; padding-bottom: 4px; letter-spacing: 0.5px; }
-        .section-header:first-of-type { margin-top: 0; }
-
-        .lock-btn { cursor:pointer; font-size:11px; color:#666; display:flex; align-items:center; gap:6px; margin: -6px 0 12px 0; justify-content:flex-end; user-select:none; }
-        .lock-btn:hover { color:#999; }
-        .lock-btn.active { color: #4caf50; }
-        .lock-btn.active svg { fill: #4caf50; }
-        .lock-btn svg { width:12px; height:12px; fill:#666; transition:fill 0.2s; }
-
-        /* Simple color blobs for Play-As control */
-        .color-blob { width:18px; height:18px; border-radius:50%; display:inline-block; box-sizing:border-box; }
-        .color-blob.white { background: #fff; border: 2px solid #ccc; }
-        /* Make black visible on the dark background by giving a light border and subtle outline */
-        .color-blob.black { background: #000; border: 2px solid rgba(255,255,255,0.9); box-shadow: 0 0 0 2px rgba(255,255,255,0.06); }
-
-        /* 2. Board Area */
-        #board-area { width: 500px; }
-        #board { width: 100%; }
-        
-        /* 3. Stats Panel */
-        .sidebar { width: 320px; }
-        
-        /* Stats Styling */
-        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        .panel { background: #1f1f1f; border: 1px solid #333; padding: 10px; border-radius: 6px; margin-bottom: 8px;}
-        .panel h3 { margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase; color: #888; border-bottom: 1px solid #333; padding-bottom: 4px; }
-        
-        .policy-scroll { max-height: 300px; overflow-y: auto; padding-right:4px; }
-        .policy-scroll::-webkit-scrollbar { width: 4px; }
-        .policy-scroll::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
-        .policy-scroll::-webkit-scrollbar-track { background: #222; }
-
-        .row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 13px; }
-        .lbl { width: 50px; font-family: monospace; font-weight: bold; flex-shrink:0; }
-        .bar-bg { flex-grow: 1; height: 6px; background: #333; border-radius: 2px; overflow: hidden; }
-        .val { width: 35px; text-align: right; font-size: 11px; color: #aaa; }
-        .sub { font-size: 11px; color: #888; margin-top: 4px; }
-        .big-val { font-size: 20px; font-weight: bold; color: #eee; }
-        .err { font-size: 12px; color: #f44336; font-weight: normal; }
-        
-        .section-title { font-size: 12px; font-weight: 600; color: #aaa; margin: 20px 0 6px 0; letter-spacing: 0.5px; }
-        .chosen-move { padding: 8px; background: #2c2c2c; border-top: 1px solid #444; font-weight: bold; color: #4caf50; margin-top: 8px; }
-        
-        /* Controls */
-        /* Slight right offset so the arrow buttons sit visually centered under the board */
-        .controls { display: flex; gap: 5px; justify-content: center; margin-top: 10px; margin-left: 84px; }
-        .btn { background: #333; color: white; border: none; padding: 8px 14px; cursor: pointer; border-radius: 4px; font-size: 16px; min-width: 40px;}
-        .btn:hover { background: #444; }
-        .btn-reset { font-size: 14px; background: #442222; }
-        #status { text-align:center; min-height: 20px; color: #888; font-size: 13px; margin-top: 8px; }
-
-        /* PGN Container */
-        .pgn-container { margin-top: 15px; background: #181818; padding: 10px; border-radius: 4px; border: 1px solid #333; position: relative; min-height:40px; }
-        #pgn-text { font-family: monospace; font-size: 12px; color: #aaa; line-height: 1.4; word-wrap: break-word; padding-right: 24px; white-space: pre-wrap; }
-        .copy-btn { position: absolute; top: 5px; right: 5px; background: transparent; border: none; cursor: pointer; opacity: 0.4; font-size: 16px; transition: opacity 0.2s; }
-        .copy-btn:hover { opacity: 1; }
-
-        /* Attention overlay (8x8 grid over board) */
-        #board-wrap { position: relative; width: 100%; }
-        #attn-overlay { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); pointer-events: none; }
-        .attn-cell { background: #4caf50; opacity: 0; }
-
-        
-    </style>
-</head>
-<body>
-
-<div class="container">
-    <!-- LEFT: Settings -->
-    <div class="settings-panel">
-        <div class="section-header">Game Setup</div>
-        
-        <div class="setting-group" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-            <div class="setting-label" style="margin:0; flex:1">Play As</div>
-            <div style="display:flex; gap:8px; align-items:center;">
-                <div class="color-choice" id="i-color-white" data-color="white" title="Play as White" style="cursor:pointer; padding:4px; border-radius:4px; background:#222; border:1px solid #333;">
-                    <div class="color-blob white"></div>
-                </div>
-                <div class="color-choice" id="i-color-black" data-color="black" title="Play as Black" style="cursor:pointer; padding:4px; border-radius:4px; background:#111; border:1px solid #333;">
-                    <div class="color-blob black"></div>
-                </div>
-            </div>
-        </div>
-
-        <div class="setting-group" style="margin-bottom:4px">
-            <div class="setting-label">Engine Elo <span id="v-eelo" class="setting-val">1900</span></div>
-            <input type="range" id="i-eelo" min="1200" max="2600" step="50" value="1900">
-        </div>
-
-        <div class="lock-btn" id="lock-toggle" onclick="toggleEloLock()">
-            <svg viewBox="0 0 24 24"><path d="M12 17a2 2 0 100-4 2 2 0 000 4zm6-9h-1V6a5 5 0 00-10 0v2H6a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V10a2 2 0 00-2-2zM9 6a3 3 0 116 0v2H9V6z"/></svg>
-            <span>Link Elos</span>
-        </div>
-
-        <div class="setting-group">
-            <div class="setting-label">Human Elo <span id="v-helo" class="setting-val">1900</span></div>
-            <input type="range" id="i-helo" min="1200" max="2600" step="50" value="1900">
-        </div>
-
-        <div class="section-header">Time Control</div>
-        
-        <div class="setting-group">
-            <div class="setting-label">Start Clock (s) <span id="v-startclock" class="setting-val">180</span></div>
-            <input type="range" id="i-startclock" min="10" max="600" step="10" value="180">
-        </div>
-
-        <div class="setting-group">
-            <div class="setting-label">Increment (s) <span id="v-inc" class="setting-val">0</span></div>
-            <input type="range" id="i-inc" min="0" max="30" step="1" value="0">
-        </div>
-        
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">
-                Simulate Thinking Time
-                <span title="Engine waits for predicted time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
-            </div>
-            <input type="checkbox" id="i-simulate-thinking-time">
-        </div>
-
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">
-                Real Time
-                <span title="Use actual wall clock time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
-            </div>
-            <input type="checkbox" id="i-realtime">
-        </div>
-
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">
-                Use Mode Time
-                <span title="Use most likely time (Mode) instead of sampling" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
-            </div>
-            <input type="checkbox" id="i-modetime">
-        </div>
-
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">
-                Use Expected Time
-                <span title="Use mean of top-p time distribution" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
-            </div>
-            <input type="checkbox" id="i-exptime">
-        </div>
-
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">Show Attention</div>
-            <input type="checkbox" id="i-attn" onchange="toggleAttnPanel()">
-        </div>
-
-        <div id="attn-params" style="display:none; margin-top:6px;">
-            <div class="setting-group">
-                <div class="setting-label">Layer</div>
-                <select id="i-attn-layer" style="width:100%"></select>
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Head Aggregation</div>
-                <select id="i-attn-agg" style="width:100%">
-                    <option value="avg">Average All Heads</option>
-                    <option value="max">Max Head</option>
-                    <option value="smolgen">Smolgen Only</option>
-                </select>
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Focus Mode</div>
-                <select id="i-attn-focus" style="width:100%">
-                    <option value="outbound">Outbound (from square)</option>
-                    <option value="inbound">Inbound (to square)</option>
-                </select>
-            </div>
-        </div>
-
-        
-
-        <div class="section-header">Sampling</div>
-
-        <div class="setting-group">
-            <div class="setting-label">Temperature <span id="v-temp" class="setting-val">0.9</span></div>
-            <input type="range" id="i-temp" min="0" max="2.0" step="0.1" value="0.9">
-        </div>
-        
-        <div class="setting-group">
-            <div class="setting-label">Top P <span id="v-topp" class="setting-val">0.95</span></div>
-            <input type="range" id="i-topp" min="0.5" max="1.0" step="0.01" value="0.95">
-        </div>
-
-        <div class="setting-group">
-            <div class="setting-label">Time Temp <span id="v-ttemp" class="setting-val">1.0</span></div>
-            <input type="range" id="i-ttemp" min="0.1" max="5.0" step="0.1" value="1.0">
-        </div>
-
-        <div class="setting-group">
-            <div class="setting-label">Time Top P <span id="v-ttopp" class="setting-val">0.95</span></div>
-            <input type="range" id="i-ttopp" min="0.5" max="1.0" step="0.01" value="0.95">
-        </div>
-
-        <div class="section-header">MCTS</div>
-
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">Enable MCTS</div>
-            <input type="checkbox" id="i-use-mcts" onchange="toggleMctsPanel()">
-        </div>
-
-        <div id="mcts-params">
-            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="setting-label" style="margin:0">Show Stats</div>
-                <input type="checkbox" id="i-mcts-stats">
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Simulations <span id="v-mcts-sims" class="setting-val">128</span></div>
-                <input type="range" id="i-mcts-sims" min="16" max="5000" step="16" value="128">
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">C_PUCT <span id="v-mcts-cpuct" class="setting-val">1.5</span></div>
-                <input type="range" id="i-mcts-cpuct" min="0.2" max="6.0" step="0.1" value="1.5">
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Max Children <span id="v-mcts-k" class="setting-val">48</span></div>
-                <input type="range" id="i-mcts-k" min="8" max="128" step="8" value="48">
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Max Depth <span id="v-mcts-depth" class="setting-val">96</span></div>
-                <input type="range" id="i-mcts-depth" min="1" max="200" step="1" value="96">
-            </div>
-
-            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #333; padding-top:5px;">
-                <div class="setting-label" style="margin:0">Adaptive MCTS</div>
-                <input type="checkbox" id="i-mcts-adaptive" onchange="toggleAdaptivePanel()">
-            </div>
-            
-            <div id="adaptive-params" style="display:none; margin-bottom:10px; border-bottom:1px solid #333; padding-bottom:5px;">
-                <div class="setting-group">
-                    <div class="setting-label">Scaling Factor <span id="v-mcts-ascale" class="setting-val">100</span></div>
-                    <input type="range" id="i-mcts-ascale" min="10" max="1000" step="10" value="100">
-                </div>
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Root Noise (frac) <span id="v-mcts-frac" class="setting-val">0.0</span></div>
-                <input type="range" id="i-mcts-frac" min="0.0" max="0.5" step="0.05" value="0.0">
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Root Noise (alpha) <span id="v-mcts-alpha" class="setting-val">0.0</span></div>
-                <input type="range" id="i-mcts-alpha" min="0.0" max="1.0" step="0.05" value="0.0">
-            </div>
-
-            <div class="setting-group">
-                <div class="setting-label">Final Temp <span id="v-mcts-ft" class="setting-val">0.0</span></div>
-                <input type="range" id="i-mcts-ft" min="0.0" max="2.0" step="0.1" value="0.0">
-            </div>
-        </div>
-
-        <div id="engine-inputs"></div>
-    </div>
-
-    <!-- CENTER: Board -->
-    <div id="board-area">
-            <div id="board-wrap">
-            <div id="board"></div>
-            <div id="attn-overlay"></div>
-        </div>
-        <div class="controls">
-            <button class="btn" onclick="nav('start')" title="Start"><<</button>
-            <button class="btn" onclick="nav('prev')" title="Previous"><</button>
-            <button class="btn" onclick="nav('next')" title="Next">></button>
-            <button class="btn" onclick="nav('end')" title="End">>></button>
-            <div style="width:20px"></div>
-            <button class="btn btn-reset" onclick="resetGame()">New</button>
-        </div>
-        <div id="status"></div>
-        
-        <div class="pgn-container">
-            <div id="pgn-text"></div>
-            <button class="copy-btn" onclick="copyPgn()" title="Copy PGN">📋</button>
-        </div>
-    </div>
-    
-    <!-- RIGHT: Stats -->
-    <div class="sidebar">
-        <div class="section-title" style="margin-top:0">CURRENT EVALUATION (Live)</div>
-        <div id="current-stats">Waiting...</div>
-        
-        <div class="section-title">PREVIOUS MOVE</div>
-        <div id="prev-engine-stats">None.</div>
-    </div>
-</div>
-
-<script>
-var board = null;
-var game_fen = 'start';
-var cursor = 0, max_cursor = 0;
-var eloLocked = false;
-var moveStartTime = 0;
-var humanColor = 'white'; // 'white' or 'black'
-var attention64 = null;
-var overlayOrientation = null;
-var attnFocusMode = 'outbound';
- 
-
-function toggleMctsPanel() {
-    var checked = $('#i-use-mcts').is(':checked');
-    if (checked) {
-        $('#mcts-params').slideDown(200);
-        $('#i-temp, #i-topp, #i-simulate-thinking-time').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
-        toggleAdaptivePanel();
-    } else {
-        $('#mcts-params').slideUp(200);
-        $('#i-temp, #i-topp, #i-simulate-thinking-time').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
-    }
-}
-
-function toggleAttnPanel() {
-    var checked = $('#i-attn').is(':checked');
-    if (checked) {
-        $('#attn-params').slideDown(200);
-        updateAttnControlEnables();
-    } else {
-        $('#attn-params').slideUp(200);
-        clearAttentionOverlay();
-    }
-}
-
-function ensureAttnLayerOptions(numLayers) {
-    numLayers = parseInt(numLayers || 0, 10);
-    var $sel = $('#i-attn-layer');
-    if ($sel.data('builtFor') === numLayers) return;
-    $sel.empty();
-    $sel.append("<option value='-1'>All Layers</option>");
-    for (var i = 0; i < numLayers; i++) {
-        $sel.append("<option value='" + i + "'>Layer " + i + "</option>");
-    }
-    $sel.data('builtFor', numLayers);
-}
-
-function updateAttnControlEnables() {
-    var agg = $('#i-attn-agg').val();
-    var smolgenSelected = (agg === 'smolgen');
-    $('#i-attn-layer').prop('disabled', smolgenSelected).closest('.setting-group').css('opacity', smolgenSelected ? 0.5 : 1.0);
-}
-
-function toggleAdaptivePanel() {
-    var checked = $('#i-mcts-adaptive').is(':checked');
-    if (checked) {
-        $('#adaptive-params').slideDown(200);
-        $('#i-mcts-sims, #i-mcts-cpuct').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
-    } else {
-        $('#adaptive-params').slideUp(200);
-        $('#i-mcts-sims, #i-mcts-cpuct').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
-    }
-}
-
-function squareToIndex(sq) {
-    // a1=0 .. h8=63
-    var file = sq.charCodeAt(0) - 'a'.charCodeAt(0);
-    var rank = parseInt(sq[1], 10) - 1;
-    return rank * 8 + file;
-}
-
-function buildAttentionOverlay(orientation) {
-    if (overlayOrientation === orientation) return;
-    overlayOrientation = orientation;
-    var $o = $('#attn-overlay');
-    $o.empty();
-
-    var filesW = ['a','b','c','d','e','f','g','h'];
-    var filesB = ['h','g','f','e','d','c','b','a'];
-
-    if (orientation === 'white') {
-        for (var r = 8; r >= 1; r--) {
-            for (var f = 0; f < 8; f++) {
-                var sq = filesW[f] + r;
-                $o.append("<div class='attn-cell' data-square='" + sq + "'></div>");
-            }
-        }
-    } else {
-        for (var r2 = 1; r2 <= 8; r2++) {
-            for (var f2 = 0; f2 < 8; f2++) {
-                var sq2 = filesB[f2] + r2;
-                $o.append("<div class='attn-cell' data-square='" + sq2 + "'></div>");
-            }
-        }
-    }
-}
-
-function clearAttentionOverlay() {
-    $('#attn-overlay .attn-cell').css('opacity', 0);
-}
-
- 
-
-
-
-function renderAttentionFromSquare(fromSq) {
-    if (!attention64 || attention64.length !== 4096) return;
-
-    var fromIdx = squareToIndex(fromSq);
-    var vals = new Array(64);
-
-    if (attnFocusMode === 'inbound') {
-        // Column: which query squares attend to this square.
-        for (var i = 0; i < 64; i++) vals[i] = attention64[i * 64 + fromIdx];
-    } else {
-        // Row: where this square attends.
-        var rowStart = fromIdx * 64;
-        for (var j = 0; j < 64; j++) vals[j] = attention64[rowStart + j];
-    }
-
-    var maxV = 0;
-    for (var k = 0; k < 64; k++) if (vals[k] > maxV) maxV = vals[k];
-    if (maxV <= 0) { clearAttentionOverlay(); return; }
-
-    $('#attn-overlay .attn-cell').each(function() {
-        var sq = $(this).attr('data-square');
-        if (!sq) return;
-        var idx = squareToIndex(sq);
-        var a = vals[idx] / maxV;
-        $(this).css('opacity', Math.max(0, Math.min(1, a)));
-    });
-}
-
-// Settings Logic
-function sendSettings() {
-    var payload = {
-        temperature: $('#i-temp').val(),
-        time_temperature: $('#i-ttemp').val(),
-        top_p: $('#i-topp').val(),
-        time_top_p: $('#i-ttopp').val(),
-        use_mcts: $('#i-use-mcts').is(':checked'),
-        show_mcts_stats: $('#i-mcts-stats').is(':checked'),
-        show_attention: $('#i-attn').is(':checked'),
-
-        attn_layer: $('#i-attn-layer').val(),
-        attn_head_agg: $('#i-attn-agg').val(),
-        attn_focus: $('#i-attn-focus').val(),
-        
-        mcts_simulations: $('#i-mcts-sims').val(),
-        mcts_c_puct: $('#i-mcts-cpuct').val(),
-        mcts_max_children: $('#i-mcts-k').val(),
-        mcts_max_depth: $('#i-mcts-depth').val(),
-        mcts_adaptive: $('#i-mcts-adaptive').is(':checked'),
-        mcts_adaptive_scale: $('#i-mcts-ascale').val(),
-        mcts_root_exploration_frac: $('#i-mcts-frac').val(),
-        mcts_root_dirichlet_alpha: $('#i-mcts-alpha').val(),
-        mcts_final_temperature: $('#i-mcts-ft').val(),
-        engine_elo: $('#i-eelo').val(),
-        human_elo: $('#i-helo').val(),
-        human_color: humanColor,
-        simulate_thinking_time: $('#i-simulate-thinking-time').is(':checked'),
-        use_real_time: $('#i-realtime').is(':checked'),
-        use_mode_time: $('#i-modetime').is(':checked'),
-        use_expected_time: $('#i-exptime').is(':checked'),
-        start_clock_s: $('#i-startclock').val(),
-        inc_s: $('#i-inc').val()
-    };
-    $('#v-temp').text(payload.temperature);
-    $('#v-ttemp').text(payload.time_temperature);
-    $('#v-topp').text(payload.top_p);
-    $('#v-ttopp').text(payload.time_top_p);
-    $('#v-eelo').text(payload.engine_elo);
-    $('#v-helo').text(payload.human_elo);
-    $('#v-startclock').text(payload.start_clock_s);
-    $('#v-inc').text(payload.inc_s);
-
-    $('#v-mcts-sims').text(payload.mcts_simulations);
-    $('#v-mcts-cpuct').text(payload.mcts_c_puct);
-    $('#v-mcts-k').text(payload.mcts_max_children);
-    $('#v-mcts-depth').text(payload.mcts_max_depth);
-    $('#v-mcts-ascale').text(payload.mcts_adaptive_scale);
-    $('#v-mcts-frac').text(payload.mcts_root_exploration_frac);
-    $('#v-mcts-alpha').text(payload.mcts_root_dirichlet_alpha);
-    $('#v-mcts-ft').text(payload.mcts_final_temperature);
-    
-    humanColor = payload.human_color;
-
-    $.ajax({
-        url: '/settings', type: 'POST', contentType: 'application/json',
-        data: JSON.stringify(payload),
-        success: function(data) { 
-            updateUI(data); 
-            moveStartTime = Date.now(); // Reset clock on settings change
-            checkEngineMove(data);
-        }
-    });
-}
-
-function checkEngineMove(data) {
-    // If game not over, and it's engine's turn, trigger engine move
-    // Only trigger if we are at the latest position (not reviewing history)
-    if (!data.is_game_over && data.cursor === data.max_cursor) {
-        var turn = data.fen.split(' ')[1]; // 'w' or 'b'
-        var engineTurn = (humanColor === 'white' && turn === 'b') || (humanColor === 'black' && turn === 'w');
-        
-        if (engineTurn) {
-            $('#status').text("Engine thinking...");
-            $.post('/engine_move', function(data2) {
-                updateUI(data2);
-                moveStartTime = Date.now(); // Reset clock after engine moves
-            });
-        }
-    }
-}
-
-function toggleEloLock() {
-    eloLocked = !eloLocked;
-    $('#lock-toggle').toggleClass('active', eloLocked);
-    if (eloLocked) {
-        var val = $('#i-eelo').val();
-        $('#i-helo').val(val);
-        $('#v-helo').text(val);
-        sendSettings();
-    }
-}
-
-$('#i-temp').on('input', function() { $('#v-temp').text($(this).val()); });
-$('#i-ttemp').on('input', function() { $('#v-ttemp').text($(this).val()); });
-$('#i-topp').on('input', function() { $('#v-topp').text($(this).val()); });
-$('#i-ttopp').on('input', function() { $('#v-ttopp').text($(this).val()); });
-$('#i-mcts-sims').on('input', function() { $('#v-mcts-sims').text($(this).val()); });
-$('#i-mcts-cpuct').on('input', function() { $('#v-mcts-cpuct').text($(this).val()); });
-$('#i-mcts-k').on('input', function() { $('#v-mcts-k').text($(this).val()); });
-$('#i-mcts-depth').on('input', function() { $('#v-mcts-depth').text($(this).val()); });
-$('#i-mcts-ascale').on('input', function() { $('#v-mcts-ascale').text($(this).val()); });
-$('#i-mcts-frac').on('input', function() { $('#v-mcts-frac').text($(this).val()); });
-$('#i-mcts-alpha').on('input', function() { $('#v-mcts-alpha').text($(this).val()); });
-$('#i-mcts-ft').on('input', function() { $('#v-mcts-ft').text($(this).val()); });
-$('#i-startclock').on('input', function() { $('#v-startclock').text($(this).val()); });
-$('#i-inc').on('input', function() { $('#v-inc').text($(this).val()); });
-
-$('#i-eelo').on('input', function() {
-    var val = $(this).val();
-    $('#v-eelo').text(val);
-    if(eloLocked) {
-        $('#i-helo').val(val);
-        $('#v-helo').text(val);
-    }
-});
-
-$('#i-helo').on('input', function() {
-    var val = $(this).val();
-    $('#v-helo').text(val);
-    if(eloLocked) {
-        $('#i-eelo').val(val);
-        $('#v-eelo').text(val);
-    }
-});
-
-$('#i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-frac, #i-mcts-alpha, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-attn, #i-attn-layer, #i-attn-agg, #i-attn-focus, #i-startclock, #i-inc').on('change', function() {
-    updateAttnControlEnables();
-    sendSettings();
-});
-
-// Attention overlay hover (delegated)
-$('#board').on('mouseenter', '.square-55d63', function() {
-    if (!$('#i-attn').is(':checked')) return;
-    if (!attention64) return;
-    var sq = $(this).attr('data-square');
-    if (!sq) return;
-    renderAttentionFromSquare(sq);
-});
-
-$('#board').on('mouseleave', function() {
-    clearAttentionOverlay();
-});
-
-// Color choice click handlers
-$('.color-choice').on('click', function() {
-    var c = $(this).data('color');
-    humanColor = c;
-    $('.color-choice').removeClass('selected').css('box-shadow','none');
-    $(this).addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
-    sendSettings();
-});
-
-// Board Logic
-function onDragStart (source, piece) { 
-    var orientation = board.orientation();
-    if ((orientation === 'white' && piece.search(/^b/) !== -1) ||
-        (orientation === 'black' && piece.search(/^w/) !== -1)) {
-        return false;
-    }
-}
-function onDrop (source, target) {
-  if (source === target) return;
-  var elapsed = (Date.now() - moveStartTime) / 1000.0;
-  $.ajax({
-      url: '/move', type: 'POST', contentType: 'application/json',
-      data: JSON.stringify({ from: source, to: target, elapsed_s: elapsed }),
-      success: function(data) { 
-          updateUI(data); 
-          checkEngineMove(data);
-      },
-      error: function() { board.position(game_fen); }
-  });
-}
-function nav(action) {
-    $.ajax({
-        url: '/navigate', type: 'POST', contentType: 'application/json',
-        data: JSON.stringify({ action: action }),
-        success: function(data) { updateUI(data); }
-    });
-}
-function updateUI(data) {
-    game_fen = data.fen;
-    cursor = data.cursor; max_cursor = data.max_cursor;
-    board.orientation(data.orientation);
-    board.position(data.fen);
-
-    attention64 = data.attention64;
-    buildAttentionOverlay(data.orientation);
-
-    
-    $('#current-stats').html(data.current_stats);
-    $('#prev-engine-stats').html(data.prev_engine_stats);
-    $('#pgn-text').text(data.pgn);
-    if(data.engine_inputs) $('#engine-inputs').html(data.engine_inputs);
-    
-    var status = "Move " + Math.floor(cursor/2 + 1);
-    if (data.is_game_over) status += " | " + data.result;
-    else if (cursor < max_cursor) status += " (Analysis Mode)";
-    $('#status').text(status);
-    
-    // NOTE: We do NOT reset moveStartTime here anymore, to avoid resetting it during navigation.
-    // It is reset in init, resetGame, sendSettings, and after engine move.
-
-    if (data.settings) {
-        var s = data.settings;
-        $('#i-temp').val(s.temperature); $('#v-temp').text(s.temperature);
-        $('#i-ttemp').val(s.time_temperature); $('#v-ttemp').text(s.time_temperature);
-        $('#i-topp').val(s.top_p); $('#v-topp').text(s.top_p);
-        $('#i-ttopp').val(s.time_top_p); $('#v-ttopp').text(s.time_top_p);
-
-        $('#i-attn').prop('checked', !!s.show_attention);
-        ensureAttnLayerOptions(s.attn_num_layers || 0);
-        $('#i-attn-layer').val((s.attn_layer != null) ? String(s.attn_layer) : '-1');
-        $('#i-attn-agg').val(s.attn_head_agg || 'avg');
-        $('#i-attn-focus').val(s.attn_focus || 'outbound');
-        attnFocusMode = $('#i-attn-focus').val();
-        toggleAttnPanel();
-        if (!s.show_attention) clearAttentionOverlay();
-
-        $('#i-use-mcts').prop('checked', !!s.use_mcts);
-        toggleMctsPanel();
-        $('#i-mcts-stats').prop('checked', !!s.show_mcts_stats);
-        $('#i-mcts-sims').val(s.mcts_simulations); $('#v-mcts-sims').text(s.mcts_simulations);
-        $('#i-mcts-cpuct').val(s.mcts_c_puct); $('#v-mcts-cpuct').text(s.mcts_c_puct);
-        $('#i-mcts-k').val(s.mcts_max_children); $('#v-mcts-k').text(s.mcts_max_children);
-        $('#i-mcts-depth').val(s.mcts_max_depth || 96); $('#v-mcts-depth').text(s.mcts_max_depth || 96);
-        
-        $('#i-mcts-adaptive').prop('checked', !!s.mcts_adaptive);
-        toggleAdaptivePanel();
-        $('#i-mcts-ascale').val(s.mcts_adaptive_scale || 100); $('#v-mcts-ascale').text(s.mcts_adaptive_scale || 100);
-
-        $('#i-mcts-frac').val(s.mcts_root_exploration_frac); $('#v-mcts-frac').text(s.mcts_root_exploration_frac);
-        $('#i-mcts-alpha').val(s.mcts_root_dirichlet_alpha); $('#v-mcts-alpha').text(s.mcts_root_dirichlet_alpha);
-        $('#i-mcts-ft').val(s.mcts_final_temperature); $('#v-mcts-ft').text(s.mcts_final_temperature);
-        $('#i-eelo').val(s.engine_elo); $('#v-eelo').text(s.engine_elo);
-        $('#i-helo').val(s.human_elo); $('#v-helo').text(s.human_elo);
-        
-        $('#i-simulate-thinking-time').prop('checked', s.simulate_thinking_time);
-        $('#i-realtime').prop('checked', s.use_real_time);
-        $('#i-modetime').prop('checked', s.use_mode_time);
-        $('#i-exptime').prop('checked', s.use_expected_time);
-        $('#i-startclock').val(s.start_clock_s || 180); $('#v-startclock').text(s.start_clock_s || 180);
-        $('#i-inc').val(s.inc_s || 0); $('#v-inc').text(s.inc_s || 0);
-        
-        var color = s.human_color ? 'white' : 'black';
-        humanColor = color;
-        $('.color-choice').removeClass('selected').css('box-shadow','none');
-        if (color === 'white') {
-            $('#i-color-white').addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
-        } else {
-            $('#i-color-black').addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
-        }
-    }
-}
-
- 
-function resetGame() { 
-    $.post('/reset', function(data) { 
-        updateUI(data); 
-        moveStartTime = Date.now();
-        checkEngineMove(data);
-    }); 
-}
-
-function copyPgn() {
-    var text = $('#pgn-text').text();
-    navigator.clipboard.writeText(text).then(function() {
-        var btn = $('.copy-btn');
-        var original = btn.text();
-        btn.text('✅');
-        setTimeout(function() { btn.text(original); }, 1500);
-    });
-}
-
-function init() {
-    board = Chessboard('board', {
-        draggable: true, position: 'start',
-        onDragStart: onDragStart, onDrop: onDrop,
-        pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png'
-    });
-    $.get('/state', function(data) { 
-        updateUI(data); 
-        moveStartTime = Date.now();
-        humanColor = data.orientation;
-        checkEngineMove(data);
-    });
-    $(document).keydown(function(e) {
-        if (e.keyCode == 37) nav('prev');
-        else if (e.keyCode == 39) nav('next');
-    });
-}
-$(document).ready(init);
-</script>
-</body>
-</html>
-"""
 
 if __name__ == '__main__':
     print("Starting Flask Server on http://localhost:5000")

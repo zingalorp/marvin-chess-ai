@@ -15,6 +15,7 @@ DEFAULT_GAME_SETTINGS: dict = {
     "engine_elo": 1900,
     "human_color": chess.WHITE,
     "compile_model": True,
+    "auto_play": False,
     "simulate_thinking_time": False,
     "internal_clock": False,
     "use_real_time": False,
@@ -40,6 +41,9 @@ DEFAULT_GAME_SETTINGS: dict = {
     "show_mcts_stats": False,
 
     # Overlays
+
+    # Arrow for top move
+    "show_arrows": True,
 
     # Attention viz
     "show_attention": False,

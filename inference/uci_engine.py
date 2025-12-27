@@ -497,14 +497,30 @@ class UciEngine:
                 # Print newest-first history so it matches model input ordering.
                 self._print(f"info string time_history {time_hist}")
 
-            active_clock_s = float(wtime_s if board.turn == chess.WHITE else btime_s)
-            opponent_clock_s = float(btime_s if board.turn == chess.WHITE else wtime_s)
-            active_inc_s = float(winc_s if board.turn == chess.WHITE else binc_s)
-            opponent_inc_s = float(binc_s if board.turn == chess.WHITE else winc_s)
+            # Determine active/opponent clocks based on side-to-move.
+            # The "active" clock is ALWAYS the clock for the side whose turn it is.
+            # UCI provides wtime (White's remaining time) and btime (Black's remaining time).
+            # When board.turn == WHITE, we are White, so our clock is wtime.
+            # When board.turn == BLACK, we are Black, so our clock is btime.
+            if board.turn == chess.WHITE:
+                active_clock_s = float(wtime_s)
+                opponent_clock_s = float(btime_s)
+                active_inc_s = float(winc_s)
+                opponent_inc_s = float(binc_s)
+            else:
+                active_clock_s = float(btime_s)
+                opponent_clock_s = float(wtime_s)
+                active_inc_s = float(binc_s)
+                opponent_inc_s = float(winc_s)
 
             if bool(self.settings.get("log_time_history", False)):
-                # Log clock context for debugging time prediction
-                self._print(f"info string clocks active={active_clock_s:.1f}s opp={opponent_clock_s:.1f}s inc={active_inc_s:.1f}s")
+                # Explicit debug: show exactly what clock was assigned to whom
+                engine_color = "WHITE" if board.turn == chess.WHITE else "BLACK"
+                self._print(
+                    f"info string clock_assignment engine_plays={engine_color} "
+                    f"wtime={wtime_s:.1f}s btime={btime_s:.1f}s => "
+                    f"active_clock={active_clock_s:.1f}s opp_clock={opponent_clock_s:.1f}s"
+                )
 
             out, engine_stats, _mcts_stats = choose_engine_move(
                 model=self.model,
