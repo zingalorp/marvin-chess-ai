@@ -384,6 +384,9 @@ game_state = {
     # Cache per-position sampled time for the *current* position.
     # Key: cursor index, Value: {fen, time_temperature, time_top_p, time_sample_s, time_sample_prob}
     "pos_cache": {},
+    # MCTS tree reuse state
+    "last_mcts_result": None,  # MCTSResult from last search
+    "last_mcts_ply": -1,  # ply count when last MCTS search was done
 }
 
 # MCTS progress streaming
@@ -407,6 +410,13 @@ def _mcts_progress_callback(stats: dict) -> None:
 
 def _clear_pos_cache() -> None:
     game_state["pos_cache"] = {}
+
+
+def _clear_mcts_tree() -> None:
+    """Clear the MCTS tree reuse state."""
+    game_state["last_mcts_result"] = None
+    game_state["last_mcts_ply"] = -1
+
 
 def get_board_at_cursor():
     board = chess.Board()
@@ -634,6 +644,10 @@ def update_settings():
         game_settings['mcts_adaptive'] = bool(data['mcts_adaptive'])
     if 'mcts_adaptive_scale' in data:
         game_settings['mcts_adaptive_scale'] = float(data['mcts_adaptive_scale'])
+    if 'mcts_tree_reuse' in data:
+        game_settings['mcts_tree_reuse'] = bool(data['mcts_tree_reuse'])
+        if not game_settings['mcts_tree_reuse']:
+            _clear_mcts_tree()  # Clear tree when disabling
     if 'show_mcts_stats' in data:
         game_settings['show_mcts_stats'] = bool(data['show_mcts_stats'])
     if 'show_arrows' in data:
@@ -699,7 +713,26 @@ def _play_engine_move(board):
     if game_settings.get("use_mcts", False) and game_settings.get("show_mcts_stats", False):
         progress_cb = _mcts_progress_callback
     
-    out, engine_stats, mcts_stats = choose_engine_move_core(
+    # Prepare tree reuse data
+    mcts_reuse_root = None
+    mcts_reuse_moves = []
+    
+    if (
+        game_settings.get("mcts_tree_reuse", False)
+        and game_state.get("last_mcts_result") is not None
+        and game_state.get("last_mcts_ply", -1) >= 0
+    ):
+        last_result = game_state["last_mcts_result"]
+        if last_result.chosen_move is not None:
+            # Calculate moves played since last search
+            moves_since = cursor_engine - game_state["last_mcts_ply"]
+            if 0 < moves_since <= 2:
+                mcts_reuse_root = last_result.root
+                for i in range(game_state["last_mcts_ply"], cursor_engine):
+                    if i < len(moves_uci):
+                        mcts_reuse_moves.append(chess.Move.from_uci(moves_uci[i]))
+    
+    out, engine_stats, mcts_stats, mcts_result = choose_engine_move_core(
         model=model,
         device=loaded.device,
         settings=game_settings,
@@ -714,7 +747,14 @@ def _play_engine_move(board):
         stop_check=None,
         allow_ponder_sleep=True,
         mcts_progress_callback=progress_cb,
+        mcts_reuse_root=mcts_reuse_root,
+        mcts_reuse_moves=mcts_reuse_moves,
     )
+    
+    # Store MCTS result for tree reuse
+    if mcts_result is not None:
+        game_state["last_mcts_result"] = mcts_result
+        game_state["last_mcts_ply"] = cursor_engine
 
     stats_html = format_stats_html(engine_stats)
     engine_pred_time_s = float(engine_stats.get("time_sample_s", 0.0))
@@ -878,6 +918,7 @@ def reset():
     game_state["history"] = []
     game_state["cursor"] = 0
     _clear_pos_cache()
+    _clear_mcts_tree()
     
     # Frontend will trigger engine move if needed
         

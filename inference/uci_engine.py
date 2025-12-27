@@ -11,6 +11,7 @@ import chess
 
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, START_CLOCK_S
 from inference.engine_logic import choose_engine_move, analyze_position
+from inference.mcts import MCTSResult, _Node
 from inference.runtime import load_default_chessformer
 
 
@@ -85,6 +86,12 @@ class UciEngine:
         self.internal_wtime_s: float = float(START_CLOCK_S)
         self.internal_btime_s: float = float(START_CLOCK_S)
 
+        # Tree reuse state for MCTS
+        self._last_mcts_result: MCTSResult | None = None
+        self._last_mcts_ply: int = -1  # ply count when last MCTS search was done
+        self._ponder_thread: threading.Thread | None = None
+        self._ponder_stop_event = threading.Event()
+
         self.options = self._build_options()
 
     def _build_options(self) -> list[_Option]:
@@ -140,6 +147,8 @@ class UciEngine:
             _Option("MCTSContempt", "string", str(self.settings.get("mcts_contempt", 0.15))),
             _Option("MCTSSimulateTime", "check", bool(self.settings.get("mcts_simulate_time", False))),
             _Option("MCTSStartPly", "spin", int(self.settings.get("mcts_start_ply", 0)), min=0, max=100),
+            _Option("MCTSTreeReuse", "check", bool(self.settings.get("mcts_tree_reuse", False))),
+            _Option("Ponder", "check", bool(self.settings.get("ponder", False))),
         ]
 
     def _print(self, line: str) -> None:
@@ -162,6 +171,9 @@ class UciEngine:
         self.internal_btime_s = float(self.settings.get("start_clock_s", START_CLOCK_S))
         # In UCI mode, the engine is always the side-to-move.
         self.settings["human_color"] = (not self.board.turn)
+        # Clear tree reuse state
+        self._last_mcts_result = None
+        self._last_mcts_ply = -1
 
     def _invalidate_search_locked(self) -> threading.Thread | None:
         """Invalidate any in-flight search so it can't print/update stale output."""
@@ -387,6 +399,10 @@ class UciEngine:
             set_setting("mcts_simulate_time", _bool_from_uci(value))
         elif name_key == "mctsstartply":
             set_setting("mcts_start_ply", int(float(value)))
+        elif name_key == "mctstreereuse":
+            set_setting("mcts_tree_reuse", _bool_from_uci(value))
+        elif name_key == "ponder":
+            set_setting("ponder", _bool_from_uci(value))
 
         # Echo back what option was set so wrappers and logs can verify it took effect.
         try:
@@ -492,6 +508,26 @@ class UciEngine:
                 board = self.board.copy(stack=True)
                 moves_uci = list(self.moves_uci)
                 time_hist = self._time_history_last8_newest_first()
+                current_ply = len(moves_uci)
+                
+                # Prepare tree reuse data
+                mcts_reuse_root: _Node | None = None
+                mcts_reuse_moves: list[chess.Move] = []
+                
+                if (
+                    bool(self.settings.get("mcts_tree_reuse", False))
+                    and self._last_mcts_result is not None
+                    and self._last_mcts_ply >= 0
+                    and self._last_mcts_result.chosen_move is not None
+                ):
+                    # Calculate moves played since last search
+                    moves_since = current_ply - self._last_mcts_ply
+                    if 0 < moves_since <= 2:  # Expect 2 moves: our move + opponent's move
+                        # Get the moves that were played since last search
+                        mcts_reuse_root = self._last_mcts_result.root
+                        for i in range(self._last_mcts_ply, current_ply):
+                            if i < len(moves_uci):
+                                mcts_reuse_moves.append(chess.Move.from_uci(moves_uci[i]))
 
             if bool(self.settings.get("log_time_history", False)):
                 # Print newest-first history so it matches model input ordering.
@@ -522,7 +558,7 @@ class UciEngine:
                     f"active_clock={active_clock_s:.1f}s opp_clock={opponent_clock_s:.1f}s"
                 )
 
-            out, engine_stats, _mcts_stats = choose_engine_move(
+            out, engine_stats, _mcts_stats, mcts_result = choose_engine_move(
                 model=self.model,
                 device=self.loaded.device,
                 settings=self.settings,
@@ -536,6 +572,8 @@ class UciEngine:
                 time_history_s=time_hist,
                 stop_check=self._stop_event.is_set,
                 allow_ponder_sleep=True,
+                mcts_reuse_root=mcts_reuse_root,
+                mcts_reuse_moves=mcts_reuse_moves,
             )
 
             # Optional: surface resign/flag head signals to wrappers.
@@ -570,7 +608,8 @@ class UciEngine:
                 if bool(self.settings.get("log_mcts_stats", False)) and isinstance(_mcts_stats, dict):
                     mn = int(_mcts_stats.get("mcts_nodes", 0))
                     mps = float(_mcts_stats.get("mcts_nodes_per_s", 0.0))
-                    self._print(f"info string mcts_nodes={mn} mps={mps:.1f}")
+                    tree_reused = mcts_reuse_root is not None and len(mcts_reuse_moves) > 0
+                    self._print(f"info string mcts_nodes={mn} mps={mps:.1f} tree_reused={tree_reused}")
             except Exception:
                 pass
 
@@ -617,6 +656,11 @@ class UciEngine:
                     return
 
                 self._last_bestmove = bestmove
+                
+                # Store MCTS result for tree reuse
+                if mcts_result is not None:
+                    self._last_mcts_result = mcts_result
+                    self._last_mcts_ply = len(moves_uci)
 
                 # If our state hasn't changed mid-search, advance it.
                 if self.moves_uci == moves_uci and self.board.fen() == board.fen():

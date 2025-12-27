@@ -38,7 +38,11 @@ DEFAULT_GAME_SETTINGS: dict = {
     "mcts_contempt": 0.15,  # Penalize draws to avoid drawish positions when ahead
     "mcts_simulate_time": False,  # Simulate remaining thinking time after MCTS completes
     "mcts_start_ply": 0,  # Ply at which MCTS kicks in (0 = from start, higher = skip opening for variety)
+    "mcts_tree_reuse": False,  # Reuse search tree from previous position for faster follow-up moves
     "show_mcts_stats": False,
+    
+    # Pondering (thinking during opponent's time)
+    "ponder": False,
 
     # Overlays
 

@@ -10,7 +10,7 @@ import chess
 
 from inference.chessformer_policy import PolicyOutput, choose_move
 from inference.encoding import ContextOptions, build_history_from_position, canonicalize, make_model_batch
-from inference.mcts import MCTSSettings, mcts_choose_move
+from inference.mcts import MCTSSettings, MCTSResult, mcts_choose_move, find_subtree_by_move_sequence, _Node
 from inference.sampling import sample_from_logits
 
 
@@ -324,14 +324,19 @@ def choose_engine_move(
     stop_check: Callable[[], bool] | None = None,
     allow_ponder_sleep: bool = True,
     mcts_progress_callback: Callable[[dict], None] | None = None,
-) -> tuple[PolicyOutput, dict, dict | None]:
+    mcts_reuse_root: _Node | None = None,
+    mcts_reuse_moves: list[chess.Move] | None = None,
+) -> tuple[PolicyOutput, dict, dict | None, MCTSResult | None]:
     """Implements the engine selection path from `_play_engine_move` in `inference/app.py`.
 
-    Returns: (policy_out, analysis_dict, mcts_stats_or_none)
+    Returns: (policy_out, analysis_dict, mcts_stats_or_none, mcts_result_or_none)
+    
+    The mcts_result contains the search tree root for potential reuse in subsequent searches.
+    Pass mcts_reuse_root and mcts_reuse_moves to enable tree reuse from a previous search.
     """
 
     if board.is_game_over():
-        return PolicyOutput(move=None, policy_prob=1.0), {}, None
+        return PolicyOutput(move=None, policy_prob=1.0), {}, None, None
 
     engine_stats = analyze_position(
         model=model,
@@ -419,12 +424,18 @@ def choose_engine_move(
             final_temperature=float(settings.get("mcts_final_temperature", 0.0)),
             fpu_reduction=float(settings.get("mcts_fpu_reduction", 0.0)),
             contempt=float(settings.get("mcts_contempt", 0.15)),
+            tree_reuse=bool(settings.get("mcts_tree_reuse", False)),
         )
 
         # Track MCTS execution time for timing simulation
         mcts_start_time = time.time()
         
-        out = mcts_choose_move(
+        # Try to find a reusable subtree from the previous search
+        reuse_root: _Node | None = None
+        if mcts_settings.tree_reuse and mcts_reuse_root is not None and mcts_reuse_moves:
+            reuse_root = find_subtree_by_move_sequence(mcts_reuse_root, mcts_reuse_moves)
+        
+        mcts_result = mcts_choose_move(
             model=model,
             board=board,
             ctx=ctx,
@@ -435,7 +446,9 @@ def choose_engine_move(
             stop_check=stop_check,
             claim_draw=False,
             progress_callback=mcts_progress_callback,
+            reuse_root=reuse_root,
         )
+        out = mcts_result.output
         mcts_stats = out.stats
         
         mcts_elapsed_s = time.time() - mcts_start_time
@@ -445,6 +458,8 @@ def choose_engine_move(
             remaining_time = engine_pred_time_s - mcts_elapsed_s
             if remaining_time > 0:
                 time.sleep(remaining_time)
+        
+        return out, engine_stats, mcts_stats, mcts_result
     else:
         _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
         
@@ -468,4 +483,4 @@ def choose_engine_move(
             rng=rng,
         )
 
-    return out, engine_stats, mcts_stats
+    return out, engine_stats, mcts_stats, None

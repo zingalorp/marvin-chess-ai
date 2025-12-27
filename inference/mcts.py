@@ -316,6 +316,18 @@ class MCTSSettings:
     leaf_batch_size: int = 1
     virtual_loss: float = 1.0
 
+    # Tree reuse: if True, preserve tree across searches for the same game
+    tree_reuse: bool = False
+
+
+@dataclass
+class MCTSResult:
+    """Extended result from MCTS search, including tree for potential reuse."""
+    output: "PolicyOutput"
+    root: "_Node"
+    root_fen: str  # FEN of the position where search was run
+    chosen_move: Optional[chess.Move]  # The move that was chosen
+
 
 class _Node:
     __slots__ = ("prior", "visit_count", "value_sum", "children", "expanded", "pred_time_s")
@@ -330,6 +342,86 @@ class _Node:
 
     def q(self) -> float:
         return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
+
+
+def find_subtree_for_position(
+    last_root: Optional["_Node"],
+    last_root_fen: str,
+    last_chosen_move: Optional[chess.Move],
+    current_board: chess.Board,
+) -> Optional["_Node"]:
+    """Find a reusable subtree from the previous search.
+    
+    After we play `last_chosen_move` and opponent plays their response,
+    we want to find the grandchild node corresponding to:
+    last_root -> our move -> opponent's move
+    
+    Returns the subtree root if found, None otherwise.
+    """
+    if last_root is None or last_chosen_move is None:
+        return None
+    
+    if not last_root.expanded or not last_root.children:
+        return None
+    
+    # Find our move's child
+    if last_chosen_move not in last_root.children:
+        return None
+    
+    our_child = last_root.children[last_chosen_move]
+    
+    if not our_child.expanded or not our_child.children:
+        return None
+    
+    # The current position should match after our move + opponent's move
+    # We need to figure out what opponent's move was by comparing positions
+    # Try each of our_child's children and see if any matches current_board
+    for opp_move, grandchild in our_child.children.items():
+        # Reconstruct what the position would be after this opponent move
+        # by checking if grandchild's legal moves match current position
+        if grandchild.expanded and grandchild.children:
+            # Check if the grandchild's children match current legal moves
+            grandchild_moves = set(grandchild.children.keys())
+            current_legal = set(current_board.legal_moves)
+            # If there's good overlap, this is likely the right subtree
+            if grandchild_moves and grandchild_moves & current_legal:
+                overlap = len(grandchild_moves & current_legal) / max(1, len(current_legal))
+                if overlap > 0.5:  # At least 50% overlap
+                    return grandchild
+    
+    # Alternative: use FEN matching if we track FENs in nodes
+    # For now, return None if we can't confidently identify the subtree
+    return None
+
+
+def find_subtree_by_move_sequence(
+    last_root: Optional["_Node"],
+    moves_since_last_search: list[chess.Move],
+) -> Optional["_Node"]:
+    """Find a reusable subtree by following a sequence of moves from the last root.
+    
+    Args:
+        last_root: The root node from the previous search
+        moves_since_last_search: List of moves played since the last search
+                                 (typically [our_move, opponent_move])
+    
+    Returns the subtree root if found, None otherwise.
+    """
+    if last_root is None or not moves_since_last_search:
+        return None
+    
+    node = last_root
+    for move in moves_since_last_search:
+        if not node.expanded or not node.children:
+            return None
+        if move not in node.children:
+            return None
+        node = node.children[move]
+    
+    # Return the node only if it has been expanded (has some search info)
+    if node.expanded:
+        return node
+    return None
 
 
 def _select_child(node: _Node, *, c_puct: float, fpu_reduction: float) -> Tuple[chess.Move, _Node]:
@@ -409,52 +501,104 @@ def mcts_choose_move(
     stop_check: Callable[[], bool] | None = None,
     claim_draw: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
-) -> PolicyOutput:
-    """PUCT MCTS using (policy priors, WDL value) from the model."""
+    reuse_root: Optional["_Node"] = None,
+) -> "MCTSResult":
+    """PUCT MCTS using (policy priors, WDL value) from the model.
+    
+    If `reuse_root` is provided and matches the current position's children,
+    it will be used as the starting point instead of building a fresh tree.
+    
+    Returns an MCTSResult containing the PolicyOutput, root node, and chosen move
+    for potential tree reuse in subsequent searches.
+    """
 
     if rng is None:
         rng = np.random.default_rng()
 
     # Match `inference/app.py` behavior: keep playing in claimable-draw positions.
     if board.is_game_over(claim_draw=bool(claim_draw)):
-        return PolicyOutput(move=None, policy_prob=1.0)
+        return MCTSResult(
+            output=PolicyOutput(move=None, policy_prob=1.0),
+            root=_Node(1.0),
+            root_fen=board.fen(),
+            chosen_move=None,
+        )
 
     root_turn = board.turn
+    root_fen = board.fen()
 
-    root = _Node(1.0)
+    # Check if we can reuse the provided root
+    reused = False
+    if reuse_root is not None and reuse_root.expanded and reuse_root.children:
+        # Verify that the reuse_root's children match legal moves in this position
+        legal_moves = set(board.legal_moves)
+        reuse_moves = set(reuse_root.children.keys())
+        # Allow reuse if there's substantial overlap (some children may have been pruned)
+        if reuse_moves & legal_moves:
+            root = reuse_root
+            reused = True
+            # Get root value from existing tree (estimate from children)
+            if root.visit_count > 0:
+                root_value = root.q()
+            else:
+                root_value = 0.0
+            root_time_s = root.pred_time_s
+        else:
+            reuse_root = None
 
-    # Root expansion
-    priors, root_value, root_time_s = _evaluate_position(
-        model=model,
-        board=board,
-        ctx=ctx,
-        root_turn=root_turn,
-        time_history_s=time_history_s,
-        device=device,
-        contempt=float(settings.contempt),
-    )
-    root.pred_time_s = float(root_time_s)
+    if not reused:
+        root = _Node(1.0)
 
-    # Immediate mate check (cheap tactical sanity)
-    for mv in board.legal_moves:
-        b2 = board.copy(stack=False)
-        b2.push(mv)
-        tv = _terminal_value_for_side_to_move(b2)
-        if tv is not None and tv == -1.0:
-            # After our move, opponent-to-move is losing => we delivered mate.
-            return PolicyOutput(move=mv, policy_prob=1.0)
+        # Root expansion (only if not reusing)
+        priors, root_value, root_time_s = _evaluate_position(
+            model=model,
+            board=board,
+            ctx=ctx,
+            root_turn=root_turn,
+            time_history_s=time_history_s,
+            device=device,
+            contempt=float(settings.contempt),
+        )
+        root.pred_time_s = float(root_time_s)
 
-    priors = _prune_priors(priors, max_children=int(settings.max_children))
-    priors = _apply_root_noise(
-        priors,
-        alpha=float(settings.root_dirichlet_alpha),
-        frac=float(settings.root_exploration_frac),
-        rng=rng,
-    )
+        # Immediate mate check (cheap tactical sanity)
+        for mv in board.legal_moves:
+            b2 = board.copy(stack=False)
+            b2.push(mv)
+            tv = _terminal_value_for_side_to_move(b2)
+            if tv is not None and tv == -1.0:
+                # After our move, opponent-to-move is losing => we delivered mate.
+                return MCTSResult(
+                    output=PolicyOutput(move=mv, policy_prob=1.0),
+                    root=root,
+                    root_fen=root_fen,
+                    chosen_move=mv,
+                )
 
-    for mv, p in priors.items():
-        root.children[mv] = _Node(p)
-    root.expanded = True
+        priors = _prune_priors(priors, max_children=int(settings.max_children))
+        priors = _apply_root_noise(
+            priors,
+            alpha=float(settings.root_dirichlet_alpha),
+            frac=float(settings.root_exploration_frac),
+            rng=rng,
+        )
+
+        for mv, p in priors.items():
+            root.children[mv] = _Node(p)
+        root.expanded = True
+    else:
+        # When reusing, still check for immediate mate
+        for mv in board.legal_moves:
+            b2 = board.copy(stack=False)
+            b2.push(mv)
+            tv = _terminal_value_for_side_to_move(b2)
+            if tv is not None and tv == -1.0:
+                return MCTSResult(
+                    output=PolicyOutput(move=mv, policy_prob=1.0),
+                    root=root,
+                    root_fen=root_fen,
+                    chosen_move=mv,
+                )
 
     # Run simulations
     sims = max(1, int(settings.simulations))
@@ -464,7 +608,7 @@ def mcts_choose_move(
 
     # Lightweight diagnostics counters (minimal overhead)
     done = 0
-    node_count = 1 + len(priors)  # count the root + immediate root children
+    node_count = 1 + len(root.children)  # count the root + immediate root children
     start_time = time.time()
     while done < sims:
         if stop_check is not None and stop_check():
@@ -594,7 +738,12 @@ def mcts_choose_move(
                 pass  # Progress callback must never break MCTS
 
     if not root.children:
-        return PolicyOutput(move=None, policy_prob=1.0)
+        return MCTSResult(
+            output=PolicyOutput(move=None, policy_prob=1.0),
+            root=root,
+            root_fen=root_fen,
+            chosen_move=None,
+        )
 
     # Pick move from visit counts
     moves = list(root.children.keys())
@@ -633,12 +782,22 @@ def mcts_choose_move(
     total = float(visits.sum())
     if total <= 0:
         mv = moves[int(np.argmax([root.children[m].prior for m in moves]))]
-        return PolicyOutput(move=mv, policy_prob=1.0 / len(moves), stats=stats)
+        return MCTSResult(
+            output=PolicyOutput(move=mv, policy_prob=1.0 / len(moves), stats=stats),
+            root=root,
+            root_fen=root_fen,
+            chosen_move=mv,
+        )
 
     if float(settings.final_temperature) <= 0.0:
         idx = int(np.argmax(visits))
         mv = moves[idx]
-        return PolicyOutput(move=mv, policy_prob=float(visits[idx] / total), stats=stats)
+        return MCTSResult(
+            output=PolicyOutput(move=mv, policy_prob=float(visits[idx] / total), stats=stats),
+            root=root,
+            root_fen=root_fen,
+            chosen_move=mv,
+        )
 
     t = float(settings.final_temperature)
     # Temperature-adjusted distribution from visit counts.
@@ -665,4 +824,9 @@ def mcts_choose_move(
 
     idx = int(rng.choice(len(moves), p=w))
     mv = moves[idx]
-    return PolicyOutput(move=mv, policy_prob=float(w[idx]), stats=stats)
+    return MCTSResult(
+        output=PolicyOutput(move=mv, policy_prob=float(w[idx]), stats=stats),
+        root=root,
+        root_fen=root_fen,
+        chosen_move=mv,
+    )

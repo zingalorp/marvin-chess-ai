@@ -17,6 +17,8 @@
 # Inference
 !inference/
 !inference/*.py
+!templates/
+!templates/index.html
 
 # Lichess-bot integration
 !lichess-bot/
