@@ -36,7 +36,7 @@ GUI for prediction distributions, live parameter tweaking, experimenting, and pl
 Tested on Linux/WSL with Python 3.10+.
 
 ```bash
-git clone https://github.com/zingalorp/marvin.git
+git clone https://github.com/zingalorp/marvin-chess.git
 cd marvin
 python -m venv venv
 source venv/bin/activate
