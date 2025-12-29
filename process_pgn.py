@@ -120,9 +120,9 @@ def parse_time_control(tc_string: str) -> Optional[Tuple[int, int]]:
 
 def get_tc_category(base: int, inc: int) -> int:
     duration = base + 40 * inc
-    if duration < 600: return 0    # Bullet
-    if duration < 1800: return 1   # Blitz
-    return 2                        # Rapid+
+    if duration < 600: return 0    # Blitz
+    if duration < 1800: return 1   # Rapid
+    return 2                        # Classical
 
 
 def encode_board(board: chess.Board) -> List[int]:
