@@ -6,13 +6,13 @@ import chess
 # Settings (Defaults) copied from `inference/app.py`.
 DEFAULT_GAME_SETTINGS: dict = {
     "temperature": 0.9,
-    "time_temperature": 0.6,
+    "time_temperature": 0.5,
     "top_p": 0.95,
-    "time_top_p": 0.75,
+    "time_top_p": 0.95,
     "opening_temperature": 1.2,
     "opening_length": 10,
-    "human_elo": 1900,
-    "engine_elo": 1900,
+    "human_elo": 2400,
+    "engine_elo": 2400,
     "human_color": chess.WHITE,
     "compile_model": True,
     "auto_play": False,
@@ -20,8 +20,8 @@ DEFAULT_GAME_SETTINGS: dict = {
     "internal_clock": False,
     "use_real_time": False,
     "use_mode_time": False,
-    "use_expected_time": False,
-    "start_clock_s": 180.0,
+    "use_expected_time": True,
+    "start_clock_s": 300.0,
     "inc_s": 0.0,
 
     # MCTS (disabled by default)
@@ -33,13 +33,13 @@ DEFAULT_GAME_SETTINGS: dict = {
     "mcts_root_exploration_frac": 0.0,
     "mcts_final_temperature": 0.0,
     "mcts_max_depth": 96,
-    "mcts_adaptive": False,
-    "mcts_adaptive_scale": 500.0,
+    "mcts_adaptive": True,
+    "mcts_adaptive_scale": 150.0,
     "mcts_contempt": 0.15,  # Penalize draws to avoid drawish positions when ahead
     "mcts_simulate_time": False,  # Simulate remaining thinking time after MCTS completes
     "mcts_start_ply": 0,  # Ply at which MCTS kicks in (0 = from start, higher = skip opening for variety)
-    "mcts_tree_reuse": False,  # Reuse search tree from previous position for faster follow-up moves
-    "show_mcts_stats": False,
+    "mcts_tree_reuse": True,  # Reuse search tree from previous position for faster follow-up moves
+    "show_mcts_stats": True,
     
     # Pondering (thinking during opponent's time)
     "ponder": False,
@@ -63,7 +63,7 @@ DEFAULT_GAME_SETTINGS: dict = {
 
 
 # Fixed Context (copied from `inference/app.py`).
-START_CLOCK_S = 180.0
+START_CLOCK_S = 300.0
 INC_S = 0
 
 

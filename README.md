@@ -15,7 +15,7 @@ The architecture uses techniques from [Leela Chess Zero](https://lczero.org/blog
 Context conditioning (Elo, clock, time control) is injected via Adaptive Layer Normalization.
 
 ## Results
-
+Human move-matching accuracy comparison with [Maia2](https://arxiv.org/abs/2409.20553) and [Allie](https://arxiv.org/abs/2410.03893)
 ![Move Matching Accuracy](docs/accuracy_comparison.png)
 
 ## Contents
