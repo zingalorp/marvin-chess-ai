@@ -47,6 +47,8 @@ def load_default_chessformer(*, repo_root: Path | None = None, device: torch.dev
 
     if compile_model:
         try:
+            # Use default mode - reduce-overhead mode uses CUDA graphs which don't
+            # work well with multi-threaded environments like Flask
             model = torch.compile(model)
         except Exception as e:
             print(f"Warning: torch.compile failed: {e}. Falling back to eager mode.")

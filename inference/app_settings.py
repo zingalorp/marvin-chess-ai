@@ -32,7 +32,9 @@ DEFAULT_GAME_SETTINGS: dict = {
     "mcts_root_dirichlet_alpha": 0.0,
     "mcts_root_exploration_frac": 0.0,
     "mcts_final_temperature": 0.0,
+    "mcts_final_top_p": 0.90,  # Top-p (nucleus) sampling for final move selection (1.0 = disabled)
     "mcts_max_depth": 96,
+    "mcts_leaf_batch_size": 8,  # Batch this many leaf evaluations per forward pass
     "mcts_adaptive": True,
     "mcts_adaptive_scale": 150.0,
     "mcts_contempt": 0.15,  # Penalize draws to avoid drawish positions when ahead

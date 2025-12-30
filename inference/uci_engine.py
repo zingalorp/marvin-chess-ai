@@ -43,7 +43,8 @@ class _Option:
 
 class UciEngine:
     def __init__(self) -> None:
-        self.loaded, self.model, _ckpt = load_default_chessformer()
+        # Disable torch.compile for UCI to avoid JIT warmup delays that cause timeouts
+        self.loaded, self.model, _ckpt = load_default_chessformer(compile_model=False)
         # By default use a non-deterministic seed so separate engine processes
         # produce different sampled moves. Set the env var `MARVIN_DETERMINISTIC`
         # to any value to force reproducible seeding via `DEFAULT_RNG_SEED`.
@@ -140,6 +141,7 @@ class UciEngine:
             _Option("MCTSRootDirichletAlpha", "string", str(self.settings["mcts_root_dirichlet_alpha"])),
             _Option("MCTSRootExplorationFrac", "string", str(self.settings["mcts_root_exploration_frac"])),
             _Option("MCTSFinalTemperature", "string", str(self.settings["mcts_final_temperature"])),
+            _Option("MCTSFinalTopP", "string", str(self.settings.get("mcts_final_top_p", 1.0))),
             _Option("MCTSMaxDepth", "spin", int(self.settings["mcts_max_depth"]), min=1, max=512),
             _Option("MCTSAdaptive", "check", bool(self.settings["mcts_adaptive"])),
             _Option("MCTSAdaptiveScale", "string", str(self.settings["mcts_adaptive_scale"])),
@@ -385,6 +387,8 @@ class UciEngine:
             set_setting("mcts_root_exploration_frac", float(value))
         elif name_key == "mctsfinaltemperature":
             set_setting("mcts_final_temperature", float(value))
+        elif name_key == "mctsfinaltop_p" or name_key == "mctsfinaltopp":
+            set_setting("mcts_final_top_p", float(value))
         elif name_key == "mctsmaxdepth":
             set_setting("mcts_max_depth", int(float(value)))
         elif name_key == "mctsadaptive":

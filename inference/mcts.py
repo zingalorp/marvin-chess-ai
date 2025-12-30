@@ -299,6 +299,7 @@ class MCTSSettings:
     root_dirichlet_alpha: float = 0.0
     root_exploration_frac: float = 0.0
     final_temperature: float = 0.0
+    final_top_p: float = 0.90  # Top-p (nucleus) sampling for final move selection
 
     # Contempt: adjusts how draws are valued relative to wins/losses.
     # value = P(win) - P(loss) - contempt * P(draw)
@@ -800,6 +801,8 @@ def mcts_choose_move(
         )
 
     t = float(settings.final_temperature)
+    top_p = float(getattr(settings, "final_top_p", 1.0))
+    
     # Temperature-adjusted distribution from visit counts.
     w = np.power(visits / total, 1.0 / max(1e-6, t))
 
@@ -821,6 +824,19 @@ def mcts_choose_move(
             w = np.ones_like(visits, dtype=np.float64) / float(len(visits))
     else:
         w = w / w_sum
+
+    # Apply top-p (nucleus) sampling: keep only moves with cumulative prob <= top_p
+    if 0.0 < top_p < 1.0:
+        sorted_indices = np.argsort(w)[::-1]  # descending order
+        sorted_probs = w[sorted_indices]
+        cumsum = np.cumsum(sorted_probs)
+        # Keep moves up to and including the one that crosses top_p threshold
+        cutoff_idx = np.searchsorted(cumsum, top_p, side='right')
+        cutoff_idx = max(1, min(cutoff_idx + 1, len(w)))  # keep at least 1, include threshold-crossing move
+        mask = np.zeros_like(w, dtype=bool)
+        mask[sorted_indices[:cutoff_idx]] = True
+        w = np.where(mask, w, 0.0)
+        w = w / w.sum()  # renormalize
 
     idx = int(rng.choice(len(moves), p=w))
     mv = moves[idx]

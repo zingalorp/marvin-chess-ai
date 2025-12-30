@@ -422,9 +422,11 @@ def choose_engine_move(
             root_dirichlet_alpha=float(settings.get("mcts_root_dirichlet_alpha", 0.0)),
             root_exploration_frac=float(settings.get("mcts_root_exploration_frac", 0.0)),
             final_temperature=float(settings.get("mcts_final_temperature", 0.0)),
+            final_top_p=float(settings.get("mcts_final_top_p", 1.0)),
             fpu_reduction=float(settings.get("mcts_fpu_reduction", 0.0)),
             contempt=float(settings.get("mcts_contempt", 0.15)),
             tree_reuse=bool(settings.get("mcts_tree_reuse", False)),
+            leaf_batch_size=int(settings.get("mcts_leaf_batch_size", 8)),
         )
 
         # Track MCTS execution time for timing simulation

@@ -31,7 +31,7 @@ def load_chessformer(
     *,
     model_py_path: str | Path = "model.py",
     config_name: ConfigName = "smolgen",
-    checkpoint_path: str | Path = "inference/chessformer_smolgen_best.pt",
+    checkpoint_path: str | Path = "inference/chessformer_inference_bf16.pt",
     device: str | torch.device = "cuda",
 ) -> LoadedModel:
     model_py_path = Path(model_py_path)
