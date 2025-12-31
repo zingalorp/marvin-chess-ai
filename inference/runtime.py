@@ -34,7 +34,12 @@ def load_default_chessformer(*, repo_root: Path | None = None, device: torch.dev
     device = device or default_device()
 
     model_py_path = repo_root / "model.py"
-    checkpoint_path = repo_root / "inference/chessformer_smolgen_best.pt"
+    # Require the BF16 inference checkpoint. If it's missing, print a clear
+    # message and raise FileNotFoundError so callers see what's wrong.
+    checkpoint_path = repo_root / "inference/chessformer_inference_bf16.pt"
+    if not checkpoint_path.exists():
+        print(f"Error: model weights are missing. Expected checkpoint at {checkpoint_path}.")
+        raise FileNotFoundError(checkpoint_path)
 
     loaded = load_chessformer(
         model_py_path=model_py_path,
@@ -47,8 +52,6 @@ def load_default_chessformer(*, repo_root: Path | None = None, device: torch.dev
 
     if compile_model:
         try:
-            # Use default mode - reduce-overhead mode uses CUDA graphs which don't
-            # work well with multi-threaded environments like Flask
             model = torch.compile(model)
         except Exception as e:
             print(f"Warning: torch.compile failed: {e}. Falling back to eager mode.")

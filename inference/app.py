@@ -41,7 +41,7 @@ from inference.sampling import sample_from_logits
 print("Loading model...")
 device = default_device()
 
-model_path = repo_root / "inference/chessformer_smolgen_best.pt"
+model_path = repo_root / "inference/chessformer_inference_bf16.pt"
 if not model_path.exists():
     print(f"Warning: Model not found at {model_path}.")
 
