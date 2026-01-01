@@ -107,6 +107,28 @@ CONFIG_100M_BALANCED = {
     "context_dim": 256,
 }
 
+# Token-conditioned config: replaces AdaLN with explicit tokens
+# Uses 6 conditioning tokens prepended to 64 square tokens = 70 total tokens
+CONFIG_TOKEN_CONDITIONED = {
+    "d_model": 448,           # Same as SMOLGEN
+    "n_layers": 12,           # Same as SMOLGEN
+    "n_heads": 14,            # 448 / 32 = 14
+    "d_head": 32,
+    "d_ff": 672,              # 1.5x d_model
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,         # Still used for board history, not time
+    "num_piece_types": 13,
+    "num_tc_cats": 3,         # Blitz, Rapid, Classical
+    "embedding_ffn": True,    # Keep embedding FFN
+    "smolgen": True,          # Keep smolgen
+    "smolgen_hidden": 256,
+    "smolgen_per_head": 256,
+    "use_adaln": False,       # Disable AdaLN
+    "use_token_conditioning": True,  # Enable token-based conditioning
+    "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
+}
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -214,6 +236,195 @@ class AdaLNModulation(nn.Module):
             (scale1.unsqueeze(1), shift1.unsqueeze(1)),
             (scale2.unsqueeze(1), shift2.unsqueeze(1))
         )
+
+
+# ============================================================================
+# Token-Based Conditioning (Alternative to AdaLN)
+# ============================================================================
+
+# Bins for log-scaled time: 16 bins covering 0-1800s (30 min)
+# Boundaries at approximately: 0, 1, 2, 4, 7, 12, 20, 35, 60, 100, 180, 300, 500, 900, 1800
+NUM_TIME_LOG_BINS = 16
+NUM_ELO_ANCHORS = 14  # 1200-2500 in 100 ELO increments
+NUM_TC_CATEGORIES = 3  # Blitz, Rapid, Classical
+NUM_INC_CATEGORIES = 5  # 0, 1, 2, 5, 10+
+NUM_CONDITIONING_TOKENS = 6  # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
+
+
+def log_bin_time(seconds: torch.Tensor, num_bins: int = NUM_TIME_LOG_BINS) -> torch.Tensor:
+    """
+    Bin time values logarithmically. Returns bin indices in [0, num_bins-1].
+    
+    Covers 0 to ~1800 seconds (30 min) with denser bins at lower times.
+    Uses log1p for smooth handling of zero.
+    """
+    # log1p(1800) ≈ 7.5, so divide by 7.5 and scale to bins
+    log_time = torch.log1p(seconds.clamp(min=0))
+    # Normalize to [0, 1] range, then to bin indices
+    normalized = log_time / 7.5  # Max expected log1p value
+    bins = (normalized.clamp(0, 0.9999) * num_bins).long()
+    return bins
+
+
+def bin_increment(inc: torch.Tensor) -> torch.Tensor:
+    """
+    Bin increment values into 5 categories: 0, 1, 2, 5, 10+.
+    Returns indices 0-4.
+    """
+    # Categories: [0], [1], [2], [3-4 -> map to 5], [5-9 -> map to 5], [10+]
+    # Simplified: 0->0, 1->1, 2->2, 3-9->3, 10+->4
+    bins = torch.zeros_like(inc)
+    bins = torch.where(inc == 0, torch.tensor(0, device=inc.device), bins)
+    bins = torch.where(inc == 1, torch.tensor(1, device=inc.device), bins)
+    bins = torch.where(inc == 2, torch.tensor(2, device=inc.device), bins)
+    bins = torch.where((inc >= 3) & (inc < 10), torch.tensor(3, device=inc.device), bins)
+    bins = torch.where(inc >= 10, torch.tensor(4, device=inc.device), bins)
+    return bins
+
+
+class TokenConditioningEncoder(nn.Module):
+    """
+    Encode global context as explicit tokens prepended to the square sequence.
+    
+    Tokens:
+    1. [ELO_TOKEN] - Interpolated embedding for player skill level
+    2. [TC_TOKEN] - Time control category (Blitz, Rapid, Classical)
+    3. [URGENCY_TOKEN] - Log-binned remaining time
+    4. [INC_TOKEN] - Increment category (0, 1, 2, 5, 10+)
+    5. [MY_LAST_TIME] - Log-binned time spent on my last move
+    6. [OPP_LAST_TIME] - Log-binned time spent on opponent's last move
+    
+    Unlike AdaLN which modulates normalization, this approach lets the model
+    attend to conditioning information directly through self-attention.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        
+        # ELO: Interpolated embedding with anchor points
+        # Anchors at 1200-2500 in 100 ELO increments (matches dataset range)
+        self.elo_anchors = nn.Parameter(
+            torch.tensor([1200.0, 1300.0, 1400.0, 1500.0, 1600.0, 1700.0, 1800.0,
+                          1900.0, 2000.0, 2100.0, 2200.0, 2300.0, 2400.0, 2500.0]),
+            requires_grad=False
+        )
+        self.elo_embeddings = nn.Embedding(NUM_ELO_ANCHORS, d_model)
+        
+        # TC: Categorical embedding (Blitz=0, Rapid=1, Classical=2)
+        self.tc_embedding = nn.Embedding(NUM_TC_CATEGORIES, d_model)
+        
+        # Urgency: Log-binned remaining time
+        self.urgency_embedding = nn.Embedding(NUM_TIME_LOG_BINS, d_model)
+        
+        # Increment: Categorical (0, 1, 2, 5, 10+)
+        self.inc_embedding = nn.Embedding(NUM_INC_CATEGORIES, d_model)
+        
+        # My last move time: Log-binned
+        self.my_time_embedding = nn.Embedding(NUM_TIME_LOG_BINS, d_model)
+        
+        # Opponent's last move time: Log-binned
+        self.opp_time_embedding = nn.Embedding(NUM_TIME_LOG_BINS, d_model)
+        
+        # Position embeddings for the 6 conditioning tokens
+        self.token_pos_embedding = nn.Embedding(NUM_CONDITIONING_TOKENS, d_model)
+        
+        # Pre-computed token position indices
+        self.register_buffer(
+            "token_pos_ids",
+            torch.arange(NUM_CONDITIONING_TOKENS, dtype=torch.long),
+            persistent=False
+        )
+    
+    def _interpolate_elo(self, elo: torch.Tensor) -> torch.Tensor:
+        """
+        Interpolate ELO embedding from anchor points.
+        
+        Args:
+            elo: (B,) raw ELO values
+        Returns:
+            (B, d_model) interpolated embeddings
+        """
+        B = elo.shape[0]
+        device = elo.device
+        
+        # Clamp ELO to anchor range
+        elo_clamped = elo.clamp(self.elo_anchors[0], self.elo_anchors[-1])
+        
+        # Find which segment each ELO falls into
+        # For each ELO, find the largest anchor <= elo
+        anchors = self.elo_anchors  # (NUM_ELO_ANCHORS,)
+        
+        # Broadcast: (B, 1) vs (NUM_ELO_ANCHORS,) -> (B, NUM_ELO_ANCHORS)
+        below_mask = elo_clamped.unsqueeze(1) >= anchors.unsqueeze(0)
+        
+        # Index of lower anchor (last True in each row)
+        lower_idx = below_mask.sum(dim=1) - 1  # (B,)
+        lower_idx = lower_idx.clamp(0, NUM_ELO_ANCHORS - 2)  # Ensure valid upper idx
+        upper_idx = lower_idx + 1
+        
+        # Get anchor values
+        lower_anchor = anchors[lower_idx]  # (B,)
+        upper_anchor = anchors[upper_idx]  # (B,)
+        
+        # Interpolation weight
+        t = (elo_clamped - lower_anchor) / (upper_anchor - lower_anchor + 1e-6)  # (B,)
+        t = t.clamp(0, 1).unsqueeze(1)  # (B, 1)
+        
+        # Get embeddings and interpolate
+        lower_emb = self.elo_embeddings(lower_idx)  # (B, d_model)
+        upper_emb = self.elo_embeddings(upper_idx)  # (B, d_model)
+        
+        return (1 - t) * lower_emb + t * upper_emb  # (B, d_model)
+    
+    def forward(
+        self,
+        player_elo: torch.Tensor,      # (B,) raw ELO
+        tc_cat: torch.Tensor,           # (B,) 0=Blitz, 1=Rapid, 2=Classical
+        remaining_time: torch.Tensor,   # (B,) seconds remaining
+        increment: torch.Tensor,        # (B,) increment in seconds
+        my_last_time: torch.Tensor,     # (B,) seconds spent on my last move
+        opp_last_time: torch.Tensor,    # (B,) seconds spent on opponent's last move
+    ) -> torch.Tensor:
+        """
+        Generate conditioning token embeddings.
+        
+        Returns:
+            (B, 6, d_model) - 6 conditioning tokens
+        """
+        B = player_elo.shape[0]
+        
+        # 1. ELO token (interpolated)
+        elo_token = self._interpolate_elo(player_elo)  # (B, d_model)
+        
+        # 2. TC token (categorical)
+        tc_token = self.tc_embedding(tc_cat)  # (B, d_model)
+        
+        # 3. Urgency token (log-binned remaining time)
+        urgency_bins = log_bin_time(remaining_time)
+        urgency_token = self.urgency_embedding(urgency_bins)  # (B, d_model)
+        
+        # 4. Increment token (categorical)
+        inc_bins = bin_increment(increment)
+        inc_token = self.inc_embedding(inc_bins)  # (B, d_model)
+        
+        # 5. My last move time token (log-binned)
+        my_time_bins = log_bin_time(my_last_time)
+        my_time_token = self.my_time_embedding(my_time_bins)  # (B, d_model)
+        
+        # 6. Opponent's last move time token (log-binned)
+        opp_time_bins = log_bin_time(opp_last_time)
+        opp_time_token = self.opp_time_embedding(opp_time_bins)  # (B, d_model)
+        
+        # Stack tokens: (B, 6, d_model)
+        tokens = torch.stack([
+            elo_token, tc_token, urgency_token,
+            inc_token, my_time_token, opp_time_token
+        ], dim=1)
+        
+        # Add position embeddings
+        tokens = tokens + self.token_pos_embedding(self.token_pos_ids)  # broadcast over B
+        
+        return tokens
 
 
 class AttentionPooling(nn.Module):
@@ -655,11 +866,20 @@ class Chessformer(nn.Module):
     Chessformer model with AdaLN (Adaptive Layer Normalization) for global context conditioning.
     
     ELO and time modulate the network's behavior via conditional normalization.
+    
+    Alternatively, use token-based conditioning (use_token_conditioning=True) which
+    prepends 6 conditioning tokens to the 64 square tokens.
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
         d_model = config['d_model']
+        
+        # Token-based conditioning (alternative to AdaLN)
+        self.use_token_conditioning = config.get('use_token_conditioning', False)
+        self.num_conditioning_tokens = config.get('num_conditioning_tokens', 6)
+        if self.use_token_conditioning:
+            self.token_conditioning = TokenConditioningEncoder(d_model)
         
         # AdaLN: Global context encoder (ELO, time, move number -> style vector)
         self.use_adaln = config.get('use_adaln', False)
@@ -672,6 +892,22 @@ class Chessformer(nn.Module):
         
         # Transformer body - using TransformerBlock with Mish activation
         self.rel_pos_gen = RelativePositionGenerator(config['max_rel_dist'])
+        
+        # Extended relative position for conditioning tokens
+        # Conditioning tokens use a special "far away" bucket for their relative positions
+        if self.use_token_conditioning:
+            # Create extended relative position indices for 70 tokens
+            # Conditioning tokens (0-5) use the max distance bucket for all positions
+            total_tokens = 64 + self.num_conditioning_tokens
+            ext_indices = torch.zeros(total_tokens, total_tokens, dtype=torch.long)
+            # Fill in square-to-square relative positions (tokens 6-69)
+            ext_indices[self.num_conditioning_tokens:, self.num_conditioning_tokens:] = self.rel_pos_gen.indices
+            # All other positions (involving conditioning tokens) use max bucket
+            max_bucket = self.rel_pos_gen.num_buckets - 1
+            ext_indices[:self.num_conditioning_tokens, :] = max_bucket
+            ext_indices[:, :self.num_conditioning_tokens] = max_bucket
+            self.register_buffer("extended_rel_indices", ext_indices)
+        
         self.layers = nn.ModuleList([
             TransformerBlock(config, self.rel_pos_gen.num_buckets)
             for _ in range(config['n_layers'])
@@ -807,26 +1043,86 @@ class Chessformer(nn.Module):
                 increment, last_opp_move_time, halfmove_clock
             )
         
-        # Encode inputs
+        # Encode square inputs
         x = self.input_encoder(
             board_history, time_history, rep_flags, castling,
             ep_mask, scalars, tc_cat
-        )
+        )  # (B, 64, d_model)
+        
+        # Token conditioning: prepend conditioning tokens to the sequence
+        if self.use_token_conditioning:
+            # Extract raw values for token conditioning
+            # ELO: denormalize from scalars (was (elo - 1900) / 700)
+            player_elo_raw = scalars[:, 0] * 700 + 1900  # (B,)
+            
+            # TC category is already in the batch
+            # tc_cat: (B,) with values 0=Blitz, 1=Rapid, 2=Classical
+            
+            # Remaining time: denormalize from scalars (was log1p(seconds) / 10)
+            remaining_time_raw = torch.expm1(scalars[:, 3] * 10)  # (B,)
+            
+            # Increment: denormalize from scalars (was inc / 30)
+            increment_raw = (scalars[:, 5] * 30).long()  # (B,)
+            
+            # My last move time: time_history[:, 1] (index 1 is my last move, index 0 is opponent's last)
+            # Denormalize from /60 and handle edge cases
+            my_last_time_raw = time_history[:, 1] * 60  # (B,) in seconds
+            
+            # Opponent's last move time: time_history[:, 0]
+            opp_last_time_raw = time_history[:, 0] * 60  # (B,) in seconds
+            
+            # Generate conditioning token embeddings
+            cond_tokens = self.token_conditioning(
+                player_elo=player_elo_raw,
+                tc_cat=tc_cat,
+                remaining_time=remaining_time_raw,
+                increment=increment_raw,
+                my_last_time=my_last_time_raw,
+                opp_last_time=opp_last_time_raw,
+            )  # (B, 6, d_model)
+            
+            # Prepend conditioning tokens to square tokens
+            x = torch.cat([cond_tokens, x], dim=1)  # (B, 70, d_model)
         
         # Compute smolgen bias once (shared across layers)
+        # Note: smolgen is designed for 64x64 square attention
+        # When using token conditioning, we apply it only to square-to-square attention
         smolgen_bias = None
         if self.use_smolgen:
-            smolgen_bias = self.smolgen(x)
+            if self.use_token_conditioning:
+                # Compute smolgen on square tokens only
+                square_tokens = x[:, self.num_conditioning_tokens:, :]  # (B, 64, d_model)
+                smolgen_bias_64 = self.smolgen(square_tokens)  # (B, n_heads, 64, 64)
+                
+                # Extend to 70x70 with zeros for conditioning token interactions
+                n_heads = smolgen_bias_64.shape[1]
+                smolgen_bias = torch.zeros(
+                    B, n_heads, 70, 70, 
+                    device=device, dtype=smolgen_bias_64.dtype
+                )
+                smolgen_bias[:, :, self.num_conditioning_tokens:, self.num_conditioning_tokens:] = smolgen_bias_64
+            else:
+                smolgen_bias = self.smolgen(x)
         
         # Transformer layers with AdaLN conditioning
-        rel_indices = self.rel_pos_gen()
+        if self.use_token_conditioning:
+            rel_indices = self.extended_rel_indices
+        else:
+            rel_indices = self.rel_pos_gen()
+        
         for layer in self.layers:
             x = layer(x, rel_indices=rel_indices, smolgen_bias=smolgen_bias, context=context)
-        x = self.norm_f(x)  # (B, 64, d_model)
+        x = self.norm_f(x)  # (B, 64, d_model) or (B, 70, d_model)
+        
+        # Extract square tokens for output heads when using token conditioning
+        if self.use_token_conditioning:
+            x_squares = x[:, self.num_conditioning_tokens:, :]  # (B, 64, d_model)
+        else:
+            x_squares = x  # (B, 64, d_model)
         
         # --- Policy Head ---
-        pol_q = self.policy_query(x)  # (B, 64, d_model)
-        pol_k = self.policy_key(x)    # (B, 64, d_model)
+        pol_q = self.policy_query(x_squares)  # (B, 64, d_model)
+        pol_k = self.policy_key(x_squares)    # (B, 64, d_model)
         
         # Move logits: (B, 64, 64) -> (B, 4096)
         move_logits = torch.matmul(pol_q, pol_k.transpose(1, 2)) * self.policy_scale
@@ -859,18 +1155,18 @@ class Chessformer(nn.Module):
         
         # --- Aux: Start Square Head ---
         # Predicts which of the 64 squares the piece moves FROM
-        start_square_logits = self.start_square_head(x).squeeze(-1)  # (B, 64)
+        start_square_logits = self.start_square_head(x_squares).squeeze(-1)  # (B, 64)
         
         # --- Value and Time Heads ---
         # Value uses PaperValueHead (flattened spatial structure)
-        value_out, value_cls_out = self.value_head(x)  # (B, 1), (B, 3)
+        value_out, value_cls_out = self.value_head(x_squares)  # (B, 1), (B, 3)
 
         # Value error models volatility
-        value_error_feat = self.value_error_pool(x, context)
+        value_error_feat = self.value_error_pool(x_squares, context)
         value_error_out = self.value_error_head(value_error_feat)
         
         # Time uses attention pooling
-        time_pooled = self.time_pooling(x, context)    # (B, d_model)
+        time_pooled = self.time_pooling(x_squares, context)    # (B, d_model)
         time_cls_out = self.time_head(time_pooled)     # (B, 256) time bin logits
         
         if return_promo:
@@ -914,3 +1210,17 @@ if __name__ == "__main__":
     print(f"100M Config Trainable Parameters: {count_parameters(model_100m):,}")
     model_smolgen = Chessformer(CONFIG_SMOLGEN)
     print(f"Smolgen Config Trainable Parameters: {count_parameters(model_smolgen):,}")
+    
+    # Test Token-Conditioned config
+    print("\n--- Testing Token-Conditioned Config ---")
+    model_token = Chessformer(CONFIG_TOKEN_CONDITIONED)
+    print(f"Token-Conditioned Config Trainable Parameters: {count_parameters(model_token):,}")
+    
+    # Run forward pass with token conditioning
+    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_token(dummy_batch)
+    print(f"Move logits: {move_logits.shape}")           # (2, 4098)
+    print(f"Value (reg): {value_out.shape}")             # (2, 1)
+    print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL
+    print(f"Value error: {value_error_out.shape}")       # (2, 1)
+    print(f"Time (cls): {time_cls_out.shape}")           # (2, 256) bins
+    print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
