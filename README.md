@@ -84,3 +84,6 @@ Pretrained model weights are available on [Hugging Face](https://huggingface.co/
 - [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework
 - [Chessground](https://github.com/lichess-org/chessground) for the web board UI
 
+## License
+
+AGPL-3.0

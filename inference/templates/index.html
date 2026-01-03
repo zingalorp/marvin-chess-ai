@@ -377,6 +377,8 @@ var showMctsStats = false;
 var useMcts = false;
 var pendingPremove = null;  // Store premove {from, to} during engine's turn
 var engineThinking = false;  // Track if engine is currently thinking
+var waitingForOurTurn = false;  // True while we're waiting for server response after our move
+var premoveQueue = [];  // Queue of premoves to execute
 
 // MCTS progress handling
 function renderMctsStats(stats) {
@@ -555,14 +557,30 @@ function submitMove(from, to, promotion) {
     var payload = { from: from, to: to, elapsed_s: elapsed };
     if (promotion) payload.promotion = promotion;
     
+    // Mark that we're waiting for our move to be processed
+    // This enables premove input during the wait
+    waitingForOurTurn = true;
+    
+    // Immediately allow premove dragging while we wait for server
+    if (cg && autoPlayEnabled) {
+        cg.set({
+            draggable: { enabled: true, showGhost: true },
+            premovable: { enabled: true, showDests: true },
+            movable: { color: humanColor }
+        });
+    }
+    
     $.ajax({
         url: '/move', type: 'POST', contentType: 'application/json',
         data: JSON.stringify(payload),
         success: function(data) { 
+            waitingForOurTurn = false;
             updateUI(data); 
             checkEngineMove(data);
         },
         error: function() { 
+            waitingForOurTurn = false;
+            premoveQueue = [];
             // Revert to current position on error
             updateBoardPosition(game_fen);
         }
@@ -572,6 +590,21 @@ function submitMove(from, to, promotion) {
 // Move handler for Chessground
 function onMove(orig, dest) {
     var turnColor = getTurnColor(game_fen);
+    
+    // If it's not our turn (engine's turn or waiting), treat as premove
+    if (autoPlayEnabled && turnColor !== humanColor) {
+        // This is a premove - store it and don't submit yet
+        pendingPremove = { from: orig, to: dest };
+        console.log('Premove registered:', orig, '->', dest);
+        return;
+    }
+    
+    // Also treat as premove if we're waiting for our previous move
+    if (waitingForOurTurn || engineThinking) {
+        premoveQueue.push({ from: orig, to: dest });
+        console.log('Move queued while waiting:', orig, '->', dest);
+        return;
+    }
     
     if (isPromotion(orig, dest, game_fen)) {
         showPromotionDialog(orig, dest, turnColor);
@@ -584,20 +617,34 @@ function onMove(orig, dest) {
 function onPremoveSet(orig, dest) {
     pendingPremove = { from: orig, to: dest };
     console.log('Premove set:', orig, '->', dest);
+    
+    // If we set a premove immediately after our move (while waiting for response),
+    // this is a "quick premove" that should be queued
+    if (waitingForOurTurn) {
+        premoveQueue.push({ from: orig, to: dest });
+        console.log('Premove queued during move wait');
+    }
 }
 
 function onPremoveUnset() {
     pendingPremove = null;
+    premoveQueue = [];
     console.log('Premove cancelled');
 }
 
 // Execute pending premove if valid
 function executePremove() {
-    if (!pendingPremove) return;
+    // Check queue first, then pending premove
+    var premoveToExecute = premoveQueue.shift() || pendingPremove;
+    if (!premoveToExecute) return;
     
-    var from = pendingPremove.from;
-    var to = pendingPremove.to;
-    pendingPremove = null;
+    var from = premoveToExecute.from;
+    var to = premoveToExecute.to;
+    
+    // Only clear pendingPremove if we used it (not from queue)
+    if (premoveToExecute === pendingPremove) {
+        pendingPremove = null;
+    }
     
     // Clear the premove visualization
     if (cg) cg.cancelPremove();
@@ -617,6 +664,10 @@ function executePremove() {
         }
     } else {
         console.log('Premove was not legal:', moveUci);
+        // Try next in queue if this one failed
+        if (premoveQueue.length > 0) {
+            executePremove();
+        }
     }
 }
 
@@ -632,8 +683,11 @@ function updateBoardPosition(fen) {
     // In auto-play mode, only allow moves when it's human's turn
     var canMove = (cursor === max_cursor) && (!autoPlayEnabled || turnColor === humanColor);
     
-    // Allow premoves when it's engine's turn in auto-play mode
-    var canPremove = autoPlayEnabled && (cursor === max_cursor) && turnColor !== humanColor;
+    // Allow premoves when:
+    // 1. It's engine's turn in auto-play mode
+    // 2. We're waiting for our move to be processed (for immediate next premove)
+    var canPremove = autoPlayEnabled && (cursor === max_cursor) && 
+                     (turnColor !== humanColor || waitingForOurTurn || engineThinking);
     
     // For premoves to work, we need to set movable.color to humanColor even when it's not our turn
     // Chessground allows premoves when movable.color differs from turnColor
@@ -673,7 +727,9 @@ function updateBoardPosition(fen) {
         canPremove: canPremove,
         movableColor: movableColor,
         cursor: cursor,
-        max_cursor: max_cursor
+        max_cursor: max_cursor,
+        waitingForOurTurn: waitingForOurTurn,
+        engineThinking: engineThinking
     });
 }
 
@@ -898,6 +954,9 @@ function checkEngineMove(data) {
             $('#status').text("Engine thinking...");
             engineThinking = true;
             
+            // Make sure board allows premoves while engine thinks
+            updateBoardPosition(data.fen);
+            
             // Start MCTS streaming if MCTS is enabled and show_mcts_stats is on
             if (useMcts && showMctsStats) {
                 startMctsStream();
@@ -922,9 +981,12 @@ function checkEngineMove(data) {
                 updateUI(data2);
                 moveStartTime = Date.now();
                 
-                // Execute any pending premove after a short delay
-                if (pendingPremove && !data2.is_game_over) {
-                    setTimeout(executePremove, 100);
+                // Execute any pending premove immediately (no delay for responsiveness)
+                if ((pendingPremove || premoveQueue.length > 0) && !data2.is_game_over) {
+                    // Use requestAnimationFrame for immediate execution after render
+                    requestAnimationFrame(function() {
+                        executePremove();
+                    });
                 }
             });
         }
@@ -1036,6 +1098,7 @@ $('.color-choice').on('click', function() {
 
 window.nav = function(action) {
     onPremoveUnset();
+    premoveQueue = [];
     if (cg) cg.cancelPremove();
     $.ajax({
         url: '/navigate', type: 'POST', contentType: 'application/json',
@@ -1149,6 +1212,9 @@ function updateUI(data) {
 
 window.resetGame = function() { 
     onPremoveUnset();
+    premoveQueue = [];
+    waitingForOurTurn = false;
+    engineThinking = false;
     if (cg) cg.cancelPremove();
     $.post('/reset', function(data) { 
         updateUI(data); 
@@ -1171,7 +1237,7 @@ function init() {
     cg = Chessground(document.getElementById('board'), {
         orientation: 'white',
         coordinates: true,
-        animation: { enabled: true, duration: 200 },
+        animation: { enabled: true, duration: 120 },  // Faster animation like Lichess
         movable: {
             color: 'white',
             free: false,
