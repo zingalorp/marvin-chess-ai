@@ -8,13 +8,14 @@ from typing import Any, Dict, Literal, Tuple
 import torch
 
 
-ConfigName = Literal["leela", "deep", "smolgen", "100m"]
+ConfigName = Literal["leela", "deep", "smolgen", "token", "100m", "auto"]
 
 
 @dataclass(frozen=True)
 class LoadedModel:
     model: torch.nn.Module
     config: Dict[str, Any]
+    config_name: str
     device: torch.device
 
 
@@ -27,10 +28,25 @@ def _load_model_module(model_py_path: Path):
     return module
 
 
+def _detect_config_from_state(state: Dict[str, Any]) -> str:
+    """Auto-detect which config was used based on state_dict keys."""
+    # Normalize keys (strip _orig_mod. prefix if present)
+    keys = set(k.replace("_orig_mod.", "") for k in state.keys())
+    
+    # Token-conditioned model has token_conditioning.* keys
+    if any(k.startswith("token_conditioning.") for k in keys):
+        return "token"
+    # Smolgen model has adaln_mod and context_encoder
+    if any("adaln_mod" in k for k in keys):
+        return "smolgen"
+    # Default fallback
+    return "smolgen"
+
+
 def load_chessformer(
     *,
     model_py_path: str | Path = "model.py",
-    config_name: ConfigName = "smolgen",
+    config_name: ConfigName = "auto",
     checkpoint_path: str | Path = "inference/chessformer_inference_bf16.pt",
     device: str | torch.device = "cuda",
 ) -> LoadedModel:
@@ -42,6 +58,20 @@ def load_chessformer(
         raise FileNotFoundError(checkpoint_path)
 
     module = _load_model_module(model_py_path)
+    device = torch.device(device)
+
+    # Load checkpoint first to potentially auto-detect config
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = ckpt.get("model", ckpt)
+    
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    if any(k.startswith("_orig_mod.") for k in state.keys()):
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+    
+    # Auto-detect config if requested
+    if config_name == "auto":
+        config_name = _detect_config_from_state(state)
+        print(f"Auto-detected model config: {config_name}")
 
     if config_name == "deep":
         config = dict(module.CONFIG_DEEP)
@@ -49,20 +79,13 @@ def load_chessformer(
         config = dict(module.CONFIG_LEELA)
     elif config_name == "100m":
         config = dict(module.CONFIG_100M_BALANCED)
+    elif config_name == "token":
+        config = dict(module.CONFIG_TOKEN_CONDITIONED)
     else:
         config = dict(module.CONFIG_SMOLGEN)
 
-    device = torch.device(device)
     model = module.Chessformer(config).to(device)
-
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state = ckpt.get("model", ckpt)
-    try:
-        model.load_state_dict(state)
-    except RuntimeError:
-        # torch.compile prefix
-        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-        model.load_state_dict(state)
+    model.load_state_dict(state)
 
     model.eval()
-    return LoadedModel(model=model, config=config, device=device)
+    return LoadedModel(model=model, config=config, config_name=config_name, device=device)

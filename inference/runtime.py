@@ -27,23 +27,23 @@ def default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def load_default_chessformer(*, repo_root: Path | None = None, device: torch.device | None = None, compile_model: bool = True) -> tuple[LoadedModel, torch.nn.Module, Path]:
+def load_default_chessformer(*, repo_root: Path | None = None, device: torch.device | None = None, compile_model: bool = True, checkpoint_path: Path | None = None, config_name: str = "auto") -> tuple[LoadedModel, torch.nn.Module, Path]:
     repo_root = (repo_root or resolve_repo_root()).resolve()
     ensure_repo_on_syspath(repo_root)
 
     device = device or default_device()
 
     model_py_path = repo_root / "model.py"
-    # Require the BF16 inference checkpoint. If it's missing, print a clear
-    # message and raise FileNotFoundError so callers see what's wrong.
-    checkpoint_path = repo_root / "inference/chessformer_inference_bf16.pt"
+    # Use provided checkpoint or default to BF16 inference checkpoint
+    if checkpoint_path is None:
+        checkpoint_path = repo_root / "inference/chessformer_inference_bf16.pt"
     if not checkpoint_path.exists():
         print(f"Error: model weights are missing. Expected checkpoint at {checkpoint_path}.")
         raise FileNotFoundError(checkpoint_path)
 
     loaded = load_chessformer(
         model_py_path=model_py_path,
-        config_name="smolgen",
+        config_name=config_name,
         checkpoint_path=checkpoint_path,
         device=device,
     )

@@ -71,7 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-weight", type=float, default=0.5)
     parser.add_argument("--start-square-weight", type=float, default=0.1)
     parser.add_argument("--promo-weight", type=float, default=0.1)
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for policy loss")
     return parser.parse_args()
 
 
@@ -137,60 +136,9 @@ def move_batch_to_device(batch: Dict, device: torch.device, non_blocking: bool =
     return result
 
 
-def compute_masked_label_smoothing_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    legal_mask: torch.Tensor,
-    smoothing: float = 0.1,
-) -> torch.Tensor:
-    """
-    Compute cross-entropy loss with label smoothing, distributing smoothed mass
-    only across legal chess moves (excluding resign/flag indices 4096-4097).
-    
-    Args:
-        logits: (B, 4098) raw policy logits (may have -inf for illegal moves)
-        targets: (B,) target move indices
-        legal_mask: (B, 4098) boolean mask of legal moves
-        smoothing: label smoothing factor (e.g., 0.1 means 90% on target, 10% distributed)
-    
-    Returns:
-        Scalar loss
-    """
-    # For resign/flag targets (4096, 4097), use standard cross-entropy (no smoothing)
-    is_special = targets >= 4096
-    
-    if is_special.all():
-        return F.cross_entropy(logits, targets)
-    
-    # Compute log probabilities - clamp -inf to a large negative to avoid NaN in masked ops
-    # The -inf values come from illegal move masking in the model
-    log_probs = F.log_softmax(logits, dim=-1)
-    
-    # Standard cross-entropy for target: nll_loss handles -inf correctly
-    nll_loss = F.nll_loss(log_probs, targets, reduction='none')  # (B,)
-    
-    # For smoothing: only consider legal chess moves (exclude resign/flag at 4096-4097)
-    chess_legal_mask = legal_mask[:, :4096].float()  # (B, 4096)
-    
-    # Replace -inf with 0 before masked sum to avoid -inf * 0 = NaN
-    # Use nan_to_num which is faster than torch.where for this pattern
-    chess_log_probs = log_probs[:, :4096]
-    safe_log_probs = torch.nan_to_num(chess_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Masked sum and normalize by count
-    num_legal = chess_legal_mask.sum(dim=1).clamp(min=1)  # (B,)
-    smooth_loss = -(safe_log_probs * chess_legal_mask).sum(dim=1) / num_legal  # (B,)
-    
-    # Combine losses
-    combined_loss = (1 - smoothing) * nll_loss + smoothing * smooth_loss
-    combined_loss = torch.where(is_special, nll_loss, combined_loss)
-    
-    return combined_loss.mean()
-
-
 def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_weight=0.1,
                    value_cls_weight=0.3, start_square_weight=0.1, value_error_weight=0.1, 
-                   promo_weight=0.1, label_smoothing=0.0):
+                   promo_weight=0.1):
     """Compute losses for model outputs.
     
     Args:
@@ -198,7 +146,6 @@ def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_wei
                           value_cls_out [B, 3], value_error_out [B, 1],
                           time_cls_out [B, 256], start_square_logits [B, 64], (optional promo_logits))
         batch: dict with policy_target, y_val, y_val_cls, time_target_cls, legal_mask
-        label_smoothing: if > 0, applies masked label smoothing to policy loss
     """
     if len(outputs) == 7:
         move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits, promo_logits = outputs
@@ -208,14 +155,7 @@ def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_wei
     
     # Policy loss: cross-entropy on 4098 classes
     policy_target = batch['policy_target']  # [B] int64 indices
-    
-    if label_smoothing > 0 and 'legal_mask' in batch:
-        # Masked label smoothing: distribute smoothed mass only across legal chess moves
-        policy_loss = compute_masked_label_smoothing_loss(
-            move_logits, policy_target, batch['legal_mask'], smoothing=label_smoothing
-        )
-    else:
-        policy_loss = F.cross_entropy(move_logits, policy_target)
+    policy_loss = F.cross_entropy(move_logits, policy_target)
     
     # Promotion loss: cross-entropy on 4 classes (Q, R, B, N)
     # Only calculated for moves that are actually promotions.
@@ -401,7 +341,6 @@ def evaluate(model, loader, device, non_blocking, max_batches=0, args=None) -> D
                 value_cls_weight=args.value_cls_weight if args else 0.3,
                 start_square_weight=args.start_square_weight if args else 0.1,
                 promo_weight=args.promo_weight if args else 0.1,
-                label_smoothing=0.0,  # No smoothing during validation
             )
             metrics = compute_metrics(outputs, batch)
             
@@ -484,7 +423,6 @@ def train_one_epoch(
                 value_cls_weight=args.value_cls_weight,
                 start_square_weight=args.start_square_weight,
                 promo_weight=args.promo_weight,
-                label_smoothing=args.label_smoothing,
             )
             loss = raw_loss / args.grad_accum_steps
 

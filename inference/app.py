@@ -41,13 +41,18 @@ from inference.sampling import sample_from_logits
 print("Loading model...")
 device = default_device()
 
-model_path = repo_root / "inference/chessformer_inference_bf16.pt"
-if not model_path.exists():
-    print(f"Warning: Model not found at {model_path}.")
+# Configure which model to load (change this to switch models)
+# Options: chessformer_inference_bf16.pt, chessformer_token_best.pt, etc.
+MODEL_CHECKPOINT = "chessformer_token_best.pt"
+model_path = repo_root / "inference" / MODEL_CHECKPOINT
 
-loaded, model, _checkpoint_path = load_default_chessformer(repo_root=repo_root, device=device)
+loaded, model, _checkpoint_path = load_default_chessformer(
+    repo_root=repo_root, 
+    device=device,
+    checkpoint_path=model_path,  # Uses auto-detection for config
+)
 device = loaded.device
-print("Model loaded.")
+print(f"Model loaded: {MODEL_CHECKPOINT} (config: {loaded.config_name})")
 
 # Handle torch.compile wrapper for metadata inspection
 orig_model = getattr(model, "_orig_mod", model)

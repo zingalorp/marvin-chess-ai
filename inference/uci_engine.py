@@ -15,7 +15,6 @@ from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, STAR
 from inference.engine_logic import choose_engine_move, analyze_position
 from inference.mcts import MCTSResult, _Node
 from inference.runtime import load_default_chessformer
-from inference.encoding import ContextOptions, build_history_from_position, make_model_batch
 
 
 def _bool_from_uci(value: str) -> bool:
@@ -46,13 +45,10 @@ class _Option:
 
 class UciEngine:
     def __init__(self) -> None:
-        # Enable torch.compile for faster inference. We do a warmup pass below
-        # to trigger JIT compilation before Lichess starts sending commands.
-        self.loaded, self.model, _ckpt = load_default_chessformer(compile_model=True)
-        
-        # Warmup forward pass to trigger JIT compilation before game starts.
-        # This avoids timeouts on the first move.
-        self._warmup_model()
+        # Load model without compilation for fast startup.
+        # Compilation happens lazily in isready if CompileModel option is true.
+        self.loaded, self.model, _ckpt = load_default_chessformer(compile_model=False)
+        self._model_compiled = False
         
         # By default use a non-deterministic seed so separate engine processes
         # produce different sampled moves. Set the env var `MARVIN_DETERMINISTIC`
@@ -104,38 +100,23 @@ class UciEngine:
 
         self.options = self._build_options()
 
-    def _warmup_model(self) -> None:
-        """Run a few forward passes to trigger JIT compilation before game starts."""
-        device = self.loaded.device
-        board = chess.Board()
-        _, board_history, rep_flags = build_history_from_position(board, [])
+    def _maybe_compile_model(self) -> None:
+        """Compile model with torch.compile if CompileModel option is enabled."""
+        if self._model_compiled:
+            return
+        if not self.settings.get("compile_model", False):
+            return
         
-        ctx = ContextOptions(
-            active_elo=1500,
-            opponent_elo=1500,
-            active_clock_s=300.0,
-            opponent_clock_s=300.0,
-        )
-        
-        batch = make_model_batch(
-            board=board,
-            board_history=board_history,
-            repetition_flags=rep_flags,
-            ctx=ctx,
-            device=device,
-        )
-        
-        print("Warming up model (JIT compilation)...", file=sys.stderr)
+        print("Compiling model with torch.compile...", file=sys.stderr)
         start = time.time()
-        
-        # Run a few forward passes to ensure all code paths are compiled
-        with torch.inference_mode():
-            with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-                for _ in range(3):
-                    _ = self.model(batch, return_promo=True)
-        
-        elapsed = time.time() - start
-        print(f"Model warmup complete in {elapsed:.1f}s", file=sys.stderr)
+        try:
+            self.model = torch.compile(self.model)
+            self._model_compiled = True
+            elapsed = time.time() - start
+            print(f"Model compilation complete in {elapsed:.1f}s", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}. Using eager mode.", file=sys.stderr)
+            self._model_compiled = True  # Don't retry
 
     def _build_options(self) -> list[_Option]:
         # These mirror the adjustable knobs in `inference/app.py`, excluding attention/UI-only.
@@ -153,7 +134,7 @@ class UciEngine:
             _Option("UseRealTime", "check", bool(self.settings.get("use_real_time", False))),
             _Option("HumanElo", "spin", int(self.settings["human_elo"]), min=100, max=4000),
             _Option("EngineElo", "spin", int(self.settings["engine_elo"]), min=100, max=4000),
-            _Option("CompileModel", "check", bool(self.settings.get("compile_model", True))),
+            _Option("CompileModel", "check", bool(self.settings.get("compile_model", False))),
             _Option("SimulateThinkingTime", "check", bool(self.settings.get("simulate_thinking_time", False))),
             _Option("InternalClock", "check", bool(self.settings.get("internal_clock", False))),
             _Option("DebugClocks", "check", bool(self.settings.get("debug_clocks", False))),
@@ -891,6 +872,7 @@ class UciEngine:
             if line == "uci":
                 self._handle_uci()
             elif line == "isready":
+                self._maybe_compile_model()
                 self._print("readyok")
             elif line.startswith("setoption"):
                 self._handle_setoption(line)
