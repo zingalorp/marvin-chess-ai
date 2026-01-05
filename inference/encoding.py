@@ -29,10 +29,6 @@ TC_BLITZ = 0
 TC_RAPID = 1
 TC_CLASSICAL = 2
 
-# Minimum base time (seconds) that the model was trained on.
-# Games with shorter base times (bullet) are scaled up to this value.
-MIN_TRAINED_BASE_S = 180.0
-
 # Known increment values the model was trained on (in seconds).
 # Rare increments are clamped to the nearest known value to improve generalization.
 KNOWN_INCREMENTS = [0, 2, 3, 5, 10]
@@ -52,25 +48,6 @@ def get_tc_category(base_seconds: float, inc_seconds: float) -> int:
     if duration < 1800.0:
         return TC_RAPID
     return TC_CLASSICAL
-
-
-def is_bullet_time_control(base_seconds: float, inc_seconds: float) -> bool:
-    """Check if time control is bullet (<180s duration), which wasn't in training data."""
-    duration = float(base_seconds) + 40.0 * float(inc_seconds)
-    return duration < MIN_TRAINED_BASE_S
-
-
-def get_bullet_scale_factor(base_seconds: float, inc_seconds: float) -> float:
-    """Get the factor to scale bullet clocks up to blitz-like values for model input.
-    
-    Returns 1.0 for non-bullet time controls (no scaling needed).
-    For bullet, returns MIN_TRAINED_BASE_S / duration so clocks are scaled up.
-    """
-    duration = float(base_seconds) + 40.0 * float(inc_seconds)
-    if duration >= MIN_TRAINED_BASE_S:
-        return 1.0
-    # Scale up so that the effective duration matches MIN_TRAINED_BASE_S
-    return MIN_TRAINED_BASE_S / max(1.0, duration)
 
 
 def canonicalize(board: chess.Board) -> chess.Board:
@@ -207,18 +184,10 @@ def make_model_batch(
     ply_norm = board.fullmove_number * 2 - (0 if board.turn == chess.WHITE else 1)
     ply_norm = ply_norm / 100.0
 
-    # Scale bullet clocks up to blitz-like values for model input.
-    # The model wasn't trained on bullet (<180s duration), so we scale clocks
-    # proportionally so the model "thinks" it's playing blitz.
-    # Time predictions are fractions of remaining clock, so they naturally
-    # scale back down when decoded against the real (unscaled) clock.
-    base_for_scaling = float(ctx.tc_base_s) if ctx.tc_base_s is not None else float(max(ctx.active_clock_s, ctx.opponent_clock_s))
-    bullet_scale = get_bullet_scale_factor(base_for_scaling, ctx.active_inc_s)
-    scaled_active_clock = ctx.active_clock_s * bullet_scale
-    scaled_opp_clock = ctx.opponent_clock_s * bullet_scale
-
-    active_clock_norm = math.log1p(max(0.0, scaled_active_clock)) / 10.0
-    opp_clock_norm = math.log1p(max(0.0, scaled_opp_clock)) / 10.0
+    # Use actual clock times directly - no scaling for bullet games.
+    # The model will see the real time values even for bullet (<180s).
+    active_clock_norm = math.log1p(max(0.0, ctx.active_clock_s)) / 10.0
+    opp_clock_norm = math.log1p(max(0.0, ctx.opponent_clock_s)) / 10.0
     
     # Clamp increments to known values for better time prediction generalization.
     # The model struggles with rare increment values it wasn't trained on.

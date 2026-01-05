@@ -24,9 +24,6 @@ from dataset import create_dataloader, count_samples
 # Import model
 from model import (
     Chessformer,
-    CONFIG_LEELA,
-    CONFIG_DEEP,
-    CONFIG_SMOLGEN,
     CONFIG_100M_BALANCED,
     CONFIG_TOKEN_CONDITIONED,
 )
@@ -35,7 +32,7 @@ from model import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
-    parser.add_argument("--config", choices=["leela", "deep", "smolgen", "100m", "token"], default="smolgen")
+    parser.add_argument("--config", choices=["100m", "token"], default="token")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -579,16 +576,10 @@ def main() -> None:
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
 
-    if args.config == "deep":
-        config = copy.deepcopy(CONFIG_DEEP)
-    elif args.config == "smolgen":
-        config = copy.deepcopy(CONFIG_SMOLGEN)
-    elif args.config == "100m":
+    if args.config == "100m":
         config = copy.deepcopy(CONFIG_100M_BALANCED)
-    elif args.config == "token":
+    else:  # token (default)
         config = copy.deepcopy(CONFIG_TOKEN_CONDITIONED)
-    else:  # leela
-        config = copy.deepcopy(CONFIG_LEELA)
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
 

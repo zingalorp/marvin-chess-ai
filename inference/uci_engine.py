@@ -15,6 +15,7 @@ from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, STAR
 from inference.engine_logic import choose_engine_move, analyze_position
 from inference.mcts import MCTSResult, _Node
 from inference.runtime import load_default_chessformer
+from inference.config import get_model_name, print_config, get_model_path, get_config_name
 
 
 def _bool_from_uci(value: str) -> bool:
@@ -47,8 +48,12 @@ class UciEngine:
     def __init__(self) -> None:
         # Load model without compilation for fast startup.
         # Compilation happens lazily in isready if CompileModel option is true.
+        # Model/config selected via inference/config.py or env vars:
+        #   MARVIN_MODEL=marvin_token_bf16.pt
+        #   MARVIN_CONFIG=auto
         self.loaded, self.model, _ckpt = load_default_chessformer(compile_model=False)
         self._model_compiled = False
+        print(f"# Model: {get_model_name()} (config: {self.loaded.config_name})", file=sys.stderr)
         
         # By default use a non-deterministic seed so separate engine processes
         # produce different sampled moves. Set the env var `MARVIN_DETERMINISTIC`

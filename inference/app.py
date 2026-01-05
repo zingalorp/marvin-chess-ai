@@ -37,22 +37,21 @@ from inference.encoding import ContextOptions, build_history_from_position, cano
 from inference.chessformer_policy import choose_move
 from inference.mcts import MCTSSettings, mcts_choose_move
 from inference.sampling import sample_from_logits
+from inference.config import get_model_name, print_config
 
 print("Loading model...")
+print_config(repo_root)
 device = default_device()
 
-# Configure which model to load (change this to switch models)
-# Options: chessformer_inference_bf16.pt, chessformer_token_best.pt, etc.
-MODEL_CHECKPOINT = "chessformer_token_best.pt"
-model_path = repo_root / "inference" / MODEL_CHECKPOINT
-
+# Model/config selected via inference/config.py or env vars:
+#   MARVIN_MODEL=marvin_token_bf16.pt
+#   MARVIN_CONFIG=auto
 loaded, model, _checkpoint_path = load_default_chessformer(
     repo_root=repo_root, 
     device=device,
-    checkpoint_path=model_path,  # Uses auto-detection for config
 )
 device = loaded.device
-print(f"Model loaded: {MODEL_CHECKPOINT} (config: {loaded.config_name})")
+print(f"Model loaded: {get_model_name()} (config: {loaded.config_name})")
 
 # Handle torch.compile wrapper for metadata inspection
 orig_model = getattr(model, "_orig_mod", model)

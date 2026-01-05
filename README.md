@@ -6,13 +6,13 @@ A human-like chess transformer designed to mimic human play across skill levels 
 
 Marvin is trained on millions of [Lichess](https://lichess.org) games to predict moves, time usage, and game outcomes. The goal is an engine that plays like a human - natural moves, realistic mistakes, and appropriate time management for the emulated skill level.
 
-The architecture uses techniques from [Leela Chess Zero](https://lczero.org/blog/2024/02/transformer-progress/) and Daniel Monroe's "[Mastering Chess with a Transformer Model](https://arxiv.org/abs/2409.12272)" in a ~32M parameter transformer with primary output heads including:
+The architecture uses techniques from [Leela Chess Zero](https://lczero.org/blog/2024/02/transformer-progress/) and Daniel Monroe's "[Mastering Chess with a Transformer Model](https://arxiv.org/abs/2409.12272)" in a transformer with token-based conditioning. Primary output heads include:
 
 - **Policy**: Move probabilities (4096 from-to squares + resign + flag)
 - **Time**: 256-bin classification for thinking time
 - **Value**: Win/Draw/Loss probabilities
 
-Context conditioning (Elo, clock, time control) is injected via Adaptive Layer Normalization.
+Context conditioning (Elo, clock, time control) is injected via 6 conditioning tokens prepended to the 64 square tokens.
 
 ## Results
 Human move-matching accuracy comparison with [Maia2](https://arxiv.org/abs/2409.20553) and [Allie](https://arxiv.org/abs/2410.03893)

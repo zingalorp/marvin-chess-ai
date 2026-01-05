@@ -31,80 +31,31 @@ class Mish(nn.Module):
         return F.mish(x)
 
 
-# Deep+wide config with 1x FFN: tests Leela's hypothesis at ~20M params
-# Same capacity as SMALL but trades FFN width for more layers and wider d_model
-CONFIG_DEEP = {
-    "d_model": 448,           # Wider than SMALL (384 -> 448)
-    "n_layers": 14,           # Deeper than SMALL (8 -> 14)
-    "n_heads": 14,            # 448 / 32 = 14
-    "d_head": 32,
-    "d_ff": 448,              # 1x d_model (Leela-style)
-    "dropout": 0.1,
-    "max_rel_dist": 7,
-    "history_len": 8,
-    "num_piece_types": 13,
-    "num_tc_cats": 3,
-    "embedding_ffn": False,   # No embedding FFN, capacity from depth/width
-    "use_adaln": True,
-    "context_dim": 256,
-}
+# =============================================================================
+# MODEL CONFIGURATIONS
+# =============================================================================
+# Both configs use token-based conditioning (6 tokens prepended to 64 square tokens)
+# for ELO, time control, urgency, increment, and move timing.
 
-# Leela-style config: 1x FFN but with post-embedding FFN layer
-CONFIG_LEELA = {
-    "d_model": 384,
-    "n_layers": 8,
-    "n_heads": 48,            # More heads with smaller d_head
-    "d_head": 8,              # Leela uses small head depths
-    "d_ff": 384,              # 1x d_model (Leela-style)
-    "dropout": 0.1,
-    "max_rel_dist": 7,
-    "history_len": 8,
-    "num_piece_types": 13,
-    "num_tc_cats": 3,
-    "embedding_ffn": True,    # Add FFN after embedding (Leela-style)
-    "smolgen": True,
-    "use_adaln": True,
-    "context_dim": 256,
-}
-
-# Smolgen config: 1.5x FFN + dynamic attention biases
-# This allows 1.5x FFN to work by making attention position-content-aware
-CONFIG_SMOLGEN = {
-    "d_model": 448,           # Wider to compensate for 1x FFN
-    "n_layers": 12,           # 10 layers (between 8 and 12)
-    "n_heads": 14,            # 448 / 32 = 14
-    "d_head": 32,
-    "d_ff": 672,              # 1.5x d_model
-    "dropout": 0.1,
-    "max_rel_dist": 7,
-    "history_len": 8,
-    "num_piece_types": 13,
-    "num_tc_cats": 3,
-    "embedding_ffn": True,    # Leela uses both embedding FFN and smolgen
-    "smolgen": True,          # Enable smolgen dynamic attention biases
-    "smolgen_hidden": 256,    # Compressed position representation size
-    "smolgen_per_head": 256,  # Per-head intermediate size
-    "use_adaln": True,
-    "context_dim": 256,
-}
-# 64,936,970 params
+# ~100M params config with token conditioning
 CONFIG_100M_BALANCED = {
-    "d_model": 640,           # Base width
-    "n_layers": 16,           # Reduced from the original 100M-ish target
-    "n_heads": 20,            # 640 / 20 = 32 dim per head
+    "d_model": 800,           # Base width
+    "n_layers": 16,           # 16 layers
+    "n_heads": 25,            # 800 / 25 = 32 dim per head
     "d_head": 32,
-    "d_ff": 960,             # 1.5x SwiGLU expansion
+    "d_ff": 1200,             # 1.5x d_model
     "dropout": 0.1,
     "max_rel_dist": 7,
-    "history_len": 8,
+    "history_len": 8,         # Still used for board history, not time
     "num_piece_types": 13,
-    "num_tc_cats": 3,
-    "embedding_ffn": True,
-    "smolgen": True,
+    "num_tc_cats": 3,         # Blitz, Rapid, Classical
+    "embedding_ffn": True,    # Keep embedding FFN
+    "smolgen": True,          # Keep smolgen
     "smolgen_hidden": 256,
     "smolgen_per_head": 256,
-    "use_adaln": False,
-    "context_dim": 256,
+    "use_adaln": False,       # Disable AdaLN
+    "use_token_conditioning": True,  # Enable token-based conditioning
+    "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
 }
 
 # Token-conditioned config: replaces AdaLN with explicit tokens
@@ -137,105 +88,9 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x, scale_shift=None):
+    def forward(self, x):
         rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        normed = x / rms * self.scale
-        
-        # Apply adaptive scale and shift if provided
-        if scale_shift is not None:
-            scale, shift = scale_shift
-            normed = normed * (1 + scale) + shift
-        
-        return normed
-
-
-class ContextEncoder(nn.Module):
-    """
-    Encode global context (ELO, time, move count) into a conditioning vector.
-    
-    Produces a vector that modulates the network's behavior via AdaLN.
-    
-    Inputs (8 scalars):
-    - player_elo: Normalized to ~[0.1, 0.9] for 1200-2500 range
-    - opponent_elo: Same normalization  
-    - my_clock: Log-scaled remaining time
-    - opp_clock: Log-scaled opponent's remaining time
-    - move_ply: Normalized move number (for opening/middlegame/endgame style)
-    - increment: Normalized time increment (style of time control)
-    - last_opp_move_time: How long opponent took on their last move
-    - halfmove_clock: 50-move rule pressure
-    """
-    def __init__(self, context_dim=256, num_layers=None):
-        super().__init__()
-        self.context_dim = context_dim
-        
-        # Input: 8 global scalars
-        # Output: context_dim style vector
-        self.mlp = nn.Sequential(
-            nn.Linear(8, 64),
-            nn.SiLU(),
-            nn.Linear(64, context_dim),
-            nn.SiLU(),
-        )
-        
-        # For AdaLN, we need to produce scale and shift for each layer's norms
-        # Each transformer block has 2 norms (pre-attention, pre-FFN)
-        # So we need 2 * d_model * 2 (scale + shift) per layer
-        # But we'll generate these per-layer in the transformer block
-        
-    def forward(self, player_elo, opp_elo, my_clock, opp_clock, move_ply,
-                increment, last_opp_move_time, halfmove_clock):
-        """
-        Args:
-            player_elo: (B,) normalized ELO ~[0.1, 0.9]
-            opp_elo: (B,) normalized ELO
-            my_clock: (B,) log-scaled clock
-            opp_clock: (B,) log-scaled clock  
-            move_ply: (B,) normalized move number
-            increment: (B,) normalized increment
-            last_opp_move_time: (B,) opponent's last move time (normalized)
-            halfmove_clock: (B,) 50-move rule counter (normalized)
-        
-        Returns:
-            context: (B, context_dim) style vector
-        """
-        # Stack inputs: (B, 8)
-        x = torch.stack([
-            player_elo, opp_elo, my_clock, opp_clock, move_ply,
-            increment, last_opp_move_time, halfmove_clock
-        ], dim=-1)
-        return self.mlp(x)
-
-
-class AdaLNModulation(nn.Module):
-    """
-    Generate scale and shift parameters for AdaLN from context vector.
-    
-    Used in each transformer block to modulate both pre-attention and pre-FFN norms.
-    """
-    def __init__(self, context_dim, d_model):
-        super().__init__()
-        # Generate 4 vectors: scale1, shift1, scale2, shift2
-        # for the two norms in a transformer block
-        self.proj = nn.Linear(context_dim, d_model * 4)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-        
-    def forward(self, context):
-        """
-        Args:
-            context: (B, context_dim)
-        Returns:
-            (scale1, shift1), (scale2, shift2) - each (B, 1, d_model) for broadcasting
-        """
-        out = self.proj(context)  # (B, d_model * 4)
-        scale1, shift1, scale2, shift2 = out.chunk(4, dim=-1)
-        
-        # Add broadcast dimension for (B, 64, d_model) tensors
-        return (
-            (scale1.unsqueeze(1), shift1.unsqueeze(1)),
-            (scale2.unsqueeze(1), shift2.unsqueeze(1))
-        )
+        return x / rms * self.scale
 
 
 # ============================================================================
@@ -688,7 +543,6 @@ class TransformerBlock(nn.Module):
     """Transformer block with Mish activation and bias=False for attention."""
     def __init__(self, config, num_rel_pos):
         super().__init__()
-        self.use_adaln = config.get('use_adaln', False)
         d_model = config['d_model']
         
         self.norm1 = RMSNorm(d_model)
@@ -702,28 +556,11 @@ class TransformerBlock(nn.Module):
         
         # SwiGLU FFN for improved convergence
         self.ff = SwiGLU(d_model, config['d_ff'], config['dropout'])
-        
-        # AdaLN modulation: generates scale/shift from context
-        if self.use_adaln:
-            context_dim = config.get('context_dim', 256)
-            self.adaln_mod = AdaLNModulation(context_dim, d_model)
 
-    def forward(self, x, rel_indices, smolgen_bias=None, context=None):
-        # Pre-LN structure with AdaLN conditioning
-        if self.use_adaln and context is not None:
-            (scale1, shift1), (scale2, shift2) = self.adaln_mod(context)
-            n1 = self.norm1(x, (scale1, shift1))
-        else:
-            n1 = self.norm1(x)
-        
-        x = x + self.attn(n1, rel_indices=rel_indices, smolgen_bias=smolgen_bias)
-        
-        if self.use_adaln and context is not None:
-            n2 = self.norm2(x, (scale2, shift2))
-        else:
-            n2 = self.norm2(x)
-        
-        x = x + self.ff(n2)
+    def forward(self, x, rel_indices, smolgen_bias=None):
+        # Pre-LN structure
+        x = x + self.attn(self.norm1(x), rel_indices=rel_indices, smolgen_bias=smolgen_bias)
+        x = x + self.ff(self.norm2(x))
         return x
 
 
@@ -863,29 +700,26 @@ class PerSquareInputEncoder(nn.Module):
 
 class Chessformer(nn.Module):
     """
-    Chessformer model with AdaLN (Adaptive Layer Normalization) for global context conditioning.
+    Chessformer model with token-based conditioning.
     
-    ELO and time modulate the network's behavior via conditional normalization.
-    
-    Alternatively, use token-based conditioning (use_token_conditioning=True) which
-    prepends 6 conditioning tokens to the 64 square tokens.
+    Uses 6 conditioning tokens prepended to 64 square tokens for:
+    - ELO (interpolated embedding)
+    - Time control category (Blitz/Rapid/Classical)
+    - Urgency (remaining time)
+    - Increment category
+    - My last move time
+    - Opponent's last move time
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
         d_model = config['d_model']
         
-        # Token-based conditioning (alternative to AdaLN)
-        self.use_token_conditioning = config.get('use_token_conditioning', False)
+        # Token-based conditioning
+        self.use_token_conditioning = config.get('use_token_conditioning', True)
         self.num_conditioning_tokens = config.get('num_conditioning_tokens', 6)
         if self.use_token_conditioning:
             self.token_conditioning = TokenConditioningEncoder(d_model)
-        
-        # AdaLN: Global context encoder (ELO, time, move number -> style vector)
-        self.use_adaln = config.get('use_adaln', False)
-        if self.use_adaln:
-            context_dim = config.get('context_dim', 256)
-            self.context_encoder = ContextEncoder(context_dim=context_dim)
         
         # Input encoder (per-square features only, globals handled by context encoder)
         self.input_encoder = PerSquareInputEncoder(config)
@@ -948,11 +782,7 @@ class Chessformer(nn.Module):
         self.value_head = PaperValueHead(d_model)
 
         # Value error head to model volatility
-        if self.use_adaln:
-            context_dim = config.get('context_dim', 256)
-            self.value_error_pool = AttentionPooling(d_model, context_dim=context_dim)
-        else:
-            self.value_error_pool = AttentionPooling(d_model, context_dim=None)
+        self.value_error_pool = AttentionPooling(d_model, context_dim=None)
         self.value_error_head = nn.Sequential(
             nn.Linear(d_model, 256),
             Mish(),
@@ -961,11 +791,7 @@ class Chessformer(nn.Module):
         
         # Time head: 256-bin classification with attention pooling
         # Time distribution is multimodal (instant moves, short thinks, long thinks)
-        if self.use_adaln:
-            context_dim = config.get('context_dim', 256)
-            self.time_pooling = AttentionPooling(d_model, context_dim=context_dim)
-        else:
-            self.time_pooling = AttentionPooling(d_model, context_dim=None)
+        self.time_pooling = AttentionPooling(d_model, context_dim=None)
         
         self.time_head = nn.Sequential(
             nn.Linear(d_model, 256, bias=False),
@@ -1010,38 +836,6 @@ class Chessformer(nn.Module):
         
         B = board_history.shape[0]
         device = board_history.device
-        
-        # Compute global context vector for AdaLN conditioning
-        # scalars layout: [active_elo, opp_elo, ply, active_clock, opp_clock, active_inc, opp_inc, halfmove]
-        context = None
-        if self.use_adaln:
-            # Extract global features from scalars
-            # Normalize ELO to ~[0.1, 0.9] range: leave room for extrapolation
-            # Current normalization: (elo - 1900) / 700, range ~[-1, 1] for 1200-2600
-            # Convert to [0.1, 0.9]: (x + 1) / 2 * 0.8 + 0.1
-            player_elo = (scalars[:, 0] + 1) / 2 * 0.8 + 0.1
-            opp_elo = (scalars[:, 1] + 1) / 2 * 0.8 + 0.1
-            move_ply = scalars[:, 2]  # Already normalized (ply / 100)
-            
-            # Clocks are already log-normalized: log1p(seconds) / 10
-            my_clock = scalars[:, 3]
-            opp_clock = scalars[:, 4]
-            
-            # Increment: scalars[:, 5] is active_inc / 30, use that directly
-            increment = scalars[:, 5]
-            
-            # Last opponent move time: time_history[:, 0] is the most recent move
-            # (opponent's last move before active player moves)
-            # Already normalized by /60 in dataset
-            last_opp_move_time = time_history[:, 0]
-            
-            # Halfmove clock for 50-move rule: scalars[:, 7], already normalized (hmc / 100)
-            halfmove_clock = scalars[:, 7]
-            
-            context = self.context_encoder(
-                player_elo, opp_elo, my_clock, opp_clock, move_ply,
-                increment, last_opp_move_time, halfmove_clock
-            )
         
         # Encode square inputs
         x = self.input_encoder(
@@ -1104,14 +898,14 @@ class Chessformer(nn.Module):
             else:
                 smolgen_bias = self.smolgen(x)
         
-        # Transformer layers with AdaLN conditioning
+        # Transformer layers
         if self.use_token_conditioning:
             rel_indices = self.extended_rel_indices
         else:
             rel_indices = self.rel_pos_gen()
         
         for layer in self.layers:
-            x = layer(x, rel_indices=rel_indices, smolgen_bias=smolgen_bias, context=context)
+            x = layer(x, rel_indices=rel_indices, smolgen_bias=smolgen_bias)
         x = self.norm_f(x)  # (B, 64, d_model) or (B, 70, d_model)
         
         # Extract square tokens for output heads when using token conditioning
@@ -1162,11 +956,11 @@ class Chessformer(nn.Module):
         value_out, value_cls_out = self.value_head(x_squares)  # (B, 1), (B, 3)
 
         # Value error models volatility
-        value_error_feat = self.value_error_pool(x_squares, context)
+        value_error_feat = self.value_error_pool(x_squares)
         value_error_out = self.value_error_head(value_error_feat)
         
         # Time uses attention pooling
-        time_pooled = self.time_pooling(x_squares, context)    # (B, d_model)
+        time_pooled = self.time_pooling(x_squares)    # (B, d_model)
         time_cls_out = self.time_head(time_pooled)     # (B, 256) time bin logits
         
         if return_promo:
@@ -1180,8 +974,9 @@ def count_parameters(model):
 
 if __name__ == "__main__":
     # Test the model
-    model = Chessformer(CONFIG_SMOLGEN)
-    print(f"Total Trainable Parameters: {count_parameters(model):,}")
+    print("--- Testing Token-Conditioned Config (~26.6M params) ---")
+    model = Chessformer(CONFIG_TOKEN_CONDITIONED)
+    print(f"Token-Conditioned Config Trainable Parameters: {count_parameters(model):,}")
     
     # Create dummy batch
     B = 2
@@ -1205,19 +1000,12 @@ if __name__ == "__main__":
     print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
     
     # Test 100M config
-    print("\n--- Testing 100M Config ---")
+    print("\n--- Testing 100M Config (~100M params) ---")
     model_100m = Chessformer(CONFIG_100M_BALANCED)
     print(f"100M Config Trainable Parameters: {count_parameters(model_100m):,}")
-    model_smolgen = Chessformer(CONFIG_SMOLGEN)
-    print(f"Smolgen Config Trainable Parameters: {count_parameters(model_smolgen):,}")
     
-    # Test Token-Conditioned config
-    print("\n--- Testing Token-Conditioned Config ---")
-    model_token = Chessformer(CONFIG_TOKEN_CONDITIONED)
-    print(f"Token-Conditioned Config Trainable Parameters: {count_parameters(model_token):,}")
-    
-    # Run forward pass with token conditioning
-    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_token(dummy_batch)
+    # Run forward pass with 100M config
+    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_100m(dummy_batch)
     print(f"Move logits: {move_logits.shape}")           # (2, 4098)
     print(f"Value (reg): {value_out.shape}")             # (2, 1)
     print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL
