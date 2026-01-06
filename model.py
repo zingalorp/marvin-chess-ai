@@ -39,11 +39,11 @@ class Mish(nn.Module):
 
 # ~100M params config with token conditioning
 CONFIG_100M_BALANCED = {
-    "d_model": 800,           # Base width
-    "n_layers": 16,           # 16 layers
-    "n_heads": 25,            # 800 / 25 = 32 dim per head
+    "d_model": 768,           # Base width
+    "n_layers": 14,           # 14 layers
+    "n_heads": 24,            # 800 / 25 = 32 dim per head
     "d_head": 32,
-    "d_ff": 1200,             # 1.5x d_model
+    "d_ff": 2048,             # 1.5x d_model
     "dropout": 0.1,
     "max_rel_dist": 7,
     "history_len": 8,         # Still used for board history, not time

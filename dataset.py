@@ -180,11 +180,111 @@ def _sample_to_tensors(sample: Sample) -> Dict[str, torch.Tensor]:
     }
 
 
+def _sample_to_tensors_fast(
+    board_history: np.ndarray,
+    legal_moves: List[Tuple[int, int, int]],
+    time_history: np.ndarray,
+    rep_flags: np.ndarray,
+    castling: np.ndarray,
+    ep_square: int,
+    active_elo: int,
+    opp_elo: int,
+    move_ply: int,
+    halfmove_clock: int,
+    tc_cat: int,
+    active_clock: float,
+    opp_clock: float,
+    active_inc: int,
+    opp_inc: int,
+    policy_move: Tuple[int, int, int],
+    policy_is_resign: bool,
+    policy_is_flag: bool,
+    y_val: float,
+    time_target: float,
+    noise: float,
+) -> Dict[str, torch.Tensor]:
+    """Optimized tensor conversion - takes direct arguments to avoid Sample object creation."""
+    
+    # Time history: reverse and normalize (most-recent first)
+    time_hist_reversed = time_history[::-1].copy() / 60.0
+    
+    # EP mask
+    ep_mask = np.zeros(64, dtype=np.float32)
+    if 0 <= ep_square < 64:
+        ep_mask[ep_square] = 1.0
+    
+    # Scalars - pre-compute normalization
+    scalars = np.array([
+        (active_elo - 1900) / 700.0,
+        (opp_elo - 1900) / 700.0,
+        move_ply / 100.0,
+        np.log1p(active_clock) / 10.0,
+        np.log1p(opp_clock) / 10.0,
+        active_inc / 30.0,
+        opp_inc / 30.0,
+        halfmove_clock / 100.0,
+    ], dtype=np.float32)
+    
+    # Legal move mask - use numpy for speed
+    legal_mask = np.zeros(NUM_POLICY_OUTPUTS, dtype=np.bool_)
+    for from_sq, to_sq, promo in legal_moves:
+        if 0 <= from_sq < 64 and 0 <= to_sq < 64:
+            legal_mask[from_sq * 64 + to_sq] = True
+    legal_mask[RESIGN_MOVE_INDEX] = True
+    legal_mask[FLAG_MOVE_INDEX] = True
+    
+    # Policy target
+    promo_target = 0
+    promo_file = 0
+    
+    if policy_is_resign:
+        policy_target_idx = RESIGN_MOVE_INDEX
+    elif policy_is_flag:
+        policy_target_idx = FLAG_MOVE_INDEX
+    else:
+        from_sq, to_sq, promo = policy_move
+        policy_target_idx = from_sq * 64 + to_sq
+        promo_target = promo
+        if 56 <= to_sq <= 63:
+            promo_file = to_sq - 56
+    
+    # Value classification target
+    y_val_cls = int(y_val * 2)
+    
+    # Time target with dequantization noise
+    clock_before = max(1.0, active_clock)
+    noisy_time = max(0.0, time_target + noise)
+    time_ratio = noisy_time / clock_before
+    time_target_scaled = time_ratio ** 0.5
+    time_bin = int(min(max(time_target_scaled, 0.0), 0.9999) * 256)
+    
+    # Convert to tensors
+    return {
+        "board_history": torch.from_numpy(board_history),
+        "time_history": torch.from_numpy(time_hist_reversed),
+        "rep_flags": torch.from_numpy(rep_flags.astype(np.float32)),
+        "castling": torch.from_numpy(castling.astype(np.float32)),
+        "ep_mask": torch.from_numpy(ep_mask),
+        "scalars": torch.from_numpy(scalars),
+        "tc_cat": torch.tensor(tc_cat, dtype=torch.long),
+        "legal_mask": torch.from_numpy(legal_mask),
+        "policy_target": torch.tensor(policy_target_idx, dtype=torch.long),
+        "y_val": torch.tensor(y_val, dtype=torch.float32),
+        "y_val_cls": torch.tensor(y_val_cls, dtype=torch.long),
+        "time_target_cls": torch.tensor(time_bin, dtype=torch.long),
+        "promo_target": torch.tensor(promo_target, dtype=torch.long),
+        "promo_file": torch.tensor(promo_file, dtype=torch.long),
+    }
+
+
 def _collate(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """Collate a batch of samples."""
+    """Collate a batch of samples - optimized with pre-allocated stacking."""
+    if not samples:
+        return {}
+    keys = samples[0].keys()
     return {
         key: torch.stack([s[key] for s in samples])
-        for key in samples[0].keys()
+        for key in keys
     }
 
 
@@ -255,14 +355,98 @@ class StreamingDataset(IterableDataset):
                 shuffle_indices = rng.permutation(batch_len)
                 batch = batch.take(shuffle_indices)
 
-            # Extract columns
+            # Vectorized batch processing - much faster than row-by-row
             try:
-                for i in range(batch_len):
-                    sample = self._extract_sample(batch, i)
-                    if sample is not None:
-                        yield _sample_to_tensors(sample)
+                yield from self._process_batch_vectorized(batch, rng)
             except Exception as e:
                 print(f"[dataset] Error processing batch in {file_path}: {e}")
+                continue
+
+    def _process_batch_vectorized(self, batch, rng):
+        """Process entire batch using vectorized operations instead of row-by-row."""
+        batch_len = batch.num_rows
+        
+        # Extract all columns at once using to_pylist() - faster than individual .as_py()
+        board_history_list = batch["board_history"].to_pylist()
+        legal_moves_list = batch["legal_moves"].to_pylist()
+        time_history_list = batch["time_history"].to_pylist()
+        rep_flags_list = batch["repetition_flags"].to_pylist()
+        castling_list = batch["castling_rights"].to_pylist()
+        
+        # Scalar columns - convert to numpy arrays for fast access
+        ep_square_arr = batch["ep_square"].to_numpy()
+        active_elo_arr = batch["active_elo"].to_numpy()
+        opp_elo_arr = batch["opp_elo"].to_numpy()
+        move_ply_arr = batch["move_ply"].to_numpy()
+        halfmove_clock_arr = batch["halfmove_clock"].to_numpy()
+        tc_cat_arr = batch["tc_cat"].to_numpy()
+        active_clock_arr = batch["active_clock"].to_numpy()
+        opp_clock_arr = batch["opp_clock"].to_numpy()
+        active_inc_arr = batch["active_inc"].to_numpy()
+        opp_inc_arr = batch["opp_inc"].to_numpy()
+        
+        # Target columns
+        policy_move_list = batch["policy_move"].to_pylist()
+        # Boolean columns require zero_copy_only=False
+        policy_is_resign_arr = batch["policy_is_resign"].to_numpy(zero_copy_only=False)
+        policy_is_flag_arr = batch["policy_is_flag"].to_numpy(zero_copy_only=False)
+        y_val_arr = batch["y_val"].to_numpy()
+        time_target_arr = batch["time_target"].to_numpy()
+        
+        # Pre-generate noise for dequantization
+        noise_arr = rng.random(batch_len) - 0.5
+        
+        for i in range(batch_len):
+            try:
+                # Board history
+                bh = board_history_list[i]
+                board_history = np.array([np.array(b) for b in bh], dtype=np.int64)
+                if board_history.shape != (8, 64):
+                    continue
+                
+                # Legal moves
+                legal_moves = [(int(m[0]), int(m[1]), int(m[2])) for m in legal_moves_list[i]]
+                
+                # Time history
+                th = time_history_list[i]
+                time_history = np.array(th, dtype=np.float32) if len(th) == 8 else np.zeros(8, dtype=np.float32)
+                
+                # Rep flags
+                rf = rep_flags_list[i]
+                rep_flags = np.array(rf, dtype=np.int64) if len(rf) == 8 else np.zeros(8, dtype=np.int64)
+                
+                # Castling
+                cr = castling_list[i]
+                castling = np.array(cr, dtype=np.int64) if len(cr) == 4 else np.zeros(4, dtype=np.int64)
+                
+                # Policy move
+                pm = policy_move_list[i]
+                policy_move = (int(pm[0]), int(pm[1]), int(pm[2]))
+                
+                yield _sample_to_tensors_fast(
+                    board_history=board_history,
+                    legal_moves=legal_moves,
+                    time_history=time_history,
+                    rep_flags=rep_flags,
+                    castling=castling,
+                    ep_square=int(ep_square_arr[i]),
+                    active_elo=int(active_elo_arr[i]),
+                    opp_elo=int(opp_elo_arr[i]),
+                    move_ply=int(move_ply_arr[i]),
+                    halfmove_clock=int(halfmove_clock_arr[i]),
+                    tc_cat=int(tc_cat_arr[i]),
+                    active_clock=float(active_clock_arr[i]),
+                    opp_clock=float(opp_clock_arr[i]),
+                    active_inc=int(active_inc_arr[i]),
+                    opp_inc=int(opp_inc_arr[i]),
+                    policy_move=policy_move,
+                    policy_is_resign=bool(policy_is_resign_arr[i]),
+                    policy_is_flag=bool(policy_is_flag_arr[i]),
+                    y_val=float(y_val_arr[i]),
+                    time_target=float(time_target_arr[i]),
+                    noise=noise_arr[i],
+                )
+            except Exception:
                 continue
 
     def _extract_sample(self, batch, idx: int) -> Optional[Sample]:
@@ -431,6 +615,8 @@ def create_dataloader(
     pin_memory: bool = True,
     prefetch_factor: int = None,
     val_fraction: float = 0.05,
+    persistent_workers: bool = True,
+    drop_last: bool = True,
 ) -> DataLoader:
     """Create a single dataloader for a split.
     
@@ -440,6 +626,8 @@ def create_dataloader(
         data_dir: Root directory containing train/ subdirectory
         split: 'train' or 'val' - determines which split to load
         val_fraction: Fraction of files to use for validation (default 5%)
+        persistent_workers: Keep workers alive between epochs (faster)
+        drop_last: Drop last incomplete batch (better for training)
         Other args: standard DataLoader configuration
     """
     
@@ -472,6 +660,9 @@ def create_dataloader(
         seed=seed,
     )
     
+    # Use persistent_workers to avoid worker restart overhead between epochs
+    use_persistent = persistent_workers and num_workers > 0
+    
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -479,6 +670,8 @@ def create_dataloader(
         collate_fn=_collate,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=use_persistent,
+        drop_last=drop_last if is_train else False,
     )
 
 
