@@ -80,6 +80,25 @@ CONFIG_TOKEN_CONDITIONED = {
     "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
 }
 
+CONFIG_TOKEN_NEW= {
+    "d_model": 448,           # Same as SMOLGEN
+    "n_layers": 12,           # Same as SMOLGEN
+    "n_heads": 14,            # 448 / 32 = 14
+    "d_head": 32,
+    "d_ff": 448,              # 1.0x d_model
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,         # Still used for board history, not time
+    "num_piece_types": 13,
+    "num_tc_cats": 3,         # Blitz, Rapid, Classical
+    "embedding_ffn": True,    # Keep embedding FFN
+    "smolgen": True,          # Keep smolgen
+    "smolgen_hidden": 256,
+    "smolgen_per_head": 256,
+    "use_adaln": False,       # Disable AdaLN
+    "use_token_conditioning": True,  # Enable token-based conditioning
+    "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
+}
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -1038,6 +1057,19 @@ if __name__ == "__main__":
     
     # Run forward pass with 100M config
     move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_100m(dummy_batch)
+    print(f"Move logits: {move_logits.shape}")           # (2, 4098)
+    print(f"Value (reg): {value_out.shape}")             # (2, 1)
+    print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL
+    print(f"Value error: {value_error_out.shape}")       # (2, 1)
+    print(f"Time (cls): {time_cls_out.shape}")           # (2, 256) bins
+    print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
+
+    print("\n Testing token-new config")
+    model_token_new = Chessformer(CONFIG_TOKEN_NEW)
+    print(f"Token-new Config Trainable Parameters: {count_parameters(model_token_new):,}")
+
+    # Run forward pass with 100M config
+    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_token_new(dummy_batch)
     print(f"Move logits: {move_logits.shape}")           # (2, 4098)
     print(f"Value (reg): {value_out.shape}")             # (2, 1)
     print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL

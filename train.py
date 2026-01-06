@@ -26,16 +26,17 @@ from model import (
     Chessformer,
     CONFIG_100M_BALANCED,
     CONFIG_TOKEN_CONDITIONED,
+    CONFIG_TOKEN_NEW,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
-    parser.add_argument("--config", choices=["100m", "token"], default="token")
-    parser.add_argument("--batch-size", type=int, default=512)  # 512 for small config
+    parser.add_argument("--config", choices=["100m", "token", "token-new"], default="token")
+    parser.add_argument("--batch-size", type=int, default=640)  # 512 for small config
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1.25e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -66,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     # Loss weights
     parser.add_argument("--policy-weight", type=float, default=1.0)
     parser.add_argument("--value-weight", type=float, default=0.5)
-    parser.add_argument("--value-cls-weight", type=float, default=0.5)
+    parser.add_argument("--value-cls-weight", type=float, default=0.3)
     parser.add_argument("--value-error-weight", type=float, default=0.1)
     parser.add_argument("--time-weight", type=float, default=0.5)
     parser.add_argument("--start-square-weight", type=float, default=0.1)
@@ -318,7 +319,7 @@ def evaluate(model, loader, device, non_blocking, max_batches=0, args=None) -> D
     elo_top5_correct = torch.zeros(num_bins, device=device)
     elo_counts = torch.zeros(num_bins, device=device)
 
-    with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+    with torch.no_grad(), autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
         for batch_idx, batch in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
@@ -405,7 +406,7 @@ def train_one_epoch(
     for step, batch in enumerate(loader, start=1):
         batch = move_batch_to_device(batch, device, non_blocking)
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
             outputs = model(batch, return_promo=True)
             raw_loss, loss_terms = compute_losses(
                 outputs, batch,
@@ -574,19 +575,21 @@ def main() -> None:
 
     if args.config == "100m":
         config = copy.deepcopy(CONFIG_100M_BALANCED)
+    elif args.config == "token-new":
+        config = copy.deepcopy(CONFIG_TOKEN_NEW)
     else:  # token (default)
         config = copy.deepcopy(CONFIG_TOKEN_CONDITIONED)
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
 
-    model = Chessformer(config).to(device=device, dtype=torch.bfloat16)
+    model = Chessformer(config).to(device=device)
     if args.compile_model:
         try:
             model = torch.compile(model, mode=args.compile_mode)
             print(f"[train] torch.compile enabled with mode={args.compile_mode}")
         except Exception as exc:
             print(f"[train] torch.compile failed ({exc}); continuing without.")
-    print(f"Using {args.config} config ({count_parameters(model):,} params, bf16)")
+    print(f"Using {args.config} config ({count_parameters(model):,} params, fp16 mixed precision)")
 
     # Create dataloaders
     pin_memory = device.type == "cuda"
@@ -641,8 +644,8 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     print(f"[scheduler] Linear warmup ({warmup_steps} steps) + cosine decay")
     
-    # bf16 doesn't need gradient scaling, disable it
-    scaler = GradScaler(enabled=False)
+    # Mixed precision: use GradScaler for fp16 training
+    scaler = GradScaler(enabled=device.type == "cuda")
 
     # Resume state
     start_epoch = 1
