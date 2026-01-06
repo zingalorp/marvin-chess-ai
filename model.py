@@ -433,16 +433,48 @@ class Smolgen(nn.Module):
             RMSNorm(hidden_size),
         )
         
-        # Step 2: Generate per-head attention biases
-        # Each head gets its own projection from hidden to per_head_size
-        self.head_projections = nn.ModuleList([
-            nn.Linear(hidden_size, per_head_size, bias=False)
-            for _ in range(n_heads)
-        ])
+        # Step 2: Generate per-head attention biases using a single batched projection
+        # Project from hidden_size to (n_heads * per_head_size) in one operation
+        # This replaces the old ModuleList approach for better torch.compile compatibility
+        self.head_proj = nn.Linear(hidden_size, n_heads * per_head_size, bias=False)
         
         # Shared projection from per_head_size to 64x64 attention logits
         # This is shared across all heads (as per Leela's description)
         self.attn_logit_proj = nn.Linear(per_head_size, 64 * 64, bias=False)
+        
+        # Flag to track if we've converted from legacy format
+        self._converted_from_legacy = False
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Handle loading from old checkpoint format with head_projections ModuleList."""
+        # Check if this is an old-format checkpoint (has head_projections.0.weight but no head_proj.weight)
+        legacy_key_0 = f"{prefix}head_projections.0.weight"
+        new_key = f"{prefix}head_proj.weight"
+        
+        if legacy_key_0 in state_dict and new_key not in state_dict:
+            # Convert from legacy ModuleList format to new batched format
+            # Old format: head_projections.{i}.weight with shape (per_head_size, hidden_size)
+            # New format: head_proj.weight with shape (n_heads * per_head_size, hidden_size)
+            legacy_weights = []
+            for i in range(self.n_heads):
+                key = f"{prefix}head_projections.{i}.weight"
+                if key in state_dict:
+                    legacy_weights.append(state_dict.pop(key))
+                    # Add to unexpected_keys removal
+                else:
+                    # Missing head projection - this shouldn't happen in valid checkpoints
+                    error_msgs.append(f"Missing legacy weight: {key}")
+                    break
+            
+            if len(legacy_weights) == self.n_heads:
+                # Stack all head weights: (n_heads, per_head_size, hidden_size)
+                # Then reshape to (n_heads * per_head_size, hidden_size)
+                stacked = torch.cat(legacy_weights, dim=0)  # (n_heads * per_head_size, hidden_size)
+                state_dict[new_key] = stacked
+                self._converted_from_legacy = True
+        
+        # Call parent implementation
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
         
     def forward(self, x):
         """
@@ -459,16 +491,18 @@ class Smolgen(nn.Module):
         # Flatten and compress to global: (B, 64*32) -> (B, hidden_size)
         global_repr = self.global_compress(compressed.flatten(1))
         
-        # Generate per-head attention biases
-        attn_biases = []
-        for head_proj in self.head_projections:
-            # (B, hidden_size) -> (B, per_head_size) -> (B, 64*64)
-            head_repr = head_proj(global_repr)
-            head_logits = self.attn_logit_proj(head_repr)
-            attn_biases.append(head_logits.view(B, 64, 64))
+        # Generate all head representations in one go: (B, hidden_size) -> (B, n_heads * per_head_size)
+        all_head_repr = self.head_proj(global_repr)
         
-        # Stack: (B, n_heads, 64, 64)
-        return torch.stack(attn_biases, dim=1)
+        # Reshape to (B, n_heads, per_head_size)
+        all_head_repr = all_head_repr.view(B, self.n_heads, self.per_head_size)
+        
+        # Apply shared projection to all heads: (B, n_heads, per_head_size) -> (B, n_heads, 64*64)
+        # Using einsum for batched linear: weight is (per_head_size, 64*64)
+        head_logits = torch.matmul(all_head_repr, self.attn_logit_proj.weight.T)
+        
+        # Reshape to (B, n_heads, 64, 64)
+        return head_logits.view(B, self.n_heads, 64, 64)
 
 
 class ShawAttention(nn.Module):
@@ -522,15 +556,13 @@ class ShawAttention(nn.Module):
         # Add smolgen dynamic attention bias if provided
         if smolgen_bias is not None:
             attn_scores = attn_scores + smolgen_bias
-            # Stash for inference-time visualization (detach to avoid holding graphs during training).
-            self.last_smolgen_bias = smolgen_bias.detach()
-        else:
-            self.last_smolgen_bias = None
         
         attn_probs = self.dropout(F.softmax(attn_scores, dim=-1))
 
-        # Stash for inference-time visualization. Keep on-device; caller can detach/cpu as needed.
-        self.last_attn_probs = attn_probs
+        # Stash for inference-time visualization only (not during training to avoid graph breaks)
+        if not self.training:
+            self.last_smolgen_bias = smolgen_bias.detach() if smolgen_bias is not None else None
+            self.last_attn_probs = attn_probs.detach()
         
         content_out = torch.matmul(attn_probs, v)
         rel_out = torch.einsum('bhij,ijd->bhid', attn_probs, r_v)

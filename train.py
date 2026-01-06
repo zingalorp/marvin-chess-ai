@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
     parser.add_argument("--config", choices=["100m", "token"], default="token")
-    parser.add_argument("--batch-size", type=int, default=196)  # 512 for small config
+    parser.add_argument("--batch-size", type=int, default=512)  # 512 for small config
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -48,6 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=4)  # Lower but more workers
     parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument("--compile-mode", type=str, default="max-autotune", 
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode (default: max-autotune)")
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Number of warmup steps for LR scheduler")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-wait", type=int, default=2)
@@ -157,20 +160,22 @@ def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_wei
     policy_loss = F.cross_entropy(move_logits, policy_target)
     
     # Promotion loss: cross-entropy on 4 classes (Q, R, B, N)
-    # Only calculated for moves that are actually promotions.
-    if promo_logits is not None:
-        if 'promo_target' in batch and 'promo_file' in batch:
-            promo_target = batch['promo_target']  # [B] 0=None, 1=Q, 2=R, 3=B, 4=N
-            promo_mask = promo_target > 0
-            if promo_mask.any():
-                promo_file = batch['promo_file'][promo_mask]  # [N_promo] 0-7
-                promo_type = promo_target[promo_mask] - 1      # [N_promo] 0=Q,1=R,2=B,3=N
-                selected_logits = promo_logits[promo_mask, promo_file, :]  # [N_promo, 4]
-                promo_loss = F.cross_entropy(selected_logits, promo_type)
-            else:
-                promo_loss = torch.tensor(0.0, device=move_logits.device)
-        else:
-            promo_loss = torch.tensor(0.0, device=move_logits.device)
+    # Compute for all samples to avoid data-dependent branching that breaks torch.compile
+    if promo_logits is not None and 'promo_target' in batch and 'promo_file' in batch:
+        promo_target = batch['promo_target']  # [B] 0=None, 1=Q, 2=R, 3=B, 4=N
+        promo_file = batch['promo_file']      # [B] 0-7
+        promo_type = (promo_target - 1).clamp(min=0)  # [B] 0=Q,1=R,2=B,3=N (clamp to handle promo_target=0)
+        
+        # Select logits for each sample's promo_file: (B, 8, 4) -> (B, 4)
+        batch_indices = torch.arange(promo_logits.shape[0], device=promo_logits.device)
+        selected_logits = promo_logits[batch_indices, promo_file, :]  # [B, 4]
+        
+        # Compute per-sample loss
+        per_sample_loss = F.cross_entropy(selected_logits, promo_type, reduction='none')  # [B]
+        
+        # Mask: only count samples with actual promotions (promo_target > 0)
+        promo_mask = (promo_target > 0).float()
+        promo_loss = (per_sample_loss * promo_mask).sum() / (promo_mask.sum() + 1e-8)
     else:
         promo_loss = torch.tensor(0.0, device=move_logits.device)
 
@@ -191,16 +196,12 @@ def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_wei
     
     # Start square loss: cross-entropy on 64 squares
     # Target is the source square of the move (policy_target // 64 for regular moves)
-    # For resign/flag (indices 4096, 4097), we skip this loss
-    regular_move_mask = policy_target < 4096
-    if regular_move_mask.any():
-        start_square_target = policy_target[regular_move_mask] // 64
-        start_square_loss = F.cross_entropy(
-            start_square_logits[regular_move_mask], 
-            start_square_target
-        )
-    else:
-        start_square_loss = torch.tensor(0.0, device=move_logits.device)
+    # For resign/flag (indices 4096, 4097), we mask them out without data-dependent branching
+    regular_move_mask = (policy_target < 4096).float()
+    # Clamp target to valid range for all samples (resign/flag would give invalid indices)
+    start_square_target = (policy_target.clamp(max=4095) // 64).long()
+    per_sample_start_loss = F.cross_entropy(start_square_logits, start_square_target, reduction='none')
+    start_square_loss = (per_sample_start_loss * regular_move_mask).sum() / (regular_move_mask.sum() + 1e-8)
     
     total = (policy_weight * policy_loss + 
              value_weight * value_loss + 
@@ -258,39 +259,32 @@ def compute_metrics(outputs, batch) -> Dict[str, torch.Tensor]:
     time_pred_bin = time_cls_out.argmax(dim=1)
     time_close = (torch.abs(time_pred_bin - batch['time_target_cls']) <= 10).float().mean()
     
-    # Start square accuracy (for regular moves only)
-    regular_move_mask = policy_target < 4096
-    if regular_move_mask.any():
-        start_square_target = policy_target[regular_move_mask] // 64
-        start_square_acc = (start_square_logits[regular_move_mask].argmax(dim=1) == start_square_target).float().mean()
-    else:
-        start_square_acc = torch.tensor(0.0, device=move_logits.device)
+    # Start square accuracy (for regular moves only) - no data-dependent branching
+    regular_move_mask = (policy_target < 4096).float()
+    start_square_target = (policy_target.clamp(max=4095) // 64).long()
+    start_square_correct = (start_square_logits.argmax(dim=1) == start_square_target).float()
+    start_square_acc = (start_square_correct * regular_move_mask).sum() / (regular_move_mask.sum() + 1e-8)
     
-    # Promotion accuracy
+    # Promotion accuracy - no data-dependent branching
     promo_acc = torch.tensor(0.0, device=move_logits.device)
     promo_count = torch.tensor(0.0, device=move_logits.device)
     
-    if 'promo_target' in batch:
+    if 'promo_target' in batch and len(outputs) == 7:
+        promo_logits = outputs[6]
         promo_target = batch['promo_target']
-        promo_mask = promo_target > 0
-        promo_count = promo_mask.sum().float()
+        promo_file = batch['promo_file']
+        promo_type = (promo_target - 1).clamp(min=0)  # Handle promo_target=0
         
-        if promo_mask.any():
-            # Need to extract logits same way as in compute_losses
-            # But we don't have promo_logits here!
-            # compute_metrics signature is (outputs, batch)
-            # outputs might have promo_logits if len is 7
-            if len(outputs) == 7:
-                promo_logits = outputs[6]
-                promo_file = batch['promo_file'][promo_mask]
-                promo_type = batch['promo_target'][promo_mask] - 1
-                
-                # Select logits: (N_promo, 8, 4) -> (N_promo, 4)
-                masked_logits = promo_logits[promo_mask]
-                selected_logits = masked_logits[torch.arange(masked_logits.shape[0], device=masked_logits.device), promo_file]
-                
-                promo_preds = selected_logits.argmax(dim=1)
-                promo_acc = (promo_preds == promo_type).float().mean()
+        promo_mask = (promo_target > 0).float()
+        promo_count = promo_mask.sum()
+        
+        # Select logits for each sample's promo_file: (B, 8, 4) -> (B, 4)
+        batch_indices = torch.arange(promo_logits.shape[0], device=promo_logits.device)
+        selected_logits = promo_logits[batch_indices, promo_file, :]
+        
+        promo_preds = selected_logits.argmax(dim=1)
+        promo_correct = (promo_preds == promo_type).float()
+        promo_acc = (promo_correct * promo_mask).sum() / (promo_mask.sum() + 1e-8)
 
     return {
         'policy_top1': top1.detach(),
@@ -588,7 +582,8 @@ def main() -> None:
     model = Chessformer(config).to(device=device, dtype=torch.bfloat16)
     if args.compile_model:
         try:
-            model = torch.compile(model, mode="max-autotune")
+            model = torch.compile(model, mode=args.compile_mode)
+            print(f"[train] torch.compile enabled with mode={args.compile_mode}")
         except Exception as exc:
             print(f"[train] torch.compile failed ({exc}); continuing without.")
     print(f"Using {args.config} config ({count_parameters(model):,} params, bf16)")
