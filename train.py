@@ -585,7 +585,7 @@ def main() -> None:
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
 
-    model = Chessformer(config).to(device=device)
+    model = Chessformer(config).to(device=device, dtype=torch.bfloat16)
     if args.compile_model:
         try:
             model = torch.compile(model, mode="max-autotune")
