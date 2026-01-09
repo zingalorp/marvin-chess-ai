@@ -24,16 +24,15 @@ from dataset import create_dataloader, count_samples
 # Import model
 from model import (
     Chessformer,
-    CONFIG_100M_BALANCED,
-    CONFIG_TOKEN_CONDITIONED,
-    CONFIG_TOKEN_NEW,
+    CONFIG_LARGE,
+    CONFIG_SMALL,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
-    parser.add_argument("--config", choices=["100m", "token", "token-new"], default="token")
+    parser.add_argument("--config", choices=["large", "small"], default="small")
     parser.add_argument("--batch-size", type=int, default=640)  # 512 for small config
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1.25e-4)
@@ -573,12 +572,10 @@ def main() -> None:
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
 
-    if args.config == "100m":
-        config = copy.deepcopy(CONFIG_100M_BALANCED)
-    elif args.config == "token-new":
-        config = copy.deepcopy(CONFIG_TOKEN_NEW)
-    else:  # token (default)
-        config = copy.deepcopy(CONFIG_TOKEN_CONDITIONED)
+    if args.config == "large":
+        config = copy.deepcopy(CONFIG_LARGE)
+    else:  # small (default)
+        config = copy.deepcopy(CONFIG_SMALL)
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
 

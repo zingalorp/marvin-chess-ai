@@ -37,52 +37,32 @@ class Mish(nn.Module):
 # Both configs use token-based conditioning (6 tokens prepended to 64 square tokens)
 # for ELO, time control, urgency, increment, and move timing.
 
-# ~100M params config with token conditioning
-CONFIG_100M_BALANCED = {
-    "d_model": 768,           # Base width
-    "n_layers": 14,           # 14 layers
-    "n_heads": 24,            # 800 / 25 = 32 dim per head
-    "d_head": 32,
-    "d_ff": 2048,             # 1.5x d_model
+# ~100M trainable parameters
+CONFIG_LARGE = {
+    "d_model": 640,           # Reduced from 768 to afford more layers
+    "n_layers": 20,           # Increased from 14
+    "n_heads": 10,            # 640 / 64 = 10 heads (Standard 64 dim per head)
+    "d_head": 64,             # Sharper attention than 32
+    "d_ff": 1728,             # 2.7x expansion (SwiGLU standard)
     "dropout": 0.1,
     "max_rel_dist": 7,
-    "history_len": 8,         # Still used for board history, not time
+    "history_len": 8,
     "num_piece_types": 13,
-    "num_tc_cats": 3,         # Blitz, Rapid, Classical
-    "embedding_ffn": True,    # Keep embedding FFN
-    "smolgen": True,          # Keep smolgen
-    "smolgen_hidden": 256,
-    "smolgen_per_head": 256,
-    "use_adaln": False,       # Disable AdaLN
-    "use_token_conditioning": True,  # Enable token-based conditioning
-    "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
+    "num_tc_cats": 3,
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 256,    # Match d_model
+    "smolgen_per_head": 256,  
+    "use_token_conditioning": True,
+    "num_conditioning_tokens": 6,
 }
 
-# Token-conditioned config: replaces AdaLN with explicit tokens
+# Small token-conditioned config (~23M params)
 # Uses 6 conditioning tokens prepended to 64 square tokens = 70 total tokens
-CONFIG_TOKEN_CONDITIONED = {
-    "d_model": 448,           # Same as SMOLGEN
-    "n_layers": 12,           # Same as SMOLGEN
-    "n_heads": 14,            # 448 / 32 = 14
-    "d_head": 32,
-    "d_ff": 672,              # 1.5x d_model
-    "dropout": 0.1,
-    "max_rel_dist": 7,
-    "history_len": 8,         # Still used for board history, not time
-    "num_piece_types": 13,
-    "num_tc_cats": 3,         # Blitz, Rapid, Classical
-    "embedding_ffn": True,    # Keep embedding FFN
-    "smolgen": True,          # Keep smolgen
-    "smolgen_hidden": 256,
-    "smolgen_per_head": 256,
-    "use_adaln": False,       # Disable AdaLN
-    "use_token_conditioning": True,  # Enable token-based conditioning
-    "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
-}
-
-CONFIG_TOKEN_NEW= {
-    "d_model": 448,           # Same as SMOLGEN
-    "n_layers": 12,           # Same as SMOLGEN
+# Trained weights: inference/marvin_token_bf16.pt, checkpoints/chessformer_token-new_best.pt
+CONFIG_SMALL = {
+    "d_model": 448,           # Base width
+    "n_layers": 12,           # 12 transformer layers
     "n_heads": 14,            # 448 / 32 = 14
     "d_head": 32,
     "d_ff": 448,              # 1.0x d_model
@@ -95,7 +75,6 @@ CONFIG_TOKEN_NEW= {
     "smolgen": True,          # Keep smolgen
     "smolgen_hidden": 256,
     "smolgen_per_head": 256,
-    "use_adaln": False,       # Disable AdaLN
     "use_token_conditioning": True,  # Enable token-based conditioning
     "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
 }
@@ -113,7 +92,7 @@ class RMSNorm(nn.Module):
 
 
 # ============================================================================
-# Token-Based Conditioning (Alternative to AdaLN)
+# Token-Based Conditioning
 # ============================================================================
 
 # Bins for log-scaled time: 16 bins covering 0-1800s (30 min)
@@ -168,8 +147,8 @@ class TokenConditioningEncoder(nn.Module):
     5. [MY_LAST_TIME] - Log-binned time spent on my last move
     6. [OPP_LAST_TIME] - Log-binned time spent on opponent's last move
     
-    Unlike AdaLN which modulates normalization, this approach lets the model
-    attend to conditioning information directly through self-attention.
+    This approach lets the model attend to conditioning information directly 
+    through self-attention.
     """
     def __init__(self, d_model: int):
         super().__init__()
@@ -1025,9 +1004,9 @@ def count_parameters(model):
 
 if __name__ == "__main__":
     # Test the model
-    print("--- Testing Token-Conditioned Config (~26.6M params) ---")
-    model = Chessformer(CONFIG_TOKEN_CONDITIONED)
-    print(f"Token-Conditioned Config Trainable Parameters: {count_parameters(model):,}")
+    print("--- Testing Small Config (~23M params) ---")
+    model = Chessformer(CONFIG_SMALL)
+    print(f"Small Config Trainable Parameters: {count_parameters(model):,}")
     
     # Create dummy batch
     B = 2
@@ -1050,26 +1029,13 @@ if __name__ == "__main__":
     print(f"Time (cls): {time_cls_out.shape}")           # (2, 256) bins
     print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
     
-    # Test 100M config
-    print("\n--- Testing 100M Config (~100M params) ---")
-    model_100m = Chessformer(CONFIG_100M_BALANCED)
-    print(f"100M Config Trainable Parameters: {count_parameters(model_100m):,}")
+    # Test large config
+    print("\n--- Testing Large Config (~100M params) ---")
+    model_large = Chessformer(CONFIG_LARGE)
+    print(f"Large Config Trainable Parameters: {count_parameters(model_large):,}")
     
-    # Run forward pass with 100M config
-    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_100m(dummy_batch)
-    print(f"Move logits: {move_logits.shape}")           # (2, 4098)
-    print(f"Value (reg): {value_out.shape}")             # (2, 1)
-    print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL
-    print(f"Value error: {value_error_out.shape}")       # (2, 1)
-    print(f"Time (cls): {time_cls_out.shape}")           # (2, 256) bins
-    print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
-
-    print("\n Testing token-new config")
-    model_token_new = Chessformer(CONFIG_TOKEN_NEW)
-    print(f"Token-new Config Trainable Parameters: {count_parameters(model_token_new):,}")
-
-    # Run forward pass with 100M config
-    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_token_new(dummy_batch)
+    # Run forward pass with large config
+    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_large(dummy_batch)
     print(f"Move logits: {move_logits.shape}")           # (2, 4098)
     print(f"Value (reg): {value_out.shape}")             # (2, 1)
     print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL

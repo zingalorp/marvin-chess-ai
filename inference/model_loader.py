@@ -8,7 +8,7 @@ from typing import Any, Dict, Literal, Tuple
 import torch
 
 
-ConfigName = Literal["token", "100m", "auto"]
+ConfigName = Literal["small", "large", "auto"]
 
 
 @dataclass(frozen=True)
@@ -33,8 +33,8 @@ def _detect_config_from_state(state: Dict[str, Any]) -> str:
     # Normalize keys (strip _orig_mod. prefix if present)
     keys = set(k.replace("_orig_mod.", "") for k in state.keys())
     
-    # Check d_model size from a known layer to distinguish token vs 100m
-    # Both have token_conditioning, but 100m is larger
+    # Check d_model size from a known layer to distinguish small vs large
+    # Both have token conditioning, but large is bigger
     for key in keys:
         if "layers.0.attn.q_proj.weight" in key:
             # Look at actual weight to determine config
@@ -42,9 +42,9 @@ def _detect_config_from_state(state: Dict[str, Any]) -> str:
     
     # Token-conditioned model has token_conditioning.* keys (both configs do now)
     if any(k.startswith("token_conditioning.") for k in keys):
-        # Try to distinguish by model size - 100m has larger weights
+        # Try to distinguish by model size - large has larger weights
         # Look for a weight and check its shape
-        return "token"  # Default to smaller config for auto-detect
+        return "small"  # Default to smaller config for auto-detect
     
     return "token"
 
@@ -79,10 +79,10 @@ def load_chessformer(
         config_name = _detect_config_from_state(state)
         print(f"Auto-detected model config: {config_name}")
 
-    if config_name == "100m":
-        config = dict(module.CONFIG_100M_BALANCED)
-    else:  # token (default)
-        config = dict(module.CONFIG_TOKEN_CONDITIONED)
+    if config_name == "large":
+        config = dict(module.CONFIG_LARGE)
+    else:  # small (default)
+        config = dict(module.CONFIG_SMALL)
 
     model = module.Chessformer(config).to(device)
     model.load_state_dict(state)

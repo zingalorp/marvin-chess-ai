@@ -6,6 +6,10 @@ A human-like chess transformer designed to mimic human play across skill levels 
 
 Marvin is trained on millions of [Lichess](https://lichess.org) games to predict moves, time usage, and game outcomes. The goal is an engine that plays like a human - natural moves, realistic mistakes, and appropriate time management for the emulated skill level.
 
+There are two model sizes available:
+- **small** (`CONFIG_SMALL`) — compact and fast (about **23M parameters**), used by default for inference and training unless a different config is requested.
+- **large** (`CONFIG_LARGE`) — higher-capacity model (~**110M parameters**) for better strength at higher compute cost.
+
 The architecture uses techniques from [Leela Chess Zero](https://lczero.org/blog/2024/02/transformer-progress/) and Daniel Monroe's "[Mastering Chess with a Transformer Model](https://arxiv.org/abs/2409.12272)" in a transformer with token-based conditioning. Primary output heads include:
 
 - **Policy**: Move probabilities (4096 from-to squares + resign + flag)
@@ -62,6 +66,8 @@ python train.py --data-dir data/
 ```
 
 **Lichess bot:** See `lichess-bot/config.example.yml` for setup.
+
+**Selecting model size for inference:** Set the environment variable `MARVIN_CONFIG` to `small` or `large`, or leave it as `auto` (the code will try to detect the correct config from the checkpoint).
 
 ## Play on Lichess
 
