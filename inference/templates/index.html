@@ -748,14 +748,13 @@ window.toggleAutoPlayPanel = function() {
 window.toggleMctsPanel = function() {
     var checked = $('#i-use-mcts').is(':checked');
     useMcts = checked;
-    if (checked) {
-        $('#mcts-params').slideDown(200);
-        $('#i-temp, #i-topp, #i-simulate-thinking-time').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
-        toggleAdaptivePanel();
-    } else {
-        $('#mcts-params').slideUp(200);
-        $('#i-temp, #i-topp, #i-simulate-thinking-time').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
-    }
+   if (checked) {
+       $('#adaptive-params').slideDown(200);
+       $('#i-mcts-sims').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+   } else {
+       $('#adaptive-params').slideUp(200);
+       $('#i-mcts-sims').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+   }
     toggleMctsStatsVisibility();
 }
 
@@ -792,10 +791,10 @@ window.toggleAdaptivePanel = function() {
     var checked = $('#i-mcts-adaptive').is(':checked');
     if (checked) {
         $('#adaptive-params').slideDown(200);
-        $('#i-mcts-sims, #i-mcts-cpuct').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+        $('#i-mcts-sims').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
     } else {
         $('#adaptive-params').slideUp(200);
-        $('#i-mcts-sims, #i-mcts-cpuct').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+        $('#i-mcts-sims').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
     }
 }
 

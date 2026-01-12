@@ -13,6 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 # Special policy indices
 RESIGN_MOVE_INDEX = 4096
@@ -39,11 +40,11 @@ class Mish(nn.Module):
 
 # ~100M trainable parameters
 CONFIG_LARGE = {
-    "d_model": 640,           # Reduced from 768 to afford more layers
-    "n_layers": 20,           # Increased from 14
-    "n_heads": 10,            # 640 / 64 = 10 heads (Standard 64 dim per head)
-    "d_head": 64,             # Sharper attention than 32
-    "d_ff": 1728,             # 2.7x expansion (SwiGLU standard)
+    "d_model": 704,           # Width increased (fits 22 heads)
+    "n_layers": 20,           # Keep Depth 20 for calculation
+    "n_heads": 22,            # 704 / 32 = 22 Heads
+    "d_head": 32,             # Revert to 32-dim
+    "d_ff": 1408,             # 2.0x expansion. (Compromise between 1.0x Small and 2.7x Std)
     "dropout": 0.1,
     "max_rel_dist": 7,
     "history_len": 8,
@@ -51,8 +52,8 @@ CONFIG_LARGE = {
     "num_tc_cats": 3,
     "embedding_ffn": True,
     "smolgen": True,
-    "smolgen_hidden": 256,    # Match d_model
-    "smolgen_per_head": 256,  
+    "smolgen_hidden": 256,    
+    "smolgen_per_head": 128,  # Reduced slightly per head since we have 22 heads now
     "use_token_conditioning": True,
     "num_conditioning_tokens": 6,
 }
@@ -751,6 +752,9 @@ class Chessformer(nn.Module):
         if self.use_token_conditioning:
             self.token_conditioning = TokenConditioningEncoder(d_model)
         
+        # Gradient checkpointing for memory-efficient training
+        self.gradient_checkpointing = config.get('gradient_checkpointing', False)
+        
         # Input encoder (per-square features only, globals handled by context encoder)
         self.input_encoder = PerSquareInputEncoder(config)
         
@@ -935,7 +939,14 @@ class Chessformer(nn.Module):
             rel_indices = self.rel_pos_gen()
         
         for layer in self.layers:
-            x = layer(x, rel_indices=rel_indices, smolgen_bias=smolgen_bias)
+            if self.gradient_checkpointing and self.training:
+                # use_reentrant=False is required for torch.compile compatibility
+                x = gradient_checkpoint(
+                    layer, x, rel_indices, smolgen_bias,
+                    use_reentrant=False
+                )
+            else:
+                x = layer(x, rel_indices=rel_indices, smolgen_bias=smolgen_bias)
         x = self.norm_f(x)  # (B, 64, d_model) or (B, 70, d_model)
         
         # Extract square tokens for output heads when using token conditioning

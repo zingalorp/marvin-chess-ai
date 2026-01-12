@@ -23,6 +23,8 @@ DEFAULT_GAME_SETTINGS: dict = {
     "use_expected_time": True,
     "start_clock_s": 300.0,
     "inc_s": 0.0,
+    # Device selection for model inference: 'auto' (default), 'cuda', or 'cpu'
+    "device": "auto",
 
     # MCTS (disabled by default)
     "use_mcts": False,

@@ -33,12 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
     parser.add_argument("--config", choices=["large", "small"], default="small")
-    parser.add_argument("--batch-size", type=int, default=640)  # 512 for small config
+    parser.add_argument("--batch-size", type=int, default=640)  # 640 for small config, 256 for large config
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=1.25e-4)
+    parser.add_argument("--lr", type=float, default=1.25e-4)  # 1.25e-4 for small config, 5e-5 for large config
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)  # Training on noisy multi modal data so smaller batch sizes are fine? idk
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--val-interval", type=int, default=50000, help="Run validation every N optimizer steps")
@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-mode", type=str, default="max-autotune", 
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode (default: max-autotune)")
+    parser.add_argument("--gradient-checkpointing", action="store_true",  # Training on noisy data doesn't benefit as much from large batch sizes? So keep this off.
+                        help="Enable gradient checkpointing to reduce memory usage")
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Number of warmup steps for LR scheduler")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-wait", type=int, default=2)
@@ -576,14 +578,25 @@ def main() -> None:
         config = copy.deepcopy(CONFIG_LARGE)
     else:  # small (default)
         config = copy.deepcopy(CONFIG_SMALL)
+    
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        config['gradient_checkpointing'] = True
+    
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
 
     model = Chessformer(config).to(device=device)
     if args.compile_model:
         try:
-            model = torch.compile(model, mode=args.compile_mode)
-            print(f"[train] torch.compile enabled with mode={args.compile_mode}")
+            # Use 'default' mode when gradient accumulation is enabled to avoid instability
+            # max-autotune can cause issues with gradient accumulation
+            compile_mode = args.compile_mode
+            if args.grad_accum_steps > 1 and compile_mode == "max-autotune":
+                compile_mode = "default"
+                print(f"[train] Switching compile mode to 'default' for gradient accumulation stability")
+            model = torch.compile(model, mode=compile_mode)
+            print(f"[train] torch.compile enabled with mode={compile_mode}")
         except Exception as exc:
             print(f"[train] torch.compile failed ({exc}); continuing without.")
     print(f"Using {args.config} config ({count_parameters(model):,} params, fp16 mixed precision)")

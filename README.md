@@ -59,12 +59,6 @@ python -m inference.app
 python -m inference.uci_engine
 ```
 
-**Training:**
-```bash
-python process_pgn.py --input data/raw/*.pgn --output data/
-python train.py --data-dir data/
-```
-
 **Lichess bot:** See `lichess-bot/config.example.yml` for setup.
 
 **Selecting model size for inference:** Set the environment variable `MARVIN_CONFIG` to `small` or `large`, or leave it as `auto` (the code will try to detect the correct config from the checkpoint).

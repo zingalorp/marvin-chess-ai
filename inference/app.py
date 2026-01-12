@@ -41,7 +41,25 @@ from inference.config import get_model_name, print_config
 
 print("Loading model...")
 print_config(repo_root)
-device = default_device()
+
+# Device selection: allow overriding via settings (auto|cuda|cpu)
+device_pref = str(game_settings.get("device", "auto")).lower()
+if device_pref == "auto":
+    device = default_device()
+elif device_pref == "cuda":
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        print("[inference] Warning: requested device 'cuda' but CUDA is not available; falling back to 'cpu'.")
+        device = torch.device("cpu")
+elif device_pref == "cpu":
+    device = torch.device("cpu")
+else:
+    try:
+        device = torch.device(device_pref)
+    except Exception:
+        print(f"[inference] Warning: unrecognized device '{device_pref}'; falling back to auto-detection.")
+        device = default_device()
 
 # Model/config selected via inference/config.py or env vars:
 #   MARVIN_MODEL=marvin_token_bf16.pt
