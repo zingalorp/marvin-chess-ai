@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ChessFormer Web</title>
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@9.9.0/assets/chessground.base.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@9.9.0/assets/chessground.brown.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@9.9.0/assets/chessground.cburnett.css">
+    <style>
+        /* App-specific styles */
+        body { background-color: #0e0e0e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; }
+        
+        .container { display: flex; gap: 20px; max-width: 1300px; margin: 0 auto; align-items: flex-start; justify-content: center; }
+        
+        /* 1. Settings Panel */
+        .settings-panel { width: 250px; background: #181818; padding: 12px; border-radius: 8px; border: 1px solid #333; max-height: 85vh; overflow-y: auto; }
+        .settings-panel::-webkit-scrollbar { width: 4px; }
+        .settings-panel::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+        .settings-panel::-webkit-scrollbar-track { background: #222; }
+
+        .setting-group { margin-bottom: 8px; }
+        .setting-label { font-size: 11px; font-weight: 600; color: #aaa; margin-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
+        .setting-val { color: #4caf50; font-family: monospace; font-size: 11px; }
+        input[type=range] { width: 100%; background: #333; height: 4px; border-radius: 2px; outline: none; margin: 5px 0; display: block; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: #eee; border-radius: 50%; cursor: pointer; }
+        
+        .section-header { font-size: 10px; font-weight: 700; color: #555; text-transform: uppercase; margin: 15px 0 8px 0; border-bottom: 1px solid #222; padding-bottom: 4px; letter-spacing: 0.5px; }
+        .section-header:first-of-type { margin-top: 0; }
+
+        .lock-btn { cursor:pointer; font-size:11px; color:#666; display:flex; align-items:center; gap:6px; margin: -6px 0 12px 0; justify-content:flex-end; user-select:none; }
+        .lock-btn:hover { color:#999; }
+        .lock-btn.active { color: #4caf50; }
+        .lock-btn.active svg { fill: #4caf50; }
+        .lock-btn svg { width:12px; height:12px; fill:#666; transition:fill 0.2s; }
+
+        /* Simple color blobs for Play-As control */
+        .color-blob { width:18px; height:18px; border-radius:50%; display:inline-block; box-sizing:border-box; }
+        .color-blob.white { background: #fff; border: 2px solid #ccc; }
+        /* Make black visible on the dark background by giving a light border and subtle outline */
+        .color-blob.black { background: #000; border: 2px solid rgba(255,255,255,0.9); box-shadow: 0 0 0 2px rgba(255,255,255,0.06); }
+
+        /* 2. Board Area */
+        #board-area { width: 500px; }
+        .cg-wrap { width: 500px; height: 500px; }
+        
+        /* 3. Stats Panel */
+        .sidebar { width: 320px; }
+        
+        /* Stats Styling */
+        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .panel { background: #1f1f1f; border: 1px solid #333; padding: 10px; border-radius: 6px; margin-bottom: 8px;}
+        .panel h3 { margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase; color: #888; border-bottom: 1px solid #333; padding-bottom: 4px; }
+        
+        .policy-scroll { max-height: 300px; overflow-y: auto; padding-right:4px; }
+        .policy-scroll::-webkit-scrollbar { width: 4px; }
+        .policy-scroll::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+        .policy-scroll::-webkit-scrollbar-track { background: #222; }
+
+        .row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 13px; }
+        .lbl { width: 50px; font-family: monospace; font-weight: bold; flex-shrink:0; }
+        .bar-bg { flex-grow: 1; height: 6px; background: #333; border-radius: 2px; overflow: hidden; }
+        .val { width: 35px; text-align: right; font-size: 11px; color: #aaa; }
+        .sub { font-size: 11px; color: #888; margin-top: 4px; }
+        .big-val { font-size: 20px; font-weight: bold; color: #eee; }
+        .err { font-size: 12px; color: #f44336; font-weight: normal; }
+        
+        .section-title { font-size: 12px; font-weight: 600; color: #aaa; margin: 20px 0 6px 0; letter-spacing: 0.5px; }
+        .chosen-move { padding: 8px; background: #2c2c2c; border-top: 1px solid #444; font-weight: bold; color: #4caf50; margin-top: 8px; }
+        
+        /* Controls */
+        .controls { display: flex; gap: 5px; justify-content: center; margin-top: 10px; }
+        .btn { background: #333; color: white; border: none; padding: 8px 14px; cursor: pointer; border-radius: 4px; font-size: 16px; min-width: 40px;}
+        .btn:hover { background: #444; }
+        .btn-reset { font-size: 14px; background: #442222; }
+        #status { text-align:center; min-height: 20px; color: #888; font-size: 13px; margin-top: 8px; }
+
+        /* PGN Container */
+        .pgn-container { margin-top: 15px; background: #181818; padding: 10px; border-radius: 4px; border: 1px solid #333; position: relative; min-height:40px; }
+        #pgn-text { font-family: monospace; font-size: 12px; color: #aaa; line-height: 1.4; word-wrap: break-word; padding-right: 24px; white-space: pre-wrap; }
+        .copy-btn { position: absolute; top: 5px; right: 5px; background: transparent; border: none; cursor: pointer; opacity: 0.4; font-size: 16px; transition: opacity 0.2s; }
+        .copy-btn:hover { opacity: 1; }
+
+        /* Attention overlay (8x8 grid over board) */
+        #board-wrap { position: relative; width: 500px; height: 500px; }
+        #attn-overlay { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); pointer-events: none; z-index: 10; }
+        .attn-cell { background: #4caf50; opacity: 0; }
+
+        /* Promotion dialog */
+        #promo-dialog { display: none; position: absolute; z-index: 100; background: #222; border: 2px solid #555; border-radius: 8px; padding: 8px; }
+        #promo-dialog .promo-piece { width: 50px; height: 50px; cursor: pointer; background-size: contain; background-repeat: no-repeat; background-position: center; }
+        #promo-dialog .promo-piece:hover { background-color: rgba(76, 175, 80, 0.3); border-radius: 4px; }
+        
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <!-- LEFT: Settings -->
+    <div class="settings-panel">
+        <div class="section-header">Game Setup</div>
+        
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Auto Play
+                <span title="Engine automatically plays its moves" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-autoplay" onchange="toggleAutoPlayPanel()">
+        </div>
+
+        <div class="setting-group" style="margin-bottom:4px">
+            <div class="setting-label">Engine Elo <span id="v-eelo" class="setting-val">1900</span></div>
+            <input type="range" id="i-eelo" min="1200" max="2600" step="50" value="1900">
+        </div>
+
+        <div class="lock-btn" id="lock-toggle" onclick="toggleEloLock()">
+            <svg viewBox="0 0 24 24"><path d="M12 17a2 2 0 100-4 2 2 0 000 4zm6-9h-1V6a5 5 0 00-10 0v2H6a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V10a2 2 0 00-2-2zM9 6a3 3 0 116 0v2H9V6z"/></svg>
+            <span>Link Elos</span>
+        </div>
+
+        <div class="setting-group">
+            <div class="setting-label">Human Elo <span id="v-helo" class="setting-val">1900</span></div>
+            <input type="range" id="i-helo" min="1200" max="2600" step="50" value="1900">
+        </div>
+
+        <div class="section-header">Time Control</div>
+        
+        <div class="setting-group">
+            <div class="setting-label">Start Clock (s) <span id="v-startclock" class="setting-val">180</span></div>
+            <input type="range" id="i-startclock" min="10" max="600" step="10" value="180">
+        </div>
+
+        <div class="setting-group">
+            <div class="setting-label">Increment (s) <span id="v-inc" class="setting-val">0</span></div>
+            <input type="range" id="i-inc" min="0" max="30" step="1" value="0">
+        </div>
+
+        <div id="autoplay-settings" style="display:none;">
+        <div class="setting-group" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <div class="setting-label" style="margin:0; flex:1">Play As</div>
+            <div style="display:flex; gap:8px; align-items:center;">
+                <div class="color-choice" id="i-color-white" data-color="white" title="Play as White" style="cursor:pointer; padding:4px; border-radius:4px; background:#222; border:1px solid #333;">
+                    <div class="color-blob white"></div>
+                </div>
+                <div class="color-choice" id="i-color-black" data-color="black" title="Play as Black" style="cursor:pointer; padding:4px; border-radius:4px; background:#111; border:1px solid #333;">
+                    <div class="color-blob black"></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Simulate Thinking Time
+                <span title="Engine waits for predicted time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-simulate-thinking-time">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Real Time
+                <span title="Use actual wall clock time" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-realtime">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Use Mode Time
+                <span title="Use most likely time (Mode) instead of sampling" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-modetime">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Use Expected Time
+                <span title="Use mean of top-p time distribution" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-exptime">
+        </div>
+        </div><!-- end autoplay-settings -->
+
+        <div class="section-header">Display</div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Show Best Move Arrow
+                <span title="Draw arrow for top model move" style="cursor:help; color:#666; margin-left:4px;">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-arrows" checked>
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">Show Attention</div>
+            <input type="checkbox" id="i-attn" onchange="toggleAttnPanel()">
+        </div>
+
+        <div id="attn-params" style="display:none; margin-top:6px;">
+            <div class="setting-group">
+                <div class="setting-label">Layer</div>
+                <select id="i-attn-layer" style="width:100%"></select>
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Head Aggregation</div>
+                <select id="i-attn-agg" style="width:100%">
+                    <option value="avg">Average All Heads</option>
+                    <option value="max">Max Head</option>
+                    <option value="smolgen">Smolgen Only</option>
+                </select>
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Focus Mode</div>
+                <select id="i-attn-focus" style="width:100%">
+                    <option value="outbound">Outbound (from square)</option>
+                    <option value="inbound">Inbound (to square)</option>
+                </select>
+            </div>
+        </div>
+
+        
+
+        <div class="section-header">Sampling</div>
+
+        <div class="setting-group">
+            <div class="setting-label">Temperature <span id="v-temp" class="setting-val">0.9</span></div>
+            <input type="range" id="i-temp" min="0" max="2.0" step="0.1" value="0.9">
+        </div>
+        
+        <div class="setting-group">
+            <div class="setting-label">Top P <span id="v-topp" class="setting-val">0.95</span></div>
+            <input type="range" id="i-topp" min="0.5" max="1.0" step="0.01" value="0.95">
+        </div>
+
+        <div class="setting-group">
+            <div class="setting-label">Time Temp <span id="v-ttemp" class="setting-val">1.0</span></div>
+            <input type="range" id="i-ttemp" min="0.1" max="5.0" step="0.1" value="1.0">
+        </div>
+
+        <div class="setting-group">
+            <div class="setting-label">Time Top P <span id="v-ttopp" class="setting-val">0.95</span></div>
+            <input type="range" id="i-ttopp" min="0.5" max="1.0" step="0.01" value="0.95">
+        </div>
+
+        <div class="section-header">MCTS</div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">Enable MCTS</div>
+            <input type="checkbox" id="i-use-mcts" onchange="toggleMctsPanel()">
+        </div>
+
+        <div id="mcts-params">
+            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+                <div class="setting-label" style="margin:0">Show Stats</div>
+                <input type="checkbox" id="i-mcts-stats">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Simulations <span id="v-mcts-sims" class="setting-val">128</span></div>
+                <input type="range" id="i-mcts-sims" min="16" max="5000" step="16" value="128">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">C_PUCT <span id="v-mcts-cpuct" class="setting-val">1.5</span></div>
+                <input type="range" id="i-mcts-cpuct" min="0.2" max="6.0" step="0.1" value="1.5">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Max Children <span id="v-mcts-k" class="setting-val">48</span></div>
+                <input type="range" id="i-mcts-k" min="8" max="128" step="8" value="48">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Max Depth <span id="v-mcts-depth" class="setting-val">96</span></div>
+                <input type="range" id="i-mcts-depth" min="1" max="200" step="1" value="96">
+            </div>
+
+            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #333; padding-top:5px;">
+                <div class="setting-label" style="margin:0">Adaptive MCTS</div>
+                <input type="checkbox" id="i-mcts-adaptive" onchange="toggleAdaptivePanel()">
+            </div>
+            
+            <div id="adaptive-params" style="display:none; margin-bottom:10px; border-bottom:1px solid #333; padding-bottom:5px;">
+                <div class="setting-group">
+                    <div class="setting-label">Scaling Factor <span id="v-mcts-ascale" class="setting-val">100</span></div>
+                    <input type="range" id="i-mcts-ascale" min="10" max="1000" step="10" value="100">
+                </div>
+            </div>
+
+            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #333; padding-top:5px;">
+                <div class="setting-label" style="margin:0">Tree Reuse</div>
+                <input type="checkbox" id="i-mcts-tree-reuse">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Root Noise (frac) <span id="v-mcts-frac" class="setting-val">0.0</span></div>
+                <input type="range" id="i-mcts-frac" min="0.0" max="0.5" step="0.05" value="0.0">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Root Noise (alpha) <span id="v-mcts-alpha" class="setting-val">0.0</span></div>
+                <input type="range" id="i-mcts-alpha" min="0.0" max="1.0" step="0.05" value="0.0">
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">Final Temp <span id="v-mcts-ft" class="setting-val">0.0</span></div>
+                <input type="range" id="i-mcts-ft" min="0.0" max="2.0" step="0.1" value="0.0">
+            </div>
+        </div>
+
+        <div id="engine-inputs"></div>
+    </div>
+
+    <!-- CENTER: Board -->
+    <div id="board-area">
+        <div id="board-wrap">
+            <div id="board" class="cg-wrap"></div>
+            <div id="attn-overlay"></div>
+        </div>
+        <div id="promo-dialog">
+            <div class="promo-piece" data-piece="q"></div>
+            <div class="promo-piece" data-piece="r"></div>
+            <div class="promo-piece" data-piece="b"></div>
+            <div class="promo-piece" data-piece="n"></div>
+        </div>
+        <div class="controls">
+            <button class="btn" onclick="nav('start')" title="Start"><<</button>
+            <button class="btn" onclick="nav('prev')" title="Previous"><</button>
+            <button class="btn" onclick="nav('next')" title="Next">></button>
+            <button class="btn" onclick="nav('end')" title="End">>></button>
+            <div style="width:20px"></div>
+            <button class="btn btn-reset" onclick="resetGame()">New</button>
+        </div>
+        <div id="status"></div>
+        
+        <div class="pgn-container">
+            <div id="pgn-text"></div>
+            <button class="copy-btn" onclick="copyPgn()" title="Copy PGN">📋</button>
+        </div>
+    </div>
+    
+    <!-- RIGHT: Stats -->
+    <div class="sidebar">
+        <div class="section-title" style="margin-top:0">CURRENT EVALUATION (Live)</div>
+        <div id="current-stats">Waiting...</div>
+        
+        <!-- MCTS Stats (shown when MCTS enabled and show_mcts_stats is on) -->
+        <div id="mcts-stats-container" style="display:none;">
+            <div class="section-title">MCTS SEARCH</div>
+            <div id="mcts-stats">
+                <div style="color:#666; font-style:italic; padding:10px;">Waiting for MCTS...</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+import { Chessground } from 'https://cdn.jsdelivr.net/npm/@lichess-org/chessground@9.9.0/+esm';
+
+var cg = null;
+var game_fen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+var legalDests = null;
+var cursor = 0, max_cursor = 0;
+var eloLocked = false;
+var moveStartTime = 0;
+var humanColor = 'white';
+var attention64 = null;
+var overlayOrientation = null;
+var attnFocusMode = 'outbound';
+var pendingPromotion = null;
+var autoPlayEnabled = false;
+var showArrows = true;
+var topMoveUci = null;
+var mctsEventSource = null;
+var showMctsStats = false;
+var useMcts = false;
+var pendingPremove = null;  // Store premove {from, to} during engine's turn
+var engineThinking = false;  // Track if engine is currently thinking
+var waitingForOurTurn = false;  // True while we're waiting for server response after our move
+var premoveQueue = [];  // Queue of premoves to execute
+
+// MCTS progress handling
+function renderMctsStats(stats) {
+    if (!stats || !stats.children) return '';
+    
+    var done = stats.done || 0;
+    var total = stats.total || 0;
+    var rootValue = stats.root_value || 0;
+    var children = stats.children || [];
+    
+    var progress = total > 0 ? (done / total * 100).toFixed(0) : 0;
+    var maxVisits = children.length > 0 ? children[0].visits : 1;
+    
+    var rows = '';
+    for (var i = 0; i < children.length && i < 15; i++) {
+        var c = children[i];
+        var width = maxVisits > 0 ? (c.visits / maxVisits * 100) : 0;
+        var qColor = c.q >= 0 ? '#4caf50' : '#f44336';
+        rows += '<div class="row" style="font-size:11px; gap:4px;">' +
+            '<span class="lbl" style="width:40px; font-family:monospace;">' + c.move + '</span>' +
+            '<div class="bar-bg" style="flex:1;"><div style="background:#4caf50; width:' + width + '%; height:100%;"></div></div>' +
+            '<span class="val" style="width:35px; text-align:right;">' + c.visits + '</span>' +
+            '<span class="val" style="width:40px; text-align:right; color:' + qColor + ';">' + (c.q >= 0 ? '+' : '') + c.q.toFixed(2) + '</span>' +
+            '</div>';
+    }
+    
+    return '<div class="panel">' +
+        '<h3>Progress: ' + done + '/' + total + ' (' + progress + '%)</h3>' +
+        '<div style="height:4px; background:#333; border-radius:2px; margin-bottom:8px;">' +
+        '<div style="height:100%; background:#4caf50; width:' + progress + '%; transition:width 0.1s;"></div></div>' +
+        '<div class="policy-scroll" style="max-height:200px;">' + rows + '</div>' +
+        '<div class="sub" style="margin-top:6px;">Root Value: ' + (rootValue >= 0 ? '+' : '') + rootValue.toFixed(2) + '</div>' +
+        '</div>';
+}
+
+function startMctsStream() {
+    if (mctsEventSource) {
+        mctsEventSource.close();
+    }
+    
+    $('#mcts-stats-container').show();
+    $('#mcts-stats').html('<div style="color:#666; font-style:italic; padding:10px;">Starting MCTS search...</div>');
+    
+    mctsEventSource = new EventSource('/mcts_progress');
+    
+    mctsEventSource.onmessage = function(e) {
+        try {
+            var stats = JSON.parse(e.data);
+            $('#mcts-stats').html(renderMctsStats(stats));
+        } catch (err) {
+            // Ignore parse errors (keepalives)
+        }
+    };
+    
+    mctsEventSource.onerror = function() {
+        // Stream ended or error - this is normal when MCTS completes
+        if (mctsEventSource) {
+            mctsEventSource.close();
+            mctsEventSource = null;
+        }
+    };
+}
+
+function stopMctsStream() {
+    if (mctsEventSource) {
+        mctsEventSource.close();
+        mctsEventSource = null;
+    }
+}
+
+function toggleMctsStatsVisibility() {
+    if (useMcts && showMctsStats) {
+        $('#mcts-stats-container').show();
+    } else {
+        $('#mcts-stats-container').hide();
+    }
+}
+
+// Helper: convert FEN to piece map for Chessground
+function fenToPieces(fen) {
+    var pieces = new Map();
+    var parts = fen.split(' ');
+    var rows = parts[0].split('/');
+    var files = ['a','b','c','d','e','f','g','h'];
+    
+    var pieceMap = {
+        'p': 'pawn', 'n': 'knight', 'b': 'bishop', 'r': 'rook', 'q': 'queen', 'k': 'king',
+        'P': 'pawn', 'N': 'knight', 'B': 'bishop', 'R': 'rook', 'Q': 'queen', 'K': 'king'
+    };
+    
+    for (var rank = 0; rank < 8; rank++) {
+        var file = 0;
+        for (var i = 0; i < rows[rank].length; i++) {
+            var c = rows[rank][i];
+            if (c >= '1' && c <= '8') {
+                file += parseInt(c);
+            } else {
+                var sq = files[file] + (8 - rank);
+                var color = c === c.toUpperCase() ? 'white' : 'black';
+                pieces.set(sq, { role: pieceMap[c], color: color });
+                file++;
+            }
+        }
+    }
+    return pieces;
+}
+
+// Helper: get legal moves as a Map for chessground
+function getLegalDestsMap(legalMoves) {
+    var dests = new Map();
+    if (!legalMoves) return dests;
+    
+    legalMoves.forEach(function(uci) {
+        var from = uci.substring(0, 2);
+        var to = uci.substring(2, 4);
+        if (!dests.has(from)) dests.set(from, []);
+        dests.get(from).push(to);
+    });
+    return dests;
+}
+
+// Get turn color from FEN
+function getTurnColor(fen) {
+    var parts = fen.split(' ');
+    return parts[1] === 'w' ? 'white' : 'black';
+}
+
+// Check if move needs promotion
+function isPromotion(from, to, fen) {
+    var pieces = fenToPieces(fen);
+    var piece = pieces.get(from);
+    if (!piece || piece.role !== 'pawn') return false;
+    var toRank = to[1];
+    return (piece.color === 'white' && toRank === '8') || (piece.color === 'black' && toRank === '1');
+}
+
+// Show promotion dialog
+function showPromotionDialog(from, to, color) {
+    pendingPromotion = { from: from, to: to };
+    var $dialog = $('#promo-dialog');
+    
+    // Set piece images
+    var piecePrefix = color === 'white' ? 'w' : 'b';
+    $('#promo-dialog .promo-piece[data-piece="q"]').css('background-image', 'url(https://lichess1.org/assets/piece/cburnett/' + piecePrefix + 'Q.svg)');
+    $('#promo-dialog .promo-piece[data-piece="r"]').css('background-image', 'url(https://lichess1.org/assets/piece/cburnett/' + piecePrefix + 'R.svg)');
+    $('#promo-dialog .promo-piece[data-piece="b"]').css('background-image', 'url(https://lichess1.org/assets/piece/cburnett/' + piecePrefix + 'B.svg)');
+    $('#promo-dialog .promo-piece[data-piece="n"]').css('background-image', 'url(https://lichess1.org/assets/piece/cburnett/' + piecePrefix + 'N.svg)');
+    
+    // Position dialog near the promotion square
+    var boardRect = document.getElementById('board').getBoundingClientRect();
+    var fileIndex = to.charCodeAt(0) - 'a'.charCodeAt(0);
+    var orientation = cg.state.orientation;
+    var x = orientation === 'white' ? fileIndex * (boardRect.width / 8) : (7 - fileIndex) * (boardRect.width / 8);
+    var y = color === 'white' ? 0 : boardRect.height - 220;
+    
+    $dialog.css({ left: x + 'px', top: y + 'px', display: 'flex', 'flex-direction': 'column' });
+}
+
+// Hide promotion dialog
+function hidePromotionDialog() {
+    $('#promo-dialog').hide();
+    pendingPromotion = null;
+}
+
+// Handle promotion choice
+$('#promo-dialog .promo-piece').on('click', function() {
+    if (!pendingPromotion) return;
+    var piece = $(this).data('piece');
+    submitMove(pendingPromotion.from, pendingPromotion.to, piece);
+    hidePromotionDialog();
+});
+
+// Submit move to server
+function submitMove(from, to, promotion) {
+    var elapsed = (Date.now() - moveStartTime) / 1000.0;
+    var payload = { from: from, to: to, elapsed_s: elapsed };
+    if (promotion) payload.promotion = promotion;
+    
+    // Mark that we're waiting for our move to be processed
+    // This enables premove input during the wait
+    waitingForOurTurn = true;
+    
+    // Immediately allow premove dragging while we wait for server
+    if (cg && autoPlayEnabled) {
+        cg.set({
+            draggable: { enabled: true, showGhost: true },
+            premovable: { enabled: true, showDests: true },
+            movable: { color: humanColor }
+        });
+    }
+    
+    $.ajax({
+        url: '/move', type: 'POST', contentType: 'application/json',
+        data: JSON.stringify(payload),
+        success: function(data) { 
+            waitingForOurTurn = false;
+            updateUI(data); 
+            checkEngineMove(data);
+        },
+        error: function() { 
+            waitingForOurTurn = false;
+            premoveQueue = [];
+            // Revert to current position on error
+            updateBoardPosition(game_fen);
+        }
+    });
+}
+
+// Move handler for Chessground
+function onMove(orig, dest) {
+    var turnColor = getTurnColor(game_fen);
+    
+    // If it's not our turn (engine's turn or waiting), treat as premove
+    if (autoPlayEnabled && turnColor !== humanColor) {
+        // This is a premove - store it and don't submit yet
+        pendingPremove = { from: orig, to: dest };
+        console.log('Premove registered:', orig, '->', dest);
+        return;
+    }
+    
+    // Also treat as premove if we're waiting for our previous move
+    if (waitingForOurTurn || engineThinking) {
+        premoveQueue.push({ from: orig, to: dest });
+        console.log('Move queued while waiting:', orig, '->', dest);
+        return;
+    }
+    
+    if (isPromotion(orig, dest, game_fen)) {
+        showPromotionDialog(orig, dest, turnColor);
+    } else {
+        submitMove(orig, dest, null);
+    }
+}
+
+// Premove handlers
+function onPremoveSet(orig, dest) {
+    pendingPremove = { from: orig, to: dest };
+    console.log('Premove set:', orig, '->', dest);
+    
+    // If we set a premove immediately after our move (while waiting for response),
+    // this is a "quick premove" that should be queued
+    if (waitingForOurTurn) {
+        premoveQueue.push({ from: orig, to: dest });
+        console.log('Premove queued during move wait');
+    }
+}
+
+function onPremoveUnset() {
+    pendingPremove = null;
+    premoveQueue = [];
+    console.log('Premove cancelled');
+}
+
+// Execute pending premove if valid
+function executePremove() {
+    // Check queue first, then pending premove
+    var premoveToExecute = premoveQueue.shift() || pendingPremove;
+    if (!premoveToExecute) return;
+    
+    var from = premoveToExecute.from;
+    var to = premoveToExecute.to;
+    
+    // Only clear pendingPremove if we used it (not from queue)
+    if (premoveToExecute === pendingPremove) {
+        pendingPremove = null;
+    }
+    
+    // Clear the premove visualization
+    if (cg) cg.cancelPremove();
+    
+    // Check if the premove is legal in the current position
+    var moveUci = from + to;
+    var isLegal = legalDests && legalDests.some(function(m) {
+        return m.startsWith(moveUci);
+    });
+    
+    if (isLegal) {
+        moveStartTime = Date.now();  // Reset move timer for the premove
+        if (isPromotion(from, to, game_fen)) {
+            showPromotionDialog(from, to, getTurnColor(game_fen));
+        } else {
+            submitMove(from, to, null);
+        }
+    } else {
+        console.log('Premove was not legal:', moveUci);
+        // Try next in queue if this one failed
+        if (premoveQueue.length > 0) {
+            executePremove();
+        }
+    }
+}
+
+// Update board position
+function updateBoardPosition(fen) {
+    if (!cg) return;
+    
+    var pieces = fenToPieces(fen);
+    var turnColor = getTurnColor(fen);
+    var dests = legalDests ? getLegalDestsMap(legalDests) : new Map();
+    
+    // In analysis mode (auto-play off), allow moves from either side at the latest position
+    // In auto-play mode, only allow moves when it's human's turn
+    var canMove = (cursor === max_cursor) && (!autoPlayEnabled || turnColor === humanColor);
+    
+    // Allow premoves when:
+    // 1. It's engine's turn in auto-play mode
+    // 2. We're waiting for our move to be processed (for immediate next premove)
+    var canPremove = autoPlayEnabled && (cursor === max_cursor) && 
+                     (turnColor !== humanColor || waitingForOurTurn || engineThinking);
+    
+    // For premoves to work, we need to set movable.color to humanColor even when it's not our turn
+    // Chessground allows premoves when movable.color differs from turnColor
+    var movableColor;
+    if (canMove) {
+        movableColor = turnColor;
+    } else if (canPremove) {
+        movableColor = humanColor;
+    } else {
+        movableColor = undefined;
+    }
+    
+    cg.set({
+        fen: fen,
+        turnColor: turnColor,
+        movable: {
+            color: movableColor,
+            dests: canMove ? dests : new Map(),
+            free: false,
+            showDests: canMove
+        },
+        draggable: {
+            enabled: canMove || canPremove,
+            showGhost: true
+        },
+        premovable: {
+            enabled: canPremove,
+            showDests: true
+        }
+    });
+    
+    console.log('updateBoardPosition:', {
+        turnColor: turnColor,
+        humanColor: humanColor,
+        autoPlayEnabled: autoPlayEnabled,
+        canMove: canMove,
+        canPremove: canPremove,
+        movableColor: movableColor,
+        cursor: cursor,
+        max_cursor: max_cursor,
+        waitingForOurTurn: waitingForOurTurn,
+        engineThinking: engineThinking
+    });
+}
+
+window.toggleAutoPlayPanel = function() {
+    autoPlayEnabled = $('#i-autoplay').is(':checked');
+    if (autoPlayEnabled) {
+        $('#autoplay-settings').slideDown(200).css('opacity', 1.0);
+        $('#autoplay-settings input, #autoplay-settings select').prop('disabled', false);
+    } else {
+        $('#autoplay-settings').slideUp(200);
+    }
+    // Re-apply board move permissions
+    updateBoardPosition(game_fen);
+}
+
+window.toggleMctsPanel = function() {
+    var checked = $('#i-use-mcts').is(':checked');
+    useMcts = checked;
+   if (checked) {
+       $('#adaptive-params').slideDown(200);
+       $('#i-mcts-sims').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+   } else {
+       $('#adaptive-params').slideUp(200);
+       $('#i-mcts-sims').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+   }
+    toggleMctsStatsVisibility();
+}
+
+window.toggleAttnPanel = function() {
+    var checked = $('#i-attn').is(':checked');
+    if (checked) {
+        $('#attn-params').slideDown(200);
+        updateAttnControlEnables();
+    } else {
+        $('#attn-params').slideUp(200);
+        clearAttentionOverlay();
+    }
+}
+
+function ensureAttnLayerOptions(numLayers) {
+    numLayers = parseInt(numLayers || 0, 10);
+    var $sel = $('#i-attn-layer');
+    if ($sel.data('builtFor') === numLayers) return;
+    $sel.empty();
+    $sel.append("<option value='-1'>All Layers</option>");
+    for (var i = 0; i < numLayers; i++) {
+        $sel.append("<option value='" + i + "'>Layer " + i + "</option>");
+    }
+    $sel.data('builtFor', numLayers);
+}
+
+function updateAttnControlEnables() {
+    var agg = $('#i-attn-agg').val();
+    var smolgenSelected = (agg === 'smolgen');
+    $('#i-attn-layer').prop('disabled', smolgenSelected).closest('.setting-group').css('opacity', smolgenSelected ? 0.5 : 1.0);
+}
+
+window.toggleAdaptivePanel = function() {
+    var checked = $('#i-mcts-adaptive').is(':checked');
+    if (checked) {
+        $('#adaptive-params').slideDown(200);
+        $('#i-mcts-sims').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
+    } else {
+        $('#adaptive-params').slideUp(200);
+        $('#i-mcts-sims').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
+    }
+}
+
+function squareToIndex(sq) {
+    var file = sq.charCodeAt(0) - 'a'.charCodeAt(0);
+    var rank = parseInt(sq[1], 10) - 1;
+    return rank * 8 + file;
+}
+
+function buildAttentionOverlay(orientation) {
+    if (overlayOrientation === orientation) return;
+    overlayOrientation = orientation;
+    var $o = $('#attn-overlay');
+    $o.empty();
+
+    var filesW = ['a','b','c','d','e','f','g','h'];
+    var filesB = ['h','g','f','e','d','c','b','a'];
+
+    if (orientation === 'white') {
+        for (var r = 8; r >= 1; r--) {
+            for (var f = 0; f < 8; f++) {
+                var sq = filesW[f] + r;
+                $o.append("<div class='attn-cell' data-square='" + sq + "'></div>");
+            }
+        }
+    } else {
+        for (var r2 = 1; r2 <= 8; r2++) {
+            for (var f2 = 0; f2 < 8; f2++) {
+                var sq2 = filesB[f2] + r2;
+                $o.append("<div class='attn-cell' data-square='" + sq2 + "'></div>");
+            }
+        }
+    }
+}
+
+function clearAttentionOverlay() {
+    $('#attn-overlay .attn-cell').css('opacity', 0);
+}
+
+// Draw arrow for top model move
+function drawTopMoveArrow() {
+    if (!cg) return;
+    if (!showArrows || !topMoveUci || topMoveUci.length < 4) {
+        cg.setAutoShapes([]);
+        return;
+    }
+    var from = topMoveUci.substring(0, 2);
+    var to = topMoveUci.substring(2, 4);
+    cg.setAutoShapes([{
+        orig: from,
+        dest: to,
+        brush: 'blue'
+    }]);
+}
+
+function renderAttentionFromSquare(fromSq) {
+    if (!attention64 || attention64.length !== 4096) return;
+
+    var fromIdx = squareToIndex(fromSq);
+    var vals = new Array(64);
+
+    if (attnFocusMode === 'inbound') {
+        for (var i = 0; i < 64; i++) vals[i] = attention64[i * 64 + fromIdx];
+    } else {
+        var rowStart = fromIdx * 64;
+        for (var j = 0; j < 64; j++) vals[j] = attention64[rowStart + j];
+    }
+
+    var maxV = 0;
+    for (var k = 0; k < 64; k++) if (vals[k] > maxV) maxV = vals[k];
+    if (maxV <= 0) { clearAttentionOverlay(); return; }
+
+    $('#attn-overlay .attn-cell').each(function() {
+        var sq = $(this).attr('data-square');
+        if (!sq) return;
+        var idx = squareToIndex(sq);
+        var a = vals[idx] / maxV;
+        $(this).css('opacity', Math.max(0, Math.min(1, a)));
+    });
+}
+
+function sendSettings() {
+    var payload = {
+        auto_play: $('#i-autoplay').is(':checked'),
+        show_arrows: $('#i-arrows').is(':checked'),
+        temperature: $('#i-temp').val(),
+        time_temperature: $('#i-ttemp').val(),
+        top_p: $('#i-topp').val(),
+        time_top_p: $('#i-ttopp').val(),
+        use_mcts: $('#i-use-mcts').is(':checked'),
+        show_mcts_stats: $('#i-mcts-stats').is(':checked'),
+        show_attention: $('#i-attn').is(':checked'),
+        attn_layer: $('#i-attn-layer').val(),
+        attn_head_agg: $('#i-attn-agg').val(),
+        attn_focus: $('#i-attn-focus').val(),
+        mcts_simulations: $('#i-mcts-sims').val(),
+        mcts_c_puct: $('#i-mcts-cpuct').val(),
+        mcts_max_children: $('#i-mcts-k').val(),
+        mcts_max_depth: $('#i-mcts-depth').val(),
+        mcts_adaptive: $('#i-mcts-adaptive').is(':checked'),
+        mcts_adaptive_scale: $('#i-mcts-ascale').val(),
+        mcts_tree_reuse: $('#i-mcts-tree-reuse').is(':checked'),
+        mcts_root_exploration_frac: $('#i-mcts-frac').val(),
+        mcts_root_dirichlet_alpha: $('#i-mcts-alpha').val(),
+        mcts_final_temperature: $('#i-mcts-ft').val(),
+        engine_elo: $('#i-eelo').val(),
+        human_elo: $('#i-helo').val(),
+        human_color: humanColor,
+        simulate_thinking_time: $('#i-simulate-thinking-time').is(':checked'),
+        use_real_time: $('#i-realtime').is(':checked'),
+        use_mode_time: $('#i-modetime').is(':checked'),
+        use_expected_time: $('#i-exptime').is(':checked'),
+        start_clock_s: $('#i-startclock').val(),
+        inc_s: $('#i-inc').val()
+    };
+    $('#v-temp').text(payload.temperature);
+    $('#v-ttemp').text(payload.time_temperature);
+    $('#v-topp').text(payload.top_p);
+    $('#v-ttopp').text(payload.time_top_p);
+    $('#v-eelo').text(payload.engine_elo);
+    $('#v-helo').text(payload.human_elo);
+    $('#v-startclock').text(payload.start_clock_s);
+    $('#v-inc').text(payload.inc_s);
+
+    $('#v-mcts-sims').text(payload.mcts_simulations);
+    $('#v-mcts-cpuct').text(payload.mcts_c_puct);
+    $('#v-mcts-k').text(payload.mcts_max_children);
+    $('#v-mcts-depth').text(payload.mcts_max_depth);
+    $('#v-mcts-ascale').text(payload.mcts_adaptive_scale);
+    $('#v-mcts-frac').text(payload.mcts_root_exploration_frac);
+    $('#v-mcts-alpha').text(payload.mcts_root_dirichlet_alpha);
+    $('#v-mcts-ft').text(payload.mcts_final_temperature);
+    
+    humanColor = payload.human_color;
+
+    $.ajax({
+        url: '/settings', type: 'POST', contentType: 'application/json',
+        data: JSON.stringify(payload),
+        success: function(data) { 
+            updateUI(data); 
+            moveStartTime = Date.now();
+            checkEngineMove(data);
+        }
+    });
+}
+
+function checkEngineMove(data) {
+    // Only trigger engine move if auto-play is enabled
+    if (!autoPlayEnabled) return;
+    
+    if (!data.is_game_over && data.cursor === data.max_cursor) {
+        var turn = data.fen.split(' ')[1];
+        var engineTurn = (humanColor === 'white' && turn === 'b') || (humanColor === 'black' && turn === 'w');
+        
+        if (engineTurn) {
+            $('#status').text("Engine thinking...");
+            engineThinking = true;
+            
+            // Make sure board allows premoves while engine thinks
+            updateBoardPosition(data.fen);
+            
+            // Start MCTS streaming if MCTS is enabled and show_mcts_stats is on
+            if (useMcts && showMctsStats) {
+                startMctsStream();
+            }
+            
+            $.post('/engine_move', function(data2) {
+                // Stop the stream when move completes
+                stopMctsStream();
+                engineThinking = false;
+                
+                // Fetch and display final MCTS stats if enabled
+                if (useMcts && showMctsStats) {
+                    $.get('/mcts_stats', function(stats) {
+                        if (stats) {
+                            // Mark as complete
+                            stats.done = stats.total;
+                            $('#mcts-stats').html(renderMctsStats(stats));
+                        }
+                    });
+                }
+                
+                updateUI(data2);
+                moveStartTime = Date.now();
+                
+                // Execute any pending premove immediately (no delay for responsiveness)
+                if ((pendingPremove || premoveQueue.length > 0) && !data2.is_game_over) {
+                    // Use requestAnimationFrame for immediate execution after render
+                    requestAnimationFrame(function() {
+                        executePremove();
+                    });
+                }
+            });
+        }
+    }
+}
+
+window.toggleEloLock = function() {
+    eloLocked = !eloLocked;
+    $('#lock-toggle').toggleClass('active', eloLocked);
+    if (eloLocked) {
+        var val = $('#i-eelo').val();
+        $('#i-helo').val(val);
+        $('#v-helo').text(val);
+        sendSettings();
+    }
+}
+
+$('#i-temp').on('input', function() { $('#v-temp').text($(this).val()); });
+$('#i-ttemp').on('input', function() { $('#v-ttemp').text($(this).val()); });
+$('#i-topp').on('input', function() { $('#v-topp').text($(this).val()); });
+$('#i-ttopp').on('input', function() { $('#v-ttopp').text($(this).val()); });
+$('#i-mcts-sims').on('input', function() { $('#v-mcts-sims').text($(this).val()); });
+$('#i-mcts-cpuct').on('input', function() { $('#v-mcts-cpuct').text($(this).val()); });
+$('#i-mcts-k').on('input', function() { $('#v-mcts-k').text($(this).val()); });
+$('#i-mcts-depth').on('input', function() { $('#v-mcts-depth').text($(this).val()); });
+$('#i-mcts-ascale').on('input', function() { $('#v-mcts-ascale').text($(this).val()); });
+$('#i-mcts-frac').on('input', function() { $('#v-mcts-frac').text($(this).val()); });
+$('#i-mcts-alpha').on('input', function() { $('#v-mcts-alpha').text($(this).val()); });
+$('#i-mcts-ft').on('input', function() { $('#v-mcts-ft').text($(this).val()); });
+$('#i-startclock').on('input', function() { $('#v-startclock').text($(this).val()); });
+$('#i-inc').on('input', function() { $('#v-inc').text($(this).val()); });
+
+$('#i-eelo').on('input', function() {
+    var val = $(this).val();
+    $('#v-eelo').text(val);
+    if(eloLocked) {
+        $('#i-helo').val(val);
+        $('#v-helo').text(val);
+    }
+});
+
+$('#i-helo').on('input', function() {
+    var val = $(this).val();
+    $('#v-helo').text(val);
+    if(eloLocked) {
+        $('#i-eelo').val(val);
+        $('#v-eelo').text(val);
+    }
+});
+
+$('#i-autoplay, #i-arrows, #i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-tree-reuse, #i-mcts-frac, #i-mcts-alpha, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-attn, #i-attn-layer, #i-attn-agg, #i-attn-focus, #i-startclock, #i-inc').on('change', function() {
+    updateAttnControlEnables();
+    sendSettings();
+});
+
+// Update arrow immediately when toggle changes
+$('#i-arrows').on('change', function() {
+    showArrows = $(this).is(':checked');
+    drawTopMoveArrow();
+});
+
+// Update MCTS stats visibility when toggle changes
+$('#i-mcts-stats').on('change', function() {
+    showMctsStats = $(this).is(':checked');
+    toggleMctsStatsVisibility();
+});
+
+// Attention overlay hover - bind to board-wrap since cg-board structure is different
+$('#board-wrap').on('mousemove', function(e) {
+    if (!$('#i-attn').is(':checked') || !attention64) return;
+    
+    var boardRect = document.getElementById('board').getBoundingClientRect();
+    var x = e.clientX - boardRect.left;
+    var y = e.clientY - boardRect.top;
+    
+    if (x < 0 || y < 0 || x > boardRect.width || y > boardRect.height) {
+        clearAttentionOverlay();
+        return;
+    }
+    
+    var squareSize = boardRect.width / 8;
+    var fileIdx = Math.floor(x / squareSize);
+    var rankIdx = Math.floor(y / squareSize);
+    
+    var orientation = cg ? cg.state.orientation : 'white';
+    var files = ['a','b','c','d','e','f','g','h'];
+    
+    var sq;
+    if (orientation === 'white') {
+        sq = files[fileIdx] + (8 - rankIdx);
+    } else {
+        sq = files[7 - fileIdx] + (rankIdx + 1);
+    }
+    
+    renderAttentionFromSquare(sq);
+});
+
+$('#board-wrap').on('mouseleave', function() {
+    clearAttentionOverlay();
+});
+
+$('.color-choice').on('click', function() {
+    var c = $(this).data('color');
+    humanColor = c;
+    $('.color-choice').removeClass('selected').css('box-shadow','none');
+    $(this).addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
+    sendSettings();
+});
+
+window.nav = function(action) {
+    onPremoveUnset();
+    premoveQueue = [];
+    if (cg) cg.cancelPremove();
+    $.ajax({
+        url: '/navigate', type: 'POST', contentType: 'application/json',
+        data: JSON.stringify({ action: action }),
+        success: function(data) { updateUI(data); }
+    });
+}
+
+function updateUI(data) {
+    game_fen = data.fen;
+    legalDests = data.legal_moves;
+    cursor = data.cursor;
+    max_cursor = data.max_cursor;
+    
+    var orientation = data.orientation;
+    
+    if (cg) {
+        cg.set({ orientation: orientation });
+        updateBoardPosition(data.fen);
+        
+        // Highlight last move if available
+        if (data.last_move) {
+            cg.set({ lastMove: data.last_move });
+        }
+        
+        // Show check if in check
+        if (data.in_check) {
+            cg.set({ check: getTurnColor(data.fen) });
+        } else {
+            cg.set({ check: false });
+        }
+        
+        // Draw arrow for top move
+        topMoveUci = data.top_move_uci;
+        drawTopMoveArrow();
+    }
+
+    attention64 = data.attention64;
+    buildAttentionOverlay(orientation);
+    
+    $('#current-stats').html(data.current_stats);
+    $('#pgn-text').text(data.pgn);
+    if(data.engine_inputs) $('#engine-inputs').html(data.engine_inputs);
+    
+    var status = "Move " + Math.floor(cursor/2 + 1);
+    if (data.is_game_over) status += " | " + data.result;
+    else if (cursor < max_cursor) status += " (Analysis Mode)";
+    $('#status').text(status);
+
+    if (data.settings) {
+        var s = data.settings;
+        $('#i-temp').val(s.temperature); $('#v-temp').text(s.temperature);
+        $('#i-ttemp').val(s.time_temperature); $('#v-ttemp').text(s.time_temperature);
+        $('#i-topp').val(s.top_p); $('#v-topp').text(s.top_p);
+        $('#i-ttopp').val(s.time_top_p); $('#v-ttopp').text(s.time_top_p);
+
+        $('#i-attn').prop('checked', !!s.show_attention);
+        $('#i-arrows').prop('checked', s.show_arrows !== false);
+        showArrows = s.show_arrows !== false;
+        ensureAttnLayerOptions(s.attn_num_layers || 0);
+        $('#i-attn-layer').val((s.attn_layer != null) ? String(s.attn_layer) : '-1');
+        $('#i-attn-agg').val(s.attn_head_agg || 'avg');
+        $('#i-attn-focus').val(s.attn_focus || 'outbound');
+        attnFocusMode = $('#i-attn-focus').val();
+        toggleAttnPanel();
+        if (!s.show_attention) clearAttentionOverlay();
+
+        $('#i-use-mcts').prop('checked', !!s.use_mcts);
+        useMcts = !!s.use_mcts;
+        toggleMctsPanel();
+        $('#i-mcts-stats').prop('checked', !!s.show_mcts_stats);
+        showMctsStats = !!s.show_mcts_stats;
+        toggleMctsStatsVisibility();
+        $('#i-mcts-sims').val(s.mcts_simulations); $('#v-mcts-sims').text(s.mcts_simulations);
+        $('#i-mcts-cpuct').val(s.mcts_c_puct); $('#v-mcts-cpuct').text(s.mcts_c_puct);
+        $('#i-mcts-k').val(s.mcts_max_children); $('#v-mcts-k').text(s.mcts_max_children);
+        $('#i-mcts-depth').val(s.mcts_max_depth || 96); $('#v-mcts-depth').text(s.mcts_max_depth || 96);
+        
+        $('#i-mcts-adaptive').prop('checked', !!s.mcts_adaptive);
+        toggleAdaptivePanel();
+        $('#i-mcts-ascale').val(s.mcts_adaptive_scale || 100); $('#v-mcts-ascale').text(s.mcts_adaptive_scale || 100);
+        $('#i-mcts-tree-reuse').prop('checked', !!s.mcts_tree_reuse);
+
+        $('#i-mcts-frac').val(s.mcts_root_exploration_frac); $('#v-mcts-frac').text(s.mcts_root_exploration_frac);
+        $('#i-mcts-alpha').val(s.mcts_root_dirichlet_alpha); $('#v-mcts-alpha').text(s.mcts_root_dirichlet_alpha);
+        $('#i-mcts-ft').val(s.mcts_final_temperature); $('#v-mcts-ft').text(s.mcts_final_temperature);
+        $('#i-eelo').val(s.engine_elo); $('#v-eelo').text(s.engine_elo);
+        $('#i-helo').val(s.human_elo); $('#v-helo').text(s.human_elo);
+        
+        $('#i-autoplay').prop('checked', !!s.auto_play);
+        autoPlayEnabled = !!s.auto_play;
+        toggleAutoPlayPanel();
+        
+        $('#i-simulate-thinking-time').prop('checked', s.simulate_thinking_time);
+        $('#i-realtime').prop('checked', s.use_real_time);
+        $('#i-modetime').prop('checked', s.use_mode_time);
+        $('#i-exptime').prop('checked', s.use_expected_time);
+        $('#i-startclock').val(s.start_clock_s || 180); $('#v-startclock').text(s.start_clock_s || 180);
+        $('#i-inc').val(s.inc_s || 0); $('#v-inc').text(s.inc_s || 0);
+        
+        var color = s.human_color ? 'white' : 'black';
+        humanColor = color;
+        $('.color-choice').removeClass('selected').css('box-shadow','none');
+        if (color === 'white') {
+            $('#i-color-white').addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
+        } else {
+            $('#i-color-black').addClass('selected').css('box-shadow','0 0 0 2px rgba(76,175,80,0.15)');
+        }
+    }
+}
+
+window.resetGame = function() { 
+    onPremoveUnset();
+    premoveQueue = [];
+    waitingForOurTurn = false;
+    engineThinking = false;
+    if (cg) cg.cancelPremove();
+    $.post('/reset', function(data) { 
+        updateUI(data); 
+        moveStartTime = Date.now();
+        checkEngineMove(data);
+    }); 
+}
+
+window.copyPgn = function() {
+    var text = $('#pgn-text').text();
+    navigator.clipboard.writeText(text).then(function() {
+        var btn = $('.copy-btn');
+        var original = btn.text();
+        btn.text('✅');
+        setTimeout(function() { btn.text(original); }, 1500);
+    });
+}
+
+function init() {
+    cg = Chessground(document.getElementById('board'), {
+        orientation: 'white',
+        coordinates: true,
+        animation: { enabled: true, duration: 120 },  // Faster animation like Lichess
+        movable: {
+            color: 'white',
+            free: false,
+            showDests: true,
+            events: {
+                after: onMove
+            }
+        },
+        premovable: {
+            enabled: true,
+            showDests: true,
+            events: {
+                set: onPremoveSet,
+                unset: onPremoveUnset
+            }
+        },
+        draggable: {
+            enabled: true,
+            showGhost: true
+        },
+        highlight: {
+            lastMove: true,
+            check: true
+        },
+        drawable: {
+            enabled: true,
+            visible: true,
+            autoShapes: []
+        }
+    });
+    
+    $.get('/state', function(data) { 
+        legalDests = data.legal_moves;
+        updateUI(data); 
+        moveStartTime = Date.now();
+        humanColor = data.orientation;
+        checkEngineMove(data);
+    });
+    
+    $(document).keydown(function(e) {
+        if (e.keyCode == 37) nav('prev');
+        else if (e.keyCode == 39) nav('next');
+    });
+}
+
+$(document).ready(init);
+</script>
+</body>
+</html>
