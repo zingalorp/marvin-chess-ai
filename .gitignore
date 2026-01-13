@@ -20,14 +20,6 @@
 !inference/templates/
 !inference/templates/index.html
 
-# Lichess-bot integration
-!lichess-bot/
-!lichess-bot/extra_game_handlers.py
-!lichess-bot/lib/
-!lichess-bot/lib/engine_wrapper.py
-!lichess-bot/lib/model.py
-!lichess-bot/config.example.yml
-
 # Wrapper script for UCI engine
 !marvin_wrapper.sh
 

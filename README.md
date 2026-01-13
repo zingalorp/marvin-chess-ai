@@ -67,9 +67,6 @@ python -m inference.app
 python -m inference.uci_engine
 ```
 
-**Lichess bot:** See `lichess-bot/config.example.yml` for setup.
-
-**Selecting model size:** Set the environment variable `MARVIN_CONFIG` to `small` or `large`, or leave it as `auto` (the code will try to detect the correct config from the checkpoint).
 
 ## Play on Lichess
 
@@ -89,7 +86,7 @@ Pretrained model weights are available on [Hugging Face](https://huggingface.co/
 
 - [Lichess](https://lichess.org) for training data and bot infrastructure
 - [Leela Chess Zero](https://lczero.org) for architectural techniques
-- [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework
+- [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework (integration is maintained separately)
 - [Chessground](https://github.com/lichess-org/chessground) for the web board UI
 
 ## License
