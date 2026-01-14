@@ -54,11 +54,9 @@ CONFIG_LARGE = {
     "smolgen": True,
     "smolgen_hidden": 256,    
     "smolgen_per_head": 128,  # Reduced slightly per head since we have 22 heads now
-    "use_token_conditioning": True,
-    "num_conditioning_tokens": 6,
 }
 
-# Small token-conditioned config (~23M params)
+# Small config (~23M params)
 # Uses 6 conditioning tokens prepended to 64 square tokens = 70 total tokens
 # Trained weights: inference/marvin_token_bf16.pt, checkpoints/chessformer_token-new_best.pt
 CONFIG_SMALL = {
@@ -69,15 +67,13 @@ CONFIG_SMALL = {
     "d_ff": 448,              # 1.0x d_model
     "dropout": 0.1,
     "max_rel_dist": 7,
-    "history_len": 8,         # Still used for board history, not time
+    "history_len": 8,         # Used for board history
     "num_piece_types": 13,
     "num_tc_cats": 3,         # Blitz, Rapid, Classical
-    "embedding_ffn": True,    # Keep embedding FFN
-    "smolgen": True,          # Keep smolgen
+    "embedding_ffn": True,
+    "smolgen": True,
     "smolgen_hidden": 256,
     "smolgen_per_head": 256,
-    "use_token_conditioning": True,  # Enable token-based conditioning
-    "num_conditioning_tokens": 6,    # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
 }
 
 class RMSNorm(nn.Module):
@@ -746,35 +742,28 @@ class Chessformer(nn.Module):
         self.config = config
         d_model = config['d_model']
         
-        # Token-based conditioning
-        self.use_token_conditioning = config.get('use_token_conditioning', True)
-        self.num_conditioning_tokens = config.get('num_conditioning_tokens', 6)
-        if self.use_token_conditioning:
-            self.token_conditioning = TokenConditioningEncoder(d_model)
+        # Token-based conditioning (6 tokens prepended to 64 square tokens = 70 total)
+        self.token_conditioning = TokenConditioningEncoder(d_model)
         
         # Gradient checkpointing for memory-efficient training
         self.gradient_checkpointing = config.get('gradient_checkpointing', False)
         
-        # Input encoder (per-square features only, globals handled by context encoder)
+        # Input encoder (per-square features only, globals handled by token conditioning)
         self.input_encoder = PerSquareInputEncoder(config)
         
         # Transformer body - using TransformerBlock with Mish activation
         self.rel_pos_gen = RelativePositionGenerator(config['max_rel_dist'])
         
-        # Extended relative position for conditioning tokens
-        # Conditioning tokens use a special "far away" bucket for their relative positions
-        if self.use_token_conditioning:
-            # Create extended relative position indices for 70 tokens
-            # Conditioning tokens (0-5) use the max distance bucket for all positions
-            total_tokens = 64 + self.num_conditioning_tokens
-            ext_indices = torch.zeros(total_tokens, total_tokens, dtype=torch.long)
-            # Fill in square-to-square relative positions (tokens 6-69)
-            ext_indices[self.num_conditioning_tokens:, self.num_conditioning_tokens:] = self.rel_pos_gen.indices
-            # All other positions (involving conditioning tokens) use max bucket
-            max_bucket = self.rel_pos_gen.num_buckets - 1
-            ext_indices[:self.num_conditioning_tokens, :] = max_bucket
-            ext_indices[:, :self.num_conditioning_tokens] = max_bucket
-            self.register_buffer("extended_rel_indices", ext_indices)
+        # Extended relative position for 70 tokens (6 conditioning + 64 squares)
+        # Conditioning tokens use the max distance bucket for all positions
+        ext_indices = torch.zeros(70, 70, dtype=torch.long)
+        # Fill in square-to-square relative positions (tokens 6-69)
+        ext_indices[NUM_CONDITIONING_TOKENS:, NUM_CONDITIONING_TOKENS:] = self.rel_pos_gen.indices
+        # All other positions (involving conditioning tokens) use max bucket
+        max_bucket = self.rel_pos_gen.num_buckets - 1
+        ext_indices[:NUM_CONDITIONING_TOKENS, :] = max_bucket
+        ext_indices[:, :NUM_CONDITIONING_TOKENS] = max_bucket
+        self.register_buffer("extended_rel_indices", ext_indices)
         
         self.layers = nn.ModuleList([
             TransformerBlock(config, self.rel_pos_gen.num_buckets)
@@ -878,82 +867,69 @@ class Chessformer(nn.Module):
         )  # (B, 64, d_model)
         
         # Token conditioning: prepend conditioning tokens to the sequence
-        if self.use_token_conditioning:
-            # Extract raw values for token conditioning
-            # ELO: denormalize from scalars (was (elo - 1900) / 700)
-            player_elo_raw = scalars[:, 0] * 700 + 1900  # (B,)
-            
-            # TC category is already in the batch
-            # tc_cat: (B,) with values 0=Blitz, 1=Rapid, 2=Classical
-            
-            # Remaining time: denormalize from scalars (was log1p(seconds) / 10)
-            remaining_time_raw = torch.expm1(scalars[:, 3] * 10)  # (B,)
-            
-            # Increment: denormalize from scalars (was inc / 30)
-            increment_raw = (scalars[:, 5] * 30).long()  # (B,)
-            
-            # My last move time: time_history[:, 1] (index 1 is my last move, index 0 is opponent's last)
-            # Denormalize from /60 and handle edge cases
-            my_last_time_raw = time_history[:, 1] * 60  # (B,) in seconds
-            
-            # Opponent's last move time: time_history[:, 0]
-            opp_last_time_raw = time_history[:, 0] * 60  # (B,) in seconds
-            
-            # Generate conditioning token embeddings
-            cond_tokens = self.token_conditioning(
-                player_elo=player_elo_raw,
-                tc_cat=tc_cat,
-                remaining_time=remaining_time_raw,
-                increment=increment_raw,
-                my_last_time=my_last_time_raw,
-                opp_last_time=opp_last_time_raw,
-            )  # (B, 6, d_model)
-            
-            # Prepend conditioning tokens to square tokens
-            x = torch.cat([cond_tokens, x], dim=1)  # (B, 70, d_model)
+        # Extract raw values for token conditioning
+        # ELO: denormalize from scalars (was (elo - 1900) / 700)
+        player_elo_raw = scalars[:, 0] * 700 + 1900  # (B,)
+        
+        # TC category is already in the batch
+        # tc_cat: (B,) with values 0=Blitz, 1=Rapid, 2=Classical
+        
+        # Remaining time: denormalize from scalars (was log1p(seconds) / 10)
+        remaining_time_raw = torch.expm1(scalars[:, 3] * 10)  # (B,)
+        
+        # Increment: denormalize from scalars (was inc / 30)
+        increment_raw = (scalars[:, 5] * 30).long()  # (B,)
+        
+        # My last move time: time_history[:, 1] (index 1 is my last move, index 0 is opponent's last)
+        # Denormalize from /60 and handle edge cases
+        my_last_time_raw = time_history[:, 1] * 60  # (B,) in seconds
+        
+        # Opponent's last move time: time_history[:, 0]
+        opp_last_time_raw = time_history[:, 0] * 60  # (B,) in seconds
+        
+        # Generate conditioning token embeddings
+        cond_tokens = self.token_conditioning(
+            player_elo=player_elo_raw,
+            tc_cat=tc_cat,
+            remaining_time=remaining_time_raw,
+            increment=increment_raw,
+            my_last_time=my_last_time_raw,
+            opp_last_time=opp_last_time_raw,
+        )  # (B, 6, d_model)
+        
+        # Prepend conditioning tokens to square tokens
+        x = torch.cat([cond_tokens, x], dim=1)  # (B, 70, d_model)
         
         # Compute smolgen bias once (shared across layers)
-        # Note: smolgen is designed for 64x64 square attention
-        # When using token conditioning, we apply it only to square-to-square attention
+        # Smolgen is designed for 64x64 square attention, apply only to square-to-square
         smolgen_bias = None
         if self.use_smolgen:
-            if self.use_token_conditioning:
-                # Compute smolgen on square tokens only
-                square_tokens = x[:, self.num_conditioning_tokens:, :]  # (B, 64, d_model)
-                smolgen_bias_64 = self.smolgen(square_tokens)  # (B, n_heads, 64, 64)
-                
-                # Extend to 70x70 with zeros for conditioning token interactions
-                n_heads = smolgen_bias_64.shape[1]
-                smolgen_bias = torch.zeros(
-                    B, n_heads, 70, 70, 
-                    device=device, dtype=smolgen_bias_64.dtype
-                )
-                smolgen_bias[:, :, self.num_conditioning_tokens:, self.num_conditioning_tokens:] = smolgen_bias_64
-            else:
-                smolgen_bias = self.smolgen(x)
+            # Compute smolgen on square tokens only
+            square_tokens = x[:, NUM_CONDITIONING_TOKENS:, :]  # (B, 64, d_model)
+            smolgen_bias_64 = self.smolgen(square_tokens)  # (B, n_heads, 64, 64)
+            
+            # Extend to 70x70 with zeros for conditioning token interactions
+            n_heads = smolgen_bias_64.shape[1]
+            smolgen_bias = torch.zeros(
+                B, n_heads, 70, 70, 
+                device=device, dtype=smolgen_bias_64.dtype
+            )
+            smolgen_bias[:, :, NUM_CONDITIONING_TOKENS:, NUM_CONDITIONING_TOKENS:] = smolgen_bias_64
         
         # Transformer layers
-        if self.use_token_conditioning:
-            rel_indices = self.extended_rel_indices
-        else:
-            rel_indices = self.rel_pos_gen()
-        
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 # use_reentrant=False is required for torch.compile compatibility
                 x = gradient_checkpoint(
-                    layer, x, rel_indices, smolgen_bias,
+                    layer, x, self.extended_rel_indices, smolgen_bias,
                     use_reentrant=False
                 )
             else:
-                x = layer(x, rel_indices=rel_indices, smolgen_bias=smolgen_bias)
-        x = self.norm_f(x)  # (B, 64, d_model) or (B, 70, d_model)
+                x = layer(x, rel_indices=self.extended_rel_indices, smolgen_bias=smolgen_bias)
+        x = self.norm_f(x)  # (B, 70, d_model)
         
-        # Extract square tokens for output heads when using token conditioning
-        if self.use_token_conditioning:
-            x_squares = x[:, self.num_conditioning_tokens:, :]  # (B, 64, d_model)
-        else:
-            x_squares = x  # (B, 64, d_model)
+        # Extract square tokens for output heads
+        x_squares = x[:, NUM_CONDITIONING_TOKENS:, :]  # (B, 64, d_model)
         
         # --- Policy Head ---
         pol_q = self.policy_query(x_squares)  # (B, 64, d_model)

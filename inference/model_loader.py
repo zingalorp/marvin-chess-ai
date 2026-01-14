@@ -29,24 +29,22 @@ def _load_model_module(model_py_path: Path):
 
 
 def _detect_config_from_state(state: Dict[str, Any]) -> str:
-    """Auto-detect which config was used based on state_dict keys."""
+    """Auto-detect which config (small/large) was used based on state_dict weight shapes."""
     # Normalize keys (strip _orig_mod. prefix if present)
-    keys = set(k.replace("_orig_mod.", "") for k in state.keys())
+    normalized_state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
     
     # Check d_model size from a known layer to distinguish small vs large
-    # Both have token conditioning, but large is bigger
-    for key in keys:
+    # small: d_model=448, large: d_model=704
+    for key, value in normalized_state.items():
         if "layers.0.attn.q_proj.weight" in key:
-            # Look at actual weight to determine config
-            pass
+            d_model = value.shape[0]
+            if d_model >= 700:
+                return "large"
+            else:
+                return "small"
     
-    # Token-conditioned model has token_conditioning.* keys (both configs do now)
-    if any(k.startswith("token_conditioning.") for k in keys):
-        # Try to distinguish by model size - large has larger weights
-        # Look for a weight and check its shape
-        return "small"  # Default to smaller config for auto-detect
-    
-    return "token"
+    # Default to small if we can't determine
+    return "small"
 
 
 def load_chessformer(

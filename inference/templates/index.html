@@ -82,8 +82,10 @@
 
         /* Attention overlay (8x8 grid over board) */
         #board-wrap { position: relative; width: 500px; height: 500px; }
-        #attn-overlay { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); pointer-events: none; z-index: 10; }
-        .attn-cell { background: #4caf50; opacity: 0; }
+        #attn-overlay { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); pointer-events: none; z-index: 20; }
+        .attn-cell { background: rgba(76, 175, 80, 0.7); opacity: 0; transition: opacity 0.1s ease; }
+        /* Ensure board doesn't create isolating stacking context */
+        #board.cg-wrap { z-index: 1; }
 
         /* Promotion dialog */
         #promo-dialog { display: none; position: absolute; z-index: 100; background: #222; border: 2px solid #555; border-radius: 8px; padding: 8px; }
@@ -748,13 +750,11 @@ window.toggleAutoPlayPanel = function() {
 window.toggleMctsPanel = function() {
     var checked = $('#i-use-mcts').is(':checked');
     useMcts = checked;
-   if (checked) {
-       $('#adaptive-params').slideDown(200);
-       $('#i-mcts-sims').prop('disabled', true).closest('.setting-group').css('opacity', 0.5);
-   } else {
-       $('#adaptive-params').slideUp(200);
-       $('#i-mcts-sims').prop('disabled', false).closest('.setting-group').css('opacity', 1.0);
-   }
+    if (checked) {
+        $('#mcts-params').slideDown(200);
+    } else {
+        $('#mcts-params').slideUp(200);
+    }
     toggleMctsStatsVisibility();
 }
 
@@ -805,7 +805,7 @@ function squareToIndex(sq) {
 }
 
 function buildAttentionOverlay(orientation) {
-    if (overlayOrientation === orientation) return;
+    if (overlayOrientation === orientation && $('#attn-overlay .attn-cell').length === 64) return;
     overlayOrientation = orientation;
     var $o = $('#attn-overlay');
     $o.empty();

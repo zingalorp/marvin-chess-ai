@@ -89,6 +89,10 @@ rng = np.random.default_rng(DEFAULT_RNG_SEED)
 def _mirror_square(sq: int) -> int: return sq ^ 56
 
 
+# Model uses 6 conditioning tokens prepended to 64 square tokens = 70 total tokens
+NUM_COND_TOKENS = 6
+
+
 def _extract_attention_64(
     model: torch.nn.Module,
     *,
@@ -100,6 +104,9 @@ def _extract_attention_64(
 
     Returns flattened list length 4096 in *real* board square indexing (python-chess: a1=0..h8=63).
     Requires the model's attention modules to have `last_attn_probs` populated from a just-completed forward.
+    
+    The model has 70 tokens (6 conditioning + 64 squares). This extracts only 
+    the 64x64 square-to-square attention.
 
     head_agg:
       - 'avg': average over heads (and over layers if layer == -1)
@@ -113,6 +120,16 @@ def _extract_attention_64(
 
     orig_model = getattr(model, "_orig_mod", model)
 
+    def extract_64x64(attn_tensor: torch.Tensor) -> torch.Tensor | None:
+        """Extract the 64x64 square-to-square attention from the 70x70 attention tensor."""
+        if not torch.is_tensor(attn_tensor) or attn_tensor.ndim != 4:
+            return None
+        seq_len = attn_tensor.shape[-1]
+        if seq_len != 70:
+            return None
+        # Extract only square-to-square attention (skip first 6 conditioning tokens)
+        return attn_tensor[0, :, NUM_COND_TOKENS:, NUM_COND_TOKENS:].float()  # (H, 64, 64)
+
     # Smolgen-only view (pure dynamic bias).
     if head_agg == "smolgen":
         bias_h: torch.Tensor | None = None
@@ -120,10 +137,9 @@ def _extract_attention_64(
             b = getattr(mod, "last_smolgen_bias", None)
             if b is None:
                 continue
-            if not torch.is_tensor(b) or b.ndim != 4 or b.shape[-2:] != (64, 64):
-                continue
-            bias_h = b[0].float()  # (H, 64, 64)
-            break
+            bias_h = extract_64x64(b)
+            if bias_h is not None:
+                break
 
         if bias_h is None:
             return None
@@ -137,9 +153,9 @@ def _extract_attention_64(
             attn = getattr(mod, "last_attn_probs", None)
             if attn is None:
                 continue
-            if not torch.is_tensor(attn) or attn.ndim != 4 or attn.shape[-2:] != (64, 64):
-                continue
-            layers_h.append(attn[0].float())  # (H, 64, 64)
+            attn_64 = extract_64x64(attn)
+            if attn_64 is not None:
+                layers_h.append(attn_64)  # (H, 64, 64)
 
         if not layers_h:
             return None

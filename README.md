@@ -76,7 +76,6 @@ You can challenge the Marvin bots directly on Lichess:
 *   [Marvin-1600](https://lichess.org/@/marvin-1600)
 *   [Marvin-2000](https://lichess.org/@/marvin-2000)
 *   [Marvin-2400](https://lichess.org/@/marvin-2400)
-*   [Marvin-GM](https://lichess.org/@/marvin-GM)
 
 ## Model Weights
 
