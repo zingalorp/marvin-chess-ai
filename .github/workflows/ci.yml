@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  workflow_dispatch:  # Manual trigger from GitHub UI
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      
+      - name: Install PyTorch (CPU)
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # Use CPU-only ONNX Runtime for CI
+          pip uninstall -y onnxruntime-gpu || true
+          pip install onnxruntime
+      
+      - name: Run model tests
+        run: |
+          python -c "
+          import torch
+          from model import Chessformer, CONFIG_SMALL
+          model = Chessformer(CONFIG_SMALL)
+          print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
+          
+          # Test forward pass
+          B = 2
+          batch = {
+              'board_history': torch.randint(0, 13, (B, 8, 64)),
+              'time_history': torch.randn(B, 8),
+              'rep_flags': torch.randint(0, 2, (B, 8)).float(),
+              'castling': torch.randint(0, 2, (B, 4)).float(),
+              'ep_mask': torch.zeros(B, 64),
+              'scalars': torch.randn(B, 8),
+              'tc_cat': torch.randint(0, 3, (B,)),
+              'legal_mask': torch.ones(B, 4098, dtype=torch.bool),
+          }
+          outputs = model(batch)
+          print(f'Move logits shape: {outputs[0].shape}')
+          print('Model test passed!')
+          "
+      
+      - name: Run encoding tests
+        run: |
+          python -c "
+          import chess
+          from inference.encoding import build_history_from_position, make_model_batch, ContextOptions, TC_BLITZ
+          import torch
+          
+          board = chess.Board()
+          moves = ['e2e4', 'd7d5']
+          final_board, history, rep_flags = build_history_from_position(board, moves)
+          
+          ctx = ContextOptions()
+          batch = make_model_batch(
+              board=final_board,
+              board_history=history,
+              repetition_flags=rep_flags,
+              ctx=ctx,
+              tc_cat=TC_BLITZ,
+              device=torch.device('cpu'),
+          )
+          print(f'Batch created with keys: {list(batch.keys())}')
+          print('Encoding test passed!')
+          "
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install linting tools
+        run: pip install ruff
+      
+      - name: Run linter
+        run: |
+          ruff check --select=E,F,W --ignore=E501 model.py inference/ scripts/ || true

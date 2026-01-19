@@ -27,3 +27,7 @@ ipywidgets
 fastapi
 uvicorn
 pydantic
+
+# --- ONNX Runtime (GPU) ---
+onnx
+onnxruntime-gpu  # Provides CUDAExecutionProvider (requires cuDNN 9.x)

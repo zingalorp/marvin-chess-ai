@@ -20,6 +20,10 @@
 !inference/templates/
 !inference/templates/index.html
 
+# Scripts
+!scripts/
+!scripts/*.py
+
 # Wrapper script for UCI engine
 !marvin_wrapper.sh
 
@@ -31,3 +35,8 @@
 # docs
 !docs/
 !docs/*
+
+# GitHub Actions
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml

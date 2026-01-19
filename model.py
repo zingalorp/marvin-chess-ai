@@ -120,16 +120,17 @@ def bin_increment(inc: torch.Tensor) -> torch.Tensor:
     """
     Bin increment values into 5 categories: 0, 1, 2, 5, 10+.
     Returns indices 0-4.
+    
+    ONNX-compatible: uses arithmetic instead of torch.tensor() in traced context.
     """
-    # Categories: [0], [1], [2], [3-4 -> map to 5], [5-9 -> map to 5], [10+]
-    # Simplified: 0->0, 1->1, 2->2, 3-9->3, 10+->4
+    # Categories: 0->0, 1->1, 2->2, 3-9->3, 10+->4
+    # Use arithmetic masking for ONNX compatibility
     bins = torch.zeros_like(inc)
-    bins = torch.where(inc == 0, torch.tensor(0, device=inc.device), bins)
-    bins = torch.where(inc == 1, torch.tensor(1, device=inc.device), bins)
-    bins = torch.where(inc == 2, torch.tensor(2, device=inc.device), bins)
-    bins = torch.where((inc >= 3) & (inc < 10), torch.tensor(3, device=inc.device), bins)
-    bins = torch.where(inc >= 10, torch.tensor(4, device=inc.device), bins)
-    return bins
+    bins = bins + (inc == 1).to(inc.dtype)  # 1 -> 1
+    bins = bins + 2 * (inc == 2).to(inc.dtype)  # 2 -> 2
+    bins = bins + 3 * ((inc >= 3) & (inc < 10)).to(inc.dtype)  # 3-9 -> 3
+    bins = bins + 4 * (inc >= 10).to(inc.dtype)  # 10+ -> 4
+    return bins.long()
 
 
 class TokenConditioningEncoder(nn.Module):
@@ -875,7 +876,8 @@ class Chessformer(nn.Module):
         # tc_cat: (B,) with values 0=Blitz, 1=Rapid, 2=Classical
         
         # Remaining time: denormalize from scalars (was log1p(seconds) / 10)
-        remaining_time_raw = torch.expm1(scalars[:, 3] * 10)  # (B,)
+        # Use exp(x) - 1 instead of expm1 for ONNX compatibility
+        remaining_time_raw = torch.exp(scalars[:, 3] * 10) - 1  # (B,)
         
         # Increment: denormalize from scalars (was inc / 30)
         increment_raw = (scalars[:, 5] * 30).long()  # (B,)

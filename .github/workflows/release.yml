@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  workflow_dispatch:  # Manual trigger from GitHub UI
+  push:
+    tags:
+      - 'v*'  # Triggers on version tags like v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      
+      - name: Install PyTorch (CPU for export)
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install onnx onnxruntime
+      
+      - name: Export ONNX model
+        run: |
+          python scripts/export_onnx.py --device cpu
+      
+      - name: Create release artifacts
+        run: |
+          mkdir -p release
+          
+          # Copy ONNX model
+          cp inference/marvin_small.onnx release/
+          
+          # Copy inference code
+          cp inference/onnx_runtime.py release/
+          cp inference/encoding.py release/
+          
+          # Create requirements for inference only
+          cat > release/requirements_inference.txt << EOF
+          onnxruntime-gpu  # or onnxruntime for CPU-only
+          numpy
+          python-chess
+          EOF
+          
+          # Create README for release
+          cat > release/README.md << EOF
+          # Marvin Chess AI - ONNX Release
+          
+          ## Files
+          - \`marvin_small.onnx\` - ONNX model (~88MB)
+          - \`onnx_runtime.py\` - Inference wrapper
+          - \`encoding.py\` - Position encoding
+          
+          ## Quick Start
+          
+          \`\`\`python
+          from onnx_runtime import ONNXChessformer
+          model = ONNXChessformer(model_path="marvin_small.onnx")
+          print(f"Provider: {model.provider}")  # CUDAExecutionProvider
+          \`\`\`
+          
+          ## Requirements
+          - Python 3.10+
+          - onnxruntime-gpu (for CUDA) or onnxruntime (CPU)
+          - numpy
+          - python-chess
+          EOF
+          
+          # Create zip archive
+          cd release && zip -r ../marvin-onnx-${{ github.ref_name }}.zip .
+      
+      - name: Upload ONNX model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marvin-onnx
+          path: release/
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            marvin-onnx-${{ github.ref_name }}.zip
+            inference/marvin_small.onnx
+          body: |
+            ## Marvin Chess AI ${{ github.ref_name }}
+            
+            ### Downloads
+            - **marvin-onnx-${{ github.ref_name }}.zip** - Complete ONNX inference package
+            - **marvin_small.onnx** - ONNX model only
+            
+            ### Requirements
+            - Python 3.10+
+            - `onnxruntime-gpu` for CUDA or `onnxruntime` for CPU
+            - `numpy`, `python-chess`
+            
+            ### Performance
+            - ~6ms per position with CUDA
+            - ~160 positions/second
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build Windows executable (optional)
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install onnx onnxruntime
+      
+      - name: Export ONNX model
+        run: python scripts/export_onnx.py --device cpu
+      
+      - name: Upload Windows ONNX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marvin-onnx-windows
+          path: inference/marvin_small.onnx
