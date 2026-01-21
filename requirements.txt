@@ -1,0 +1,34 @@
+﻿# --- Core Deep Learning ---
+
+# linux installation: pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# windows installation: pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# --- Data Handling & Processing ---
+pandas
+pyarrow
+numpy
+h5py
+tables
+zstandard
+
+# --- Chess Logic ---
+python-chess
+
+# --- Utilities & Visualization ---
+tqdm
+matplotlib
+seaborn
+psutil
+mlflow
+
+# --- Jupyter/Notebook support ---
+jupyterlab
+ipywidgets
+fastapi
+uvicorn
+pydantic
+
+# --- ONNX Runtime (GPU) ---
+onnx
+onnxscript
+onnxruntime-gpu  # Provides CUDAExecutionProvider (requires cuDNN 9.x)
