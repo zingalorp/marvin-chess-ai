@@ -138,7 +138,7 @@ def export_to_onnx(
     print("\nValidating ONNX model...")
     onnx_model = onnx.load(str(output_path))
     onnx.checker.check_model(onnx_model)
-    print("  ✓ ONNX model is valid")
+    print("  [OK] ONNX model is valid")
     
     # Print model info
     print(f"\nModel info:")
@@ -207,16 +207,16 @@ def validate_onnx_vs_pytorch(onnx_path: Path, device: str = "cuda"):
         rtol, atol = 1e-3, 1e-4
         is_close = np.allclose(torch_arr, onnx_out, rtol=rtol, atol=atol)
         
-        status = "✓" if is_close else "✗"
+        status = "[OK]" if is_close else "[FAIL]"
         print(f"  {status} {name}: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}")
         
         if not is_close:
             all_close = False
     
     if all_close:
-        print("\n✓ All outputs match within tolerance!")
+        print("\n[OK] All outputs match within tolerance!")
     else:
-        print("\n⚠ Some outputs differ beyond tolerance (may be ok for bf16 models)")
+        print("\n[WARN] Some outputs differ beyond tolerance (may be ok for bf16 models)")
     
     return all_close
 
@@ -320,7 +320,7 @@ def main():
     if args.benchmark:
         benchmark_inference(output_path, device=args.device)
     
-    print("\n✓ Done!")
+    print("\n[OK] Done!")
 
 
 if __name__ == "__main__":
