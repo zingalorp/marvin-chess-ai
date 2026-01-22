@@ -180,7 +180,9 @@ jobs:
           body: |
             ## Marvin Chess AI v${{ needs.build-python.outputs.version }}
             
-            A human-like chess engine that mimics play styles across skill levels (1200-2500 Elo).
+            A human-like chess engine that mimics play styles across skill levels (1200-2400 Elo).
+            
+            > **Note**: This release uses ONNX Runtime for **CPU inference only**. GPU acceleration is not included in the standalone executables. For GPU support, use the PyTorch-based engine from the source repository.
             
             ### Downloads
             
