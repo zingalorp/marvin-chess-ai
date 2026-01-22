@@ -122,7 +122,7 @@ def build_executable(repo_root: Path, use_onefile: bool = False, has_external_da
         "--exclude-module=pandas",
         "--exclude-module=PIL",
         str(uci_script),
-    ]
+    ])
     
     result = subprocess.run(cmd, cwd=str(repo_root))
     
