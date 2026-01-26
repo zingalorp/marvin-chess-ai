@@ -5,9 +5,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/holymolyyy/marvin)
 
-Marvin is a **human-like** chess transformer trained on millions of [Lichess](https://lichess.org) games. Unlike traditional engines that seek the absolute best move, Marvin is designed to mimic human play styles across skill levels (1200–2500 Elo).
+Marvin is a **human-like** chess transformer trained on millions of [Lichess](https://lichess.org) games. Unlike traditional engines that seek the absolute best move, Marvin was trained to mimic human play styles across skill levels (1200–2500 Elo).
 
-It is **time-aware**, meaning it adapts its play based on remaining clock time, opponent rating, and time control.
+It is **context-aware**, meaning it adapts its play based on remaining clock time, opponent rating, and time control.
 
 ## Architecture
 
@@ -24,6 +24,7 @@ Context (Elo, clock, time control) is injected via 6 conditioning tokens prepend
 
 ## Results
 
+Marvin accurately mimics human play-style in the 1200-2300 ELO range.
 Marvin (23M params) has been evaluated against state-of-the-art human-mimicking models.
 
 <p align="center">
@@ -45,7 +46,7 @@ The project includes a GUI for seeing prediction distributions, live parameter t
 
 ## Installation
 
-Tested on Linux/WSL with Python 3.10+.
+Tested on Windows and Linux/WSL with Python 3.10+.
 
 ```bash
 git clone https://github.com/zingalorp/marvin-chess-ai.git
@@ -72,23 +73,6 @@ python -m inference.uci_engine
 python -m inference.uci_onnx
 ```
 
-The ONNX engine only requires `onnxruntime`, `chess`, and `numpy` - no PyTorch needed at runtime. For GPU acceleration, install `onnxruntime-gpu` instead.
-
-## ONNX Export
-
-To export the model to ONNX format for faster/lighter deployment:
-
-```bash
-python scripts/export_onnx.py
-```
-
-This creates two files in `inference/`:
-- `marvin_small.onnx` - The model graph (~1 MB)
-- `marvin_small.onnx.data` - The weights (~100 MB)
-
-Both files are required and must be kept together.
-
-
 ## Play on Lichess
 
 You can challenge the Marvin bots directly on Lichess:
@@ -100,7 +84,7 @@ You can challenge the Marvin bots directly on Lichess:
 
 ## Model Weights
 
-Pretrained model weights are available on [Hugging Face](https://huggingface.co/holymolyyy/marvin).
+Model weights and checkpoints are available on [Hugging Face](https://huggingface.co/holymolyyy/marvin).
 
 ## Acknowledgments
 
