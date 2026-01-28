@@ -3,6 +3,7 @@ import json
 import logging
 import queue
 import threading
+import argparse
 from pathlib import Path
 import numpy as np
 import torch
@@ -10,8 +11,27 @@ import chess
 import chess.svg
 from flask import Flask, render_template, render_template_string, request, jsonify, Response
 import time
+import os
 
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_S, START_CLOCK_S
+
+# =============================================================================
+# CLI ARGUMENT PARSING
+# =============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Marvin Chess Inference Server")
+    parser.add_argument("--large", action="store_true",
+                        help="Use the large model (marvin_large.pt). Default is small.")
+    parser.add_argument("--port", type=int, default=5000,
+                        help="Port to run the server on (default: 5000)")
+    return parser.parse_args()
+
+# Parse args early so we can set env vars before config is imported
+_cli_args = parse_args()
+if _cli_args.large:
+    os.environ["MARVIN_MODEL"] = "marvin_large.pt"
+else:
+    os.environ["MARVIN_MODEL"] = "marvin_small.pt"
 from inference.engine_logic import analyze_position as analyze_position_core
 from inference.engine_logic import choose_engine_move as choose_engine_move_core
 from inference.runtime import (
@@ -968,5 +988,6 @@ def reset():
     return get_state()
 
 if __name__ == '__main__':
-    print("Starting Flask Server on http://localhost:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = _cli_args.port
+    print(f"Starting Flask Server on http://localhost:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False)

@@ -168,7 +168,8 @@ class UciEngine:
             _Option("FlagThreshold", "string", str(self.settings.get("flag_threshold", 0.98))),
 
             _Option("UseMCTS", "check", bool(self.settings["use_mcts"])),
-            _Option("MCTSSimulations", "spin", int(self.settings["mcts_simulations"]), min=1, max=200000),
+            # Allow zero or any non-negative simulation setting (no min clamp)
+            _Option("MCTSSimulations", "spin", int(self.settings["mcts_simulations"]), max=200000),
             _Option("MCTSCpuct", "string", str(self.settings["mcts_c_puct"])),
             _Option("MCTSMaxChildren", "spin", int(self.settings["mcts_max_children"]), min=1, max=4096),
             _Option("MCTSRootDirichletAlpha", "string", str(self.settings["mcts_root_dirichlet_alpha"])),

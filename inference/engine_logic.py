@@ -420,13 +420,21 @@ def choose_engine_move(
             base_sims = int(settings.get("mcts_simulations", 128))
             
             # Adaptive sims: scale * predicted_time
-            sims = max(16, int(scale * engine_pred_time_s))
+            # No minimum clamp: allow sims to be 0 if scale*pred_time is 0
+            sims = int(scale * engine_pred_time_s)
             
             # Adaptive cpuct: scale by sqrt(sims / base_sims) to maintain constant regularization strength
             # relative to the policy as the search budget changes.
             # We clamp the multiplier to avoid extreme values.
-            sim_ratio = sims / max(1, base_sims)
-            cpuct_scale = math.sqrt(sim_ratio)
+            # Compute sim_ratio without forcing a minimum base_sims of 1.
+            # If base_sims <= 0, set sim_ratio to +inf when sims>0 (will clamp cpuct later),
+            # or 0 when both are zero/negative.
+            if base_sims <= 0:
+                sim_ratio = float('inf') if sims > 0 else 0.0
+            else:
+                sim_ratio = float(sims) / float(base_sims)
+            sim_ratio = max(0.0, sim_ratio)
+            cpuct_scale = math.sqrt(sim_ratio) if sim_ratio != float('inf') else float('inf')
             cpuct = cpuct * cpuct_scale
             
             # Safety clamp

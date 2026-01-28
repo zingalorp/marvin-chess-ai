@@ -201,7 +201,10 @@ def get_model_move(
     candidates = [mv for mv in board.legal_moves if mv.from_square == from_sq and mv.to_square == to_sq]
     if not candidates:
         # fallback: pick a random legal move (shouldn't happen)
-        return next(iter(board.legal_moves))
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            return None
+        return legal_moves[0]
     promo_moves = [mv for mv in candidates if mv.promotion is not None]
     if promo_moves:
         # promo file index (if to_sq in last rank)
@@ -633,14 +636,14 @@ def main():
     p = argparse.ArgumentParser(description="Compare ACPL between dataset and model")
     p.add_argument("--parquet", required=True, help="Path to val_parquet (e.g. data/val_balanced.parquet)")
     p.add_argument("--num-games", type=int, default=48000, help="Number of games (or positions) to sample")
-    p.add_argument("--min-elo", type=int, default=1150)
-    p.add_argument("--max-elo", type=int, default=2550)
+    p.add_argument("--min-elo", type=int, default=1800)
+    p.add_argument("--max-elo", type=int, default=1900)
     p.add_argument("--engine-path", type=str, default="stockfish", help="Path to stockfish binary (or 'stockfish' on PATH)")
-    p.add_argument("--engine-time", type=float, default=0.01, help="Engine time per position in seconds (or use --engine-depth)")
+    p.add_argument("--engine-time", type=float, default=0.02, help="Engine time per position in seconds (or use --engine-depth)")
     p.add_argument("--engine-depth", type=int, default=None, help="Engine depth (overrides engine-time if set)")
     p.add_argument("--model-py", default="model.py")
-    p.add_argument("--checkpoint", default="inference/chessformer_smolgen_best.pt")
-    p.add_argument("--config-name", default="smolgen")
+    p.add_argument("--checkpoint", default="inference/marvin_small.pt")
+    p.add_argument("--config-name", default="small")
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed", type=int, default=11)
     p.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0=argmax, >0=sample)")
@@ -648,7 +651,13 @@ def main():
     p.add_argument("--output-dir", type=str, default="acpl_results", help="Directory for output files")
     p.add_argument("--no-plots", action="store_true", help="Skip generating plots")
     p.add_argument("--min-samples-per-cell", type=int, default=10, help="Minimum samples for a heatmap cell to be shown")
+    p.add_argument("--eval-cutoff", type=int, default=1000, help="Positions with absolute eval > cutoff are ignored for ACPL (default 1000)")
+    p.add_argument("--cpl-cap", type=int, default=None, help="Cap individual CPL values at this amount (default: same as eval-cutoff). Use lower values like 300 to reduce outlier impact on mean.")
     args = p.parse_args()
+    
+    # Default cpl-cap to eval-cutoff if not specified
+    if args.cpl_cap is None:
+        args.cpl_cap = args.eval_cutoff
     
     print(f"Temperature: {args.temperature}, Top-p: {args.top_p}")
 
@@ -694,6 +703,7 @@ def main():
     model_cpls = []
     human_cpls = []
     position_results: List[PositionResult] = []  # Collect detailed per-position data
+    skipped_due_to_cutoff = 0  # Track positions skipped due to eval cutoff
 
     iterator = list(iterate_games_or_positions(pq_path, min_elo=args.min_elo, max_elo=args.max_elo))
     if not iterator:
@@ -702,6 +712,9 @@ def main():
 
     # Sample up to args.num_games
     samples = rng.sample(iterator, min(args.num_games, len(iterator)))
+
+    # Track ELO values being passed to the model for diagnostics
+    elo_values_used = []
 
     for idx, item in enumerate(samples, 1):
         # Either grouped game or single row
@@ -740,15 +753,23 @@ def main():
                 gt_move = chess.Move(from_sq, to_sq, promotion=promo_map.get(promo, chess.QUEEN))
 
         # model move (argmax)
+        active_elo_val = int(row.get("active_elo", 1900))
+        opp_elo_val = int(row.get("opp_elo", 1900))
+        elo_values_used.append(active_elo_val)
+        
         ctx = ContextOptions(
-            active_elo=int(row.get("active_elo", 1900)),
-            opponent_elo=int(row.get("opp_elo", row.get("opp_elo", 1900))),
+            active_elo=active_elo_val,
+            opponent_elo=opp_elo_val,
             active_clock_s=float(row.get("active_clock", 300.0)),
             opponent_clock_s=float(row.get("opp_clock", 300.0)),
             active_inc_s=float(row.get("active_inc", 0.0)),
             opponent_inc_s=float(row.get("opp_inc", 0.0)),
             halfmove_clock=int(row.get("halfmove_clock", 0)),
         )
+
+        # Skip positions with no legal moves (checkmate/stalemate)
+        if not board.legal_moves:
+            continue
 
         model_move = get_model_move(
             loaded.model, loaded.device, board, board_history, repetition_flags, ctx,
@@ -766,6 +787,12 @@ def main():
             # base_cp is the eval of the best move from the side-to-move's perspective
             base_cp = score_to_cp(base_score)
 
+            # Skip positions where one side is already winning/losing by more than the cutoff
+            # as ACPL loses its meaning in decided positions.
+            if abs(base_cp) > args.eval_cutoff:
+                skipped_due_to_cutoff += 1
+                continue
+
             # Evaluate human (ground-truth) move
             human_cpl = None
             if gt_move is not None and gt_move in board.legal_moves:
@@ -776,7 +803,7 @@ def main():
                 if isinstance(human_score, chess.engine.PovScore):
                     human_cp_after = -score_to_cp(human_score)
                     human_cpl = max(0, base_cp - human_cp_after)
-                    human_cpl = min(human_cpl, 1500)
+                    human_cpl = min(human_cpl, args.cpl_cap)
 
             # Evaluate model move
             model_cpl = None
@@ -788,7 +815,7 @@ def main():
                 if isinstance(model_score, chess.engine.PovScore):
                     model_cp_after = -score_to_cp(model_score)
                     model_cpl = max(0, base_cp - model_cp_after)
-                    model_cpl = min(model_cpl, 1500)
+                    model_cpl = min(model_cpl, args.cpl_cap)
 
             # Only count positions where we have both evaluations
             if human_cpl is not None and model_cpl is not None:
@@ -819,6 +846,20 @@ def main():
     if not model_cpls:
         print("No CPLs computed")
         return
+
+    # Print ELO diagnostics
+    if elo_values_used:
+        print(f"\n=== ELO Diagnostics ===")
+        print(f"ELO values passed to model: min={min(elo_values_used)}, max={max(elo_values_used)}, "
+              f"mean={statistics.mean(elo_values_used):.0f}, median={statistics.median(elo_values_used):.0f}")
+        print(f"Filter range: {args.min_elo} - {args.max_elo}")
+
+    # Print eval cutoff diagnostics
+    print(f"\n=== Eval Cutoff Diagnostics ===")
+    print(f"Eval cutoff: {args.eval_cutoff} cp (skip positions with |eval| > this)")
+    print(f"CPL cap: {args.cpl_cap} cp (cap individual move losses at this)")
+    print(f"Positions skipped (|eval| > {args.eval_cutoff} cp): {skipped_due_to_cutoff}")
+    print(f"Positions evaluated: {len(model_cpls)}")
 
     # Create output directory
     output_dir = Path(args.output_dir)
