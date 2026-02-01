@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import argparse
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,22 @@ from inference.engine_logic import choose_engine_move, analyze_position
 from inference.mcts import MCTSResult, _Node
 from inference.runtime import load_default_chessformer
 from inference.config import get_model_name, print_config, get_model_path, get_config_name
+
+
+# =============================================================================
+# CLI ARGUMENT PARSING
+# =============================================================================
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Marvin UCI Engine")
+    parser.add_argument("--large", action="store_true",
+                        help="Use the large model (marvin_large.pt). Default is small.")
+    return parser.parse_args()
+
+_cli_args = _parse_args()
+if _cli_args.large:
+    os.environ["MARVIN_MODEL"] = "marvin_large.pt"
+else:
+    os.environ["MARVIN_MODEL"] = "marvin_small.pt"
 
 
 def _bool_from_uci(value: str) -> bool:
