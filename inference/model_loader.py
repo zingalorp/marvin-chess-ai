@@ -8,7 +8,7 @@ from typing import Any, Dict, Literal, Tuple
 import torch
 
 
-ConfigName = Literal["small", "large", "auto"]
+ConfigName = Literal["small", "large", "tiny", "small-v2", "large-v2", "tiny-v2", "auto"]
 
 
 @dataclass(frozen=True)
@@ -29,19 +29,25 @@ def _load_model_module(model_py_path: Path):
 
 
 def _detect_config_from_state(state: Dict[str, Any]) -> str:
-    """Auto-detect which config (small/large) was used based on state_dict weight shapes."""
+    """Auto-detect which config (tiny/small/large, v1/v2) was used based on state_dict weight shapes."""
     # Normalize keys (strip _orig_mod. prefix if present)
     normalized_state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
     
-    # Check d_model size from a known layer to distinguish small vs large
-    # small: d_model=448, large: d_model=704
+    # Detect V2 by checking for PerSquareInputEncoderV2 signature
+    # V2 has input_encoder.state_proj, V1 has input_encoder.meta_proj
+    is_v2 = any("input_encoder.state_proj" in k for k in normalized_state.keys())
+    
+    # Check d_model size from a known layer to distinguish tiny vs small vs large
+    # tiny: d_model=256, small: d_model=448, large: d_model=704
     for key, value in normalized_state.items():
         if "layers.0.attn.q_proj.weight" in key:
             d_model = value.shape[0]
             if d_model >= 700:
-                return "large"
+                return "large-v2" if is_v2 else "large"
+            elif d_model >= 400:
+                return "small-v2" if is_v2 else "small"
             else:
-                return "small"
+                return "tiny-v2" if is_v2 else "tiny"
     
     # Default to small if we can't determine
     return "small"
@@ -79,6 +85,14 @@ def load_chessformer(
 
     if config_name == "large":
         config = dict(module.CONFIG_LARGE)
+    elif config_name == "large-v2":
+        config = dict(module.CONFIG_LARGE_V2)
+    elif config_name == "small-v2":
+        config = dict(module.CONFIG_SMALL_V2)
+    elif config_name == "tiny":
+        config = dict(module.CONFIG_TINY)
+    elif config_name == "tiny-v2":
+        config = dict(module.CONFIG_TINY_V2)
     else:  # small (default)
         config = dict(module.CONFIG_SMALL)
 

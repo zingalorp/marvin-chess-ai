@@ -76,6 +76,94 @@ CONFIG_SMALL = {
     "smolgen_per_head": 256,
 }
 
+# Tiny config (~5M params)
+# Minimal model for fast inference and edge deployment
+CONFIG_TINY = {
+    "d_model": 256,           # Compact width
+    "n_layers": 6,            # 6 transformer layers
+    "n_heads": 8,             # 256 / 32 = 8
+    "d_head": 32,
+    "d_ff": 256,              # 1.0x d_model
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,         # Used for board history
+    "num_piece_types": 13,
+    "num_tc_cats": 3,         # Blitz, Rapid, Classical
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 128,    # Smaller for tiny model
+    "smolgen_per_head": 64,   # Smaller for tiny model
+}
+
+# =============================================================================
+# V2 CONFIGS - Clean Architecture
+# =============================================================================
+# V2 architecture separates concerns cleanly:
+# - Token conditioning (6 prepended tokens): ALL global/game context
+#   (ELO, TC, remaining time, increment, move timing)
+# - Per-square encoding: ONLY board state
+#   (piece history, EP, castling, repetition flags)
+#
+# Removes redundant features from per-square encoding that are already
+# in token conditioning (scalars, time_history, tc_cat embedding).
+
+# V2 Large config (~50M params)
+CONFIG_LARGE_V2 = {
+    "d_model": 576,
+    "n_layers": 16,
+    "n_heads": 18,
+    "d_head": 32,
+    "d_ff": 768,              # 1.33x d_model for good capacity
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,
+    "num_piece_types": 13,
+    "num_tc_cats": 3,
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 256,
+    "smolgen_per_head": 128,
+    "arch_version": 2,        # Use clean v2 architecture
+}
+
+# V2 Small config (~23M params)
+CONFIG_SMALL_V2 = {
+    "d_model": 448,
+    "n_layers": 12,
+    "n_heads": 14,
+    "d_head": 32,
+    "d_ff": 448,
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,
+    "num_piece_types": 13,
+    "num_tc_cats": 3,
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 256,
+    "smolgen_per_head": 256,
+    "arch_version": 2,        # Use clean v2 architecture
+}
+
+# V2 Tiny config (~5M params)
+CONFIG_TINY_V2 = {
+    "d_model": 256,
+    "n_layers": 6,
+    "n_heads": 8,
+    "d_head": 32,
+    "d_ff": 256,
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,
+    "num_piece_types": 13,
+    "num_tc_cats": 3,
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 128,
+    "smolgen_per_head": 64,
+    "arch_version": 2,        # Use clean v2 architecture
+}
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
     def __init__(self, dim, eps=1e-6):
@@ -729,6 +817,110 @@ class PerSquareInputEncoder(nn.Module):
         return x
 
 
+class PerSquareInputEncoderV2(nn.Module):
+    """
+    V2 Per-square encoder with clean separation of concerns.
+    
+    This encoder handles ONLY board state information:
+    - Board history (8 positions × 13 piece types = 104 dims)
+    - En passant flag (1 dim, per-square)
+    - Castling rights (4 dims, broadcast)
+    - Repetition flags (8 dims, broadcast)
+    
+    All global/game context (ELO, clocks, increment, TC, move timing) is handled
+    by TokenConditioningEncoder as prepended tokens, NOT duplicated here.
+    
+    Total input: 104 + 1 + 4 + 8 = 117 dims per square
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.history_len = config['history_len']
+        self.num_piece_types = config['num_piece_types']
+        d_model = config['d_model']
+        
+        # Input dimension per token (board state only)
+        # 8 * 13 (piece one-hots) + 1 (ep) + 4 (castling) + 8 (rep flags)
+        self.board_dim = self.history_len * self.num_piece_types + 1  # 105
+        self.state_dim = 4 + self.history_len  # castling + rep = 12
+        
+        # Project board features (piece positions + EP)
+        self.board_proj = nn.Linear(self.board_dim, d_model, bias=False)
+        
+        # Project state features (castling + repetition) with smaller init
+        self.state_proj = nn.Linear(self.state_dim, d_model, bias=False)
+        
+        # Per-square absolute position embedding
+        self.square_emb = nn.Embedding(64, d_model)
+        
+        # Avoid per-forward torch.arange allocations
+        self.register_buffer("square_ids", torch.arange(64, dtype=torch.long), persistent=False)
+        
+        # Per-square scale and bias (paper's "multiply by learned offset")
+        self.square_scale = nn.Parameter(torch.ones(64, d_model))
+        self.square_bias = nn.Parameter(torch.zeros(64, d_model))
+        
+        # Leela-style: optional FFN after embedding
+        self.use_embedding_ffn = config.get('embedding_ffn', False)
+        if self.use_embedding_ffn:
+            self.emb_ffn = nn.Sequential(
+                nn.Linear(d_model, d_model * 4),
+                nn.GELU(),
+                nn.Linear(d_model * 4, d_model),
+            )
+            self.emb_norm = RMSNorm(d_model)
+        
+        # Initialize: full-strength board, smaller state
+        nn.init.normal_(self.board_proj.weight, std=0.02)
+        nn.init.normal_(self.state_proj.weight, std=0.01)
+        self.board_proj._no_reinit = True
+        self.state_proj._no_reinit = True
+
+    def forward(self, board_history, rep_flags, castling, ep_mask):
+        """
+        Args:
+            board_history: (B, 8, 64) int64 - piece codes per square per history step
+            rep_flags: (B, 8) float - repetition flags per history step
+            castling: (B, 4) float - castling rights
+            ep_mask: (B, 64) float - 1.0 at EP square, else 0
+        
+        Returns:
+            (B, 64, d_model) token embeddings
+        """
+        B = board_history.shape[0]
+        
+        # 1. One-hot encode board history: (B, 8, 64, 13) -> (B, 64, 104)
+        board_onehot = F.one_hot(board_history, num_classes=self.num_piece_types).float()
+        board_onehot = board_onehot.permute(0, 2, 1, 3).reshape(B, 64, -1)
+        
+        # 2. EP mask per-square: (B, 64, 1)
+        ep_per_square = ep_mask.unsqueeze(-1)
+        
+        # 3. Broadcast rep_flags to all squares: (B, 64, 8)
+        rep_broadcast = rep_flags.unsqueeze(1).expand(-1, 64, -1)
+        
+        # 4. Broadcast castling to all squares: (B, 64, 4)
+        castle_broadcast = castling.unsqueeze(1).expand(-1, 64, -1)
+        
+        # Combine inputs
+        board_input = torch.cat([board_onehot, ep_per_square], dim=-1)  # (B, 64, 105)
+        state_input = torch.cat([castle_broadcast, rep_broadcast], dim=-1)  # (B, 64, 12)
+        
+        # Project to d_model
+        x = self.board_proj(board_input) + self.state_proj(state_input)
+        
+        # Add absolute position embedding
+        x = x + self.square_emb(self.square_ids)
+        
+        # Apply per-square scale and bias
+        x = x * self.square_scale + self.square_bias
+        
+        # Leela-style: FFN after embedding
+        if self.use_embedding_ffn:
+            x = x + self.emb_ffn(self.emb_norm(x))
+        
+        return x
+
+
 class Chessformer(nn.Module):
     """
     Chessformer model with token-based conditioning.
@@ -740,11 +932,16 @@ class Chessformer(nn.Module):
     - Increment category
     - My last move time
     - Opponent's last move time
+    
+    Architecture versions:
+    - v1 (default): Original architecture with redundant global context in per-square encoding
+    - v2 (arch_version=2): Clean separation - globals only in tokens, board state only in squares
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
         d_model = config['d_model']
+        self.arch_version = config.get('arch_version', 1)
         
         # Token-based conditioning (6 tokens prepended to 64 square tokens = 70 total)
         self.token_conditioning = TokenConditioningEncoder(d_model)
@@ -752,8 +949,13 @@ class Chessformer(nn.Module):
         # Gradient checkpointing for memory-efficient training
         self.gradient_checkpointing = config.get('gradient_checkpointing', False)
         
-        # Input encoder (per-square features only, globals handled by token conditioning)
-        self.input_encoder = PerSquareInputEncoder(config)
+        # Input encoder - choose based on architecture version
+        if self.arch_version == 2:
+            # V2: Clean separation - board state only, no redundant globals
+            self.input_encoder = PerSquareInputEncoderV2(config)
+        else:
+            # V1: Original architecture with globals in per-square encoding
+            self.input_encoder = PerSquareInputEncoder(config)
         
         # Transformer body - using TransformerBlock with Mish activation
         self.rel_pos_gen = RelativePositionGenerator(config['max_rel_dist'])
@@ -864,11 +1066,14 @@ class Chessformer(nn.Module):
         B = board_history.shape[0]
         device = board_history.device
         
-        # Encode square inputs
-        x = self.input_encoder(
-            board_history, time_history, rep_flags, castling,
-            ep_mask, scalars, tc_cat
-        )  # (B, 64, d_model)
+        # Encode square inputs - V2 uses cleaner interface
+        if self.arch_version == 2:
+            x = self.input_encoder(board_history, rep_flags, castling, ep_mask)
+        else:
+            x = self.input_encoder(
+                board_history, time_history, rep_flags, castling,
+                ep_mask, scalars, tc_cat
+            )  # (B, 64, d_model)
         
         # Token conditioning: prepend conditioning tokens to the sequence
         # Extract raw values for token conditioning
@@ -995,12 +1200,7 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
-    # Test the model
-    print("--- Testing Small Config (~23M params) ---")
-    model = Chessformer(CONFIG_SMALL)
-    print(f"Small Config Trainable Parameters: {count_parameters(model):,}")
-    
-    # Create dummy batch
+    # Create dummy batch for testing
     B = 2
     dummy_batch = {
         'board_history': torch.randint(0, 13, (B, 8, 64)),
@@ -1013,24 +1213,27 @@ if __name__ == "__main__":
         'legal_mask': torch.ones(B, NUM_POLICY_OUTPUTS, dtype=torch.bool),
     }
     
-    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model(dummy_batch)
-    print(f"Move logits: {move_logits.shape}")           # (2, 4098)
-    print(f"Value (reg): {value_out.shape}")             # (2, 1)
-    print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL
-    print(f"Value error: {value_error_out.shape}")       # (2, 1)
-    print(f"Time (cls): {time_cls_out.shape}")           # (2, 256) bins
-    print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
+    # Test all V1 configs
+    print("=" * 60)
+    print("V1 CONFIGS (Original Architecture)")
+    print("=" * 60)
     
-    # Test large config
-    print("\n--- Testing Large Config (~100M params) ---")
-    model_large = Chessformer(CONFIG_LARGE)
-    print(f"Large Config Trainable Parameters: {count_parameters(model_large):,}")
+    for name, config in [("TINY", CONFIG_TINY), ("SMALL", CONFIG_SMALL), ("LARGE", CONFIG_LARGE)]:
+        print(f"\n--- CONFIG_{name} ---")
+        model = Chessformer(config)
+        print(f"Parameters: {count_parameters(model):,}")
+        out = model(dummy_batch)
+        print(f"Forward pass: OK (move_logits={out[0].shape})")
     
-    # Run forward pass with large config
-    move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits = model_large(dummy_batch)
-    print(f"Move logits: {move_logits.shape}")           # (2, 4098)
-    print(f"Value (reg): {value_out.shape}")             # (2, 1)
-    print(f"Value (cls): {value_cls_out.shape}")         # (2, 3) WDL
-    print(f"Value error: {value_error_out.shape}")       # (2, 1)
-    print(f"Time (cls): {time_cls_out.shape}")           # (2, 256) bins
-    print(f"Start square logits: {start_square_logits.shape}")  # (2, 64)
+    # Test all V2 configs
+    print("\n" + "=" * 60)
+    print("V2 CONFIGS (Clean Architecture)")
+    print("=" * 60)
+    
+    for name, config in [("TINY_V2", CONFIG_TINY_V2), ("SMALL_V2", CONFIG_SMALL_V2), ("LARGE_V2", CONFIG_LARGE_V2)]:
+        print(f"\n--- CONFIG_{name} ---")
+        model = Chessformer(config)
+        print(f"Parameters: {count_parameters(model):,}")
+        print(f"arch_version: {model.arch_version}")
+        out = model(dummy_batch)
+        print(f"Forward pass: OK (move_logits={out[0].shape})")

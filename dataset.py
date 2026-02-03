@@ -289,7 +289,7 @@ def _collate(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
 
 class StreamingDataset(IterableDataset):
-    """Streaming dataset for parquet data."""
+    """Streaming dataset for parquet data with resume support."""
     
     def __init__(
         self,
@@ -306,10 +306,26 @@ class StreamingDataset(IterableDataset):
         self.seed = seed
         self.read_batch_rows = read_batch_rows
         self.epoch = 0
+        # Resume support: number of samples to skip at start of epoch
+        self._skip_samples = 0
+        # Track samples yielded in current epoch (across all workers)
+        self._samples_yielded = 0
 
     def set_epoch(self, epoch: int) -> None:
         # Used to vary shuffling across epochs while staying deterministic.
         self.epoch = int(epoch)
+        # Reset skip counter for new epoch
+        self._skip_samples = 0
+        self._samples_yielded = 0
+
+    def set_skip_samples(self, skip_samples: int) -> None:
+        """Set number of samples to skip when iterating (for resume)."""
+        self._skip_samples = skip_samples
+        self._samples_yielded = skip_samples  # Already counted as yielded
+
+    def get_samples_yielded(self) -> int:
+        """Get total samples yielded in current epoch (for checkpointing)."""
+        return self._samples_yielded
 
     def _epoch_seed(self, base_seed: int) -> int:
         # Large odd multiplier to avoid small-cycle patterns.
@@ -331,8 +347,28 @@ class StreamingDataset(IterableDataset):
         return order
 
     def __iter__(self):
+        worker = get_worker_info()
+        num_workers = worker.num_workers if worker else 1
+        worker_id = worker.id if worker else 0
+        
+        # Calculate how many samples this worker should skip
+        # Distribute skip evenly across workers
+        skip_for_worker = self._skip_samples // num_workers
+        if worker_id < (self._skip_samples % num_workers):
+            skip_for_worker += 1
+        
+        skipped = 0
+        yielded = 0
+        
         for file_path in self._iter_files_for_worker():
-            yield from self._stream_file(file_path)
+            for sample in self._stream_file(file_path):
+                if skipped < skip_for_worker:
+                    skipped += 1
+                    continue
+                yield sample
+                yielded += 1
+                # Update samples yielded counter (approximate - not thread-safe but good enough)
+                self._samples_yielded = self._skip_samples + (yielded * num_workers)
 
     def _stream_file(self, file_path: str):
         try:

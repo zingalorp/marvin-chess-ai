@@ -22,6 +22,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Marvin Chess Inference Server")
     parser.add_argument("--large", action="store_true",
                         help="Use the large model (marvin_large.pt). Default is small.")
+    parser.add_argument("--tiny", action="store_true",
+                        help="Use the tiny model (marvin_tiny.pt). Default is small.")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to run the server on (default: 5000)")
     return parser.parse_args()
@@ -30,6 +32,8 @@ def parse_args():
 _cli_args = parse_args()
 if _cli_args.large:
     os.environ["MARVIN_MODEL"] = "marvin_large.pt"
+elif _cli_args.tiny:
+    os.environ["MARVIN_MODEL"] = "marvin_tiny.pt"
 else:
     os.environ["MARVIN_MODEL"] = "marvin_small.pt"
 from inference.engine_logic import analyze_position as analyze_position_core

@@ -26,13 +26,17 @@ from model import (
     Chessformer,
     CONFIG_LARGE,
     CONFIG_SMALL,
+    CONFIG_TINY,
+    CONFIG_LARGE_V2,
+    CONFIG_SMALL_V2,
+    CONFIG_TINY_V2,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
-    parser.add_argument("--config", choices=["large", "small"], default="small")
+    parser.add_argument("--config", choices=["large", "small", "tiny", "large-v2", "small-v2", "tiny-v2"], default="small")
     parser.add_argument("--batch-size", type=int, default=640)  # 640 for small config, 256 for large config
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1.25e-4)  # 1.25e-4 for small config, 5e-5 for large config
@@ -43,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--val-interval", type=int, default=50000, help="Run validation every N optimizer steps")
     parser.add_argument("--val-batches", type=int, default=5000, help="Max batches per validation run (0 for full)")
+    parser.add_argument("--checkpoint-interval", type=int, default=10000, help="Save checkpoint every N optimizer steps (for resume)")
     parser.add_argument("--log-dir", default="runs")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--prefetch-factor", type=int, default=4)  # Lower but more workers
@@ -395,15 +400,22 @@ def train_one_epoch(
     val_loader=None,
     best_val_loss: float = float("inf"),
     run_dir: Path = None,
+    resume_samples: int = 0,
+    resume_micro_step: int = 0,
 ):
     model.train()
     totals = defaultdict(float)
     sample_count = 0
+    samples_this_epoch = 0  # Track for checkpointing
     log_timer = time.perf_counter()
     last_log_step = global_step
     last_log_sample_count = 0
-    micro_step = 0
+    micro_step = resume_micro_step  # Resume from saved micro_step
     optimizer.zero_grad(set_to_none=True)
+    
+    # For resume: skip samples already processed
+    if resume_samples > 0:
+        print(f"[train] Resuming epoch {epoch}: skipping {resume_samples:,} samples already processed")
 
     for step, batch in enumerate(loader, start=1):
         batch = move_batch_to_device(batch, device, non_blocking)
@@ -439,6 +451,7 @@ def train_one_epoch(
         metrics = compute_metrics(outputs, batch)
         batch_size = batch['board_history'].size(0)
         sample_count += batch_size
+        samples_this_epoch += batch_size  # Track total samples for checkpointing
         totals['loss'] += raw_loss.detach() * batch_size
         for name, value in {**loss_terms, **metrics}.items():
             totals[name] += value * batch_size
@@ -459,7 +472,8 @@ def train_one_epoch(
                 it_per_sec = steps_since / elapsed
                 samples_per_sec = samples_since / elapsed
                 print(
-                    f"[train] step {global_step:,} | {it_per_sec:.2f} it/s ({samples_per_sec:,.0f} samp/s) | loss {raw_loss.item():.3f} | "
+                    f"[train] step {global_step:,} | samples {resume_samples + samples_this_epoch:,} | "
+                    f"{it_per_sec:.2f} it/s ({samples_per_sec:,.0f} samp/s) | loss {raw_loss.item():.3f} | "
                     f"policy {loss_terms['policy'].item():.3f} | value {loss_terms['value'].item():.4f} | "
                     f"top1 {metrics['policy_top1'].item():.3f}"
                 )
@@ -492,12 +506,24 @@ def train_one_epoch(
                     save_checkpoint(
                         model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
                         Path(args.checkpoint_dir) / f"chessformer_{args.config}_best.pt",
-                        args.config, run_dir
+                        args.config, run_dir,
+                        samples_consumed=resume_samples + samples_this_epoch,
+                        micro_step=micro_step % args.grad_accum_steps,
                     )
 
                 model.train()
                 log_timer = time.perf_counter()
                 last_log_step = global_step
+
+            # Periodic checkpoint for resume (overwrites previous)
+            if args.checkpoint_interval > 0 and global_step % args.checkpoint_interval == 0:
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
+                    Path(args.checkpoint_dir) / f"chessformer_{args.config}_latest.pt",
+                    args.config, run_dir,
+                    samples_consumed=resume_samples + samples_this_epoch,
+                    micro_step=micro_step % args.grad_accum_steps,
+                )
 
         if profiler is not None:
             profiler.step()
@@ -515,10 +541,20 @@ def train_one_epoch(
         global_step += 1
 
     epoch_stats = {k: (v / sample_count).item() for k, v in totals.items()}
-    return epoch_stats, global_step, best_val_loss
+    return epoch_stats, global_step, best_val_loss, resume_samples + samples_this_epoch
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, path: Path, config_name: str, run_dir: Optional[Path] = None):
+def save_checkpoint(
+    model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, 
+    path: Path, config_name: str, run_dir: Optional[Path] = None,
+    samples_consumed: int = 0, micro_step: int = 0
+):
+    """Save checkpoint with dataset position for seamless resume.
+    
+    Args:
+        samples_consumed: Number of samples processed in current epoch (for resume)
+        micro_step: Current micro-step within gradient accumulation (for resume)
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "model": model.state_dict(),
@@ -527,7 +563,10 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "global_step": global_step,
         "best_val_loss": best_val_loss,
         "config": config_name,
-        "version": "1.0",
+        "version": "2.0",  # Version bump for new resume fields
+        # Resume state
+        "samples_consumed": samples_consumed,
+        "micro_step": micro_step,
     }
     if scheduler is not None:
         checkpoint["scheduler"] = scheduler.state_dict()
@@ -536,10 +575,17 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
     if run_dir is not None:
         checkpoint["run_dir"] = str(run_dir)
     torch.save(checkpoint, path)
-    print(f"[checkpoint] Saved to {path}")
+    print(f"[checkpoint] Saved to {path} (epoch={epoch}, step={global_step}, samples={samples_consumed:,})")
 
 
 def load_checkpoint(path: Path, model, optimizer, scheduler=None, scaler=None, device=None):
+    """Load checkpoint and return resume state.
+    
+    Returns:
+        Tuple of (epoch, global_step, best_val_loss, run_dir, samples_consumed, micro_step)
+        - samples_consumed: samples processed in the saved epoch (for resume mid-epoch)
+        - micro_step: gradient accumulation step (for resume)
+    """
     print(f"[checkpoint] Loading from {path}")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     
@@ -562,8 +608,13 @@ def load_checkpoint(path: Path, model, optimizer, scheduler=None, scaler=None, d
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
     run_dir = checkpoint.get("run_dir", None)
     
+    # Resume state (new in v2.0)
+    samples_consumed = checkpoint.get("samples_consumed", 0)
+    micro_step = checkpoint.get("micro_step", 0)
+    
     print(f"[checkpoint] Resumed from epoch {epoch}, step {global_step}, best_val_loss {best_val_loss:.4f}")
-    return epoch, global_step, best_val_loss, run_dir
+    print(f"[checkpoint] Resume state: samples_consumed={samples_consumed:,}, micro_step={micro_step}")
+    return epoch, global_step, best_val_loss, run_dir, samples_consumed, micro_step
 
 
 def count_parameters(model):
@@ -579,6 +630,14 @@ def main() -> None:
 
     if args.config == "large":
         config = copy.deepcopy(CONFIG_LARGE)
+    elif args.config == "large-v2":
+        config = copy.deepcopy(CONFIG_LARGE_V2)
+    elif args.config == "small-v2":
+        config = copy.deepcopy(CONFIG_SMALL_V2)
+    elif args.config == "tiny":
+        config = copy.deepcopy(CONFIG_TINY)
+    elif args.config == "tiny-v2":
+        config = copy.deepcopy(CONFIG_TINY_V2)
     else:  # small (default)
         config = copy.deepcopy(CONFIG_SMALL)
     
@@ -665,15 +724,22 @@ def main() -> None:
     global_step = 0
     best_val_loss = float("inf")
     resumed_run_dir = None
+    resume_samples = 0  # Samples already processed in current epoch
+    resume_micro_step = 0  # Gradient accumulation step
 
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
-        start_epoch, global_step, best_val_loss, resumed_run_dir = load_checkpoint(
+        start_epoch, global_step, best_val_loss, resumed_run_dir, resume_samples, resume_micro_step = load_checkpoint(
             resume_path, model, optimizer, scheduler, scaler, device
         )
-        start_epoch += 1
+        # If we have samples_consumed > 0, we're resuming mid-epoch
+        # Otherwise, start the next epoch
+        if resume_samples == 0:
+            start_epoch += 1
+        else:
+            print(f"[resume] Resuming mid-epoch {start_epoch} at sample {resume_samples:,}")
 
     # Run directory
     if args.resume_dir:
@@ -696,11 +762,22 @@ def main() -> None:
             # Ensure streaming parquet order changes each epoch (deterministically).
             if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_epoch"):
                 train_loader.dataset.set_epoch(epoch)
-            train_stats, global_step, best_val_loss = train_one_epoch(
+            
+            # Set skip samples for resume (only for the first epoch when resuming mid-epoch)
+            if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_skip_samples"):
+                train_loader.dataset.set_skip_samples(resume_samples)
+            
+            train_stats, global_step, best_val_loss, samples_consumed = train_one_epoch(
                 model, train_loader, optimizer, scheduler, scaler, device, writer,
                 epoch, global_step, args, non_blocking, profiler,
                 val_loader=val_loader, best_val_loss=best_val_loss, run_dir=run_dir,
+                resume_samples=resume_samples, resume_micro_step=resume_micro_step,
             )
+            
+            # Reset resume state after first epoch (subsequent epochs start fresh)
+            resume_samples = 0
+            resume_micro_step = 0
+            
             print(
                 f"Train loss: {train_stats.get('loss', 0):.4f} | "
                 f"top1 {train_stats.get('policy_top1', 0):.3f} | "
@@ -730,13 +807,14 @@ def main() -> None:
             for name, value in val_stats.items():
                 writer.add_scalar(f"val/{name}", value, epoch)
 
+            # End-of-epoch checkpoint (samples_consumed=0 means epoch complete)
             ckpt_path = Path(args.checkpoint_dir) / f"chessformer_{args.config}_epoch{epoch:02d}.pt"
-            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, ckpt_path, args.config, run_dir)
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, ckpt_path, args.config, run_dir, samples_consumed=0)
             
             if val_stats['loss'] < best_val_loss:
                 best_val_loss = val_stats['loss']
                 best_path = Path(args.checkpoint_dir) / f"chessformer_{args.config}_best.pt"
-                save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, best_path, args.config, run_dir)
+                save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, best_path, args.config, run_dir, samples_consumed=0)
 
     writer.close()
     print(f"\n[done] Best val loss: {best_val_loss:.4f}")

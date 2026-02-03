@@ -301,6 +301,7 @@ class UciEngine:
                         active_inc_s=active_inc,
                         opponent_inc_s=opp_inc,
                         time_history_s=time_hist,
+                        initial_fen=self._base_fen,
                     )
                     est_t = float(est_stats.get("time_sample_s", 0.0))
                     
@@ -677,6 +678,7 @@ class UciEngine:
                 allow_ponder_sleep=True,
                 mcts_reuse_root=mcts_reuse_root,
                 mcts_reuse_moves=mcts_reuse_moves,
+                initial_fen=self._base_fen,
             )
 
             # Restore original human_elo if we overrode it

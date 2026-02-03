@@ -344,6 +344,7 @@ def choose_engine_move(
     mcts_progress_callback: Callable[[dict], None] | None = None,
     mcts_reuse_root: _Node | None = None,
     mcts_reuse_moves: list[chess.Move] | None = None,
+    initial_fen: str = chess.STARTING_FEN,
 ) -> tuple[PolicyOutput, dict, dict | None, MCTSResult | None]:
     """Implements the engine selection path from `_play_engine_move` in `inference/app.py`.
 
@@ -369,6 +370,7 @@ def choose_engine_move(
         opponent_inc_s=float(opponent_inc_s),
         time_history_s=time_history_s,
         tc_base_s=(float(settings.get("start_clock_s")) if settings.get("start_clock_s") is not None else None),
+        initial_fen=initial_fen,
     )
 
     engine_pred_time_s = float(engine_stats.get("time_sample_s", 0.0))
@@ -489,7 +491,7 @@ def choose_engine_move(
         
         return out, engine_stats, mcts_stats, mcts_result
     else:
-        _fb, bh, rf = build_history_from_position(chess.Board(), moves_uci)
+        _fb, bh, rf = build_history_from_position(chess.Board(initial_fen), moves_uci)
         
         # Use opening temperature during opening phase for more varied openings
         opening_length = int(settings.get("opening_length", 10))
