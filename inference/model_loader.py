@@ -38,11 +38,11 @@ def _detect_config_from_state(state: Dict[str, Any]) -> str:
     is_v2 = any("input_encoder.state_proj" in k for k in normalized_state.keys())
     
     # Check d_model size from a known layer to distinguish tiny vs small vs large
-    # tiny: d_model=256, small: d_model=448, large: d_model=704
+    # tiny: d_model=256, small: d_model=448, large: d_model=608/704
     for key, value in normalized_state.items():
         if "layers.0.attn.q_proj.weight" in key:
             d_model = value.shape[0]
-            if d_model >= 700:
+            if d_model >= 550:
                 return "large-v2" if is_v2 else "large"
             elif d_model >= 400:
                 return "small-v2" if is_v2 else "small"

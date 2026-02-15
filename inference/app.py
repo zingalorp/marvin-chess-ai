@@ -85,6 +85,15 @@ else:
         print(f"[inference] Warning: unrecognized device '{device_pref}'; falling back to auto-detection.")
         device = default_device()
 
+if device.type == "cuda":
+    try:
+        gpu_name = torch.cuda.get_device_name(device)
+        print(f"[inference] Device selected: {device} ({gpu_name})")
+    except Exception:
+        print(f"[inference] Device selected: {device}")
+else:
+    print(f"[inference] Device selected: {device}")
+
 # Model/config selected via inference/config.py or env vars:
 #   MARVIN_MODEL=marvin_token_bf16.pt
 #   MARVIN_CONFIG=auto
@@ -94,6 +103,7 @@ loaded, model, _checkpoint_path = load_default_chessformer(
 )
 device = loaded.device
 print(f"Model loaded: {get_model_name()} (config: {loaded.config_name})")
+print(f"[inference] Model device: {device}")
 
 # Handle torch.compile wrapper for metadata inspection
 orig_model = getattr(model, "_orig_mod", model)

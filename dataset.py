@@ -360,7 +360,36 @@ class StreamingDataset(IterableDataset):
         skipped = 0
         yielded = 0
         
-        for file_path in self._iter_files_for_worker():
+        files_for_worker = list(self._iter_files_for_worker())
+        
+        # Fast path: skip entire files by reading their row counts from metadata
+        file_idx = 0
+        if skip_for_worker > 0:
+            for file_idx, file_path in enumerate(files_for_worker):
+                try:
+                    pf = pq.ParquetFile(file_path)
+                    file_rows = pf.metadata.num_rows
+                except Exception:
+                    file_rows = 0
+                
+                if skipped + file_rows <= skip_for_worker:
+                    # Skip entire file
+                    skipped += file_rows
+                else:
+                    # This file contains the resume point - break and handle it
+                    break
+            else:
+                # All files skipped (shouldn't happen normally)
+                file_idx = len(files_for_worker)
+            
+            if skipped > 0:
+                # Only log from worker 0 to avoid spam
+                if worker_id == 0:
+                    print(f"[dataset] Worker {worker_id}: skipped {file_idx} files ({skipped:,} samples), "
+                          f"{skip_for_worker - skipped:,} samples remaining to skip in current file")
+        
+        # Process remaining files
+        for file_path in files_for_worker[file_idx:]:
             for sample in self._stream_file(file_path):
                 if skipped < skip_for_worker:
                     skipped += 1

@@ -31,7 +31,7 @@
 
 # docs
 !docs/
-!docs/*
+!docs/*.png
 
 # GitHub Actions
 !.github/

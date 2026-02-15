@@ -42,14 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1.25e-4)  # 1.25e-4 for small config, 5e-5 for large config
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)  # Training on noisy multi modal data so smaller batch sizes are fine? idk
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--val-interval", type=int, default=50000, help="Run validation every N optimizer steps")
-    parser.add_argument("--val-batches", type=int, default=5000, help="Max batches per validation run (0 for full)")
+    parser.add_argument("--val-batches", type=int, default=20000, help="Max batches per validation run (0 for full)") # 5000 for batch size 1024, so 20_000 for batch size 256*4 grad accum?
     parser.add_argument("--checkpoint-interval", type=int, default=10000, help="Save checkpoint every N optimizer steps (for resume)")
+    parser.add_argument("--checkpoint-archive-interval", type=int, default=250000, help="Save non-overwriting checkpoints every N optimizer steps")
     parser.add_argument("--log-dir", default="runs")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--checkpoint-archive-dir", default="checkpoints/archive")
     parser.add_argument("--prefetch-factor", type=int, default=4)  # Lower but more workers
     parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
@@ -520,6 +522,17 @@ def train_one_epoch(
                 save_checkpoint(
                     model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
                     Path(args.checkpoint_dir) / f"chessformer_{args.config}_latest.pt",
+                    args.config, run_dir,
+                    samples_consumed=resume_samples + samples_this_epoch,
+                    micro_step=micro_step % args.grad_accum_steps,
+                )
+
+            # Periodic archival checkpoint (non-overwriting)
+            if args.checkpoint_archive_interval > 0 and global_step % args.checkpoint_archive_interval == 0:
+                archive_path = Path(args.checkpoint_archive_dir) / f"chessformer_{args.config}_step{global_step}.pt"
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
+                    archive_path,
                     args.config, run_dir,
                     samples_consumed=resume_samples + samples_this_epoch,
                     micro_step=micro_step % args.grad_accum_steps,

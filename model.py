@@ -107,13 +107,13 @@ CONFIG_TINY = {
 # Removes redundant features from per-square encoding that are already
 # in token conditioning (scalars, time_history, tc_cat embedding).
 
-# V2 Large config (~50M params)
+# V2 Large config (~49M params)
 CONFIG_LARGE_V2 = {
-    "d_model": 576,
+    "d_model": 608,
     "n_layers": 16,
-    "n_heads": 18,
+    "n_heads": 19,
     "d_head": 32,
-    "d_ff": 768,              # 1.33x d_model for good capacity
+    "d_ff": 608,              # 1.0x d_model (consistent with Small/Tiny)
     "dropout": 0.1,
     "max_rel_dist": 7,
     "history_len": 8,

@@ -26,11 +26,15 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Marvin UCI Engine")
     parser.add_argument("--large", action="store_true",
                         help="Use the large model (marvin_large.pt). Default is small.")
+    parser.add_argument("--tiny", action="store_true",
+                        help="Use the tiny model (marvin_tiny.pt). Default is small.")
     return parser.parse_args()
 
 _cli_args = _parse_args()
 if _cli_args.large:
     os.environ["MARVIN_MODEL"] = "marvin_large.pt"
+elif _cli_args.tiny:
+    os.environ["MARVIN_MODEL"] = "marvin_tiny.pt"
 else:
     os.environ["MARVIN_MODEL"] = "marvin_small.pt"
 
@@ -194,6 +198,7 @@ class UciEngine:
             _Option("MCTSFinalTemperature", "string", str(self.settings["mcts_final_temperature"])),
             _Option("MCTSFinalTopP", "string", str(self.settings.get("mcts_final_top_p", 1.0))),
             _Option("MCTSMaxDepth", "spin", int(self.settings["mcts_max_depth"]), min=1, max=512),
+            _Option("MCTSLeafBatchSize", "spin", int(self.settings.get("mcts_leaf_batch_size", 1)), min=1, max=1024),
             _Option("MCTSAdaptive", "check", bool(self.settings["mcts_adaptive"])),
             _Option("MCTSAdaptiveScale", "string", str(self.settings["mcts_adaptive_scale"])),
             _Option("MCTSFPU", "string", str(self.settings.get("mcts_fpu_reduction", 0.0))),
@@ -483,6 +488,8 @@ class UciEngine:
             set_setting("mcts_final_top_p", float(value))
         elif name_key == "mctsmaxdepth":
             set_setting("mcts_max_depth", int(float(value)))
+        elif name_key == "mctsleafbatchsize":
+            set_setting("mcts_leaf_batch_size", max(1, int(float(value))))
         elif name_key == "mctsadaptive":
             set_setting("mcts_adaptive", _bool_from_uci(value))
         elif name_key == "mctsadaptivescale":
@@ -986,6 +993,21 @@ class UciEngine:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Marvin UCI Engine")
+    parser.add_argument("--large", action="store_true", help="Use large model")
+    parser.add_argument("--small", action="store_true", help="Use small model")
+    parser.add_argument("--tiny", action="store_true", help="Use tiny model")
+    args = parser.parse_args()
+
+    # Set env vars so config.py picks them up before UciEngine.__init__
+    if args.large:
+        os.environ.setdefault("MARVIN_MODEL", "marvin_large.pt")
+    elif args.tiny:
+        os.environ.setdefault("MARVIN_MODEL", "marvin_tiny.pt")
+    elif args.small:
+        os.environ.setdefault("MARVIN_MODEL", "marvin_small.pt")
+
     engine = UciEngine()
     engine.loop()
 
