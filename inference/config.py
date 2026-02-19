@@ -6,12 +6,15 @@ Model and config can be selected via:
 2. Editing the defaults below
 
 Available models (in inference/ folder):
-- marvin_token_bf16.pt      (token-conditioned, ~23M params)
+- marvin_large.pt           (large, ~49M params)
+- marvin_tiny.pt            (tiny, ~5M params)
+- thomasso-large.pt         (large fine-tuned on thomasso's games)
 
 Available configs:
 - "auto"  : Auto-detect from checkpoint (recommended)
-- "small" : Small token-conditioned (~23M params)
-- "large" : Large token-conditioned (~100M params)
+- "tiny"  : Tiny (~5M params)
+- "small" : Small (~23M params)
+- "large" : Large (~49M params)
 """
 
 import os
@@ -22,9 +25,9 @@ from pathlib import Path
 # =============================================================================
 
 # Model checkpoint filename (relative to inference/ folder)
-DEFAULT_MODEL = "marvin_small.pt"
+DEFAULT_MODEL = "marvin_large.pt"
 
-# Model config: "auto", "small", "large"
+# Model config: "auto", "tiny", "small", "large"
 # "auto" will detect from checkpoint keys (recommended)
 DEFAULT_CONFIG = "auto"
 

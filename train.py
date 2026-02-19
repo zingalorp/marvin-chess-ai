@@ -27,16 +27,13 @@ from model import (
     CONFIG_LARGE,
     CONFIG_SMALL,
     CONFIG_TINY,
-    CONFIG_LARGE_V2,
-    CONFIG_SMALL_V2,
-    CONFIG_TINY_V2,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
-    parser.add_argument("--config", choices=["large", "small", "tiny", "large-v2", "small-v2", "tiny-v2"], default="small")
+    parser.add_argument("--config", choices=["large", "small", "tiny"], default="small")
     parser.add_argument("--batch-size", type=int, default=640)  # 640 for small config, 256 for large config
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1.25e-4)  # 1.25e-4 for small config, 5e-5 for large config
@@ -80,6 +77,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-weight", type=float, default=0.5)
     parser.add_argument("--start-square-weight", type=float, default=0.1)
     parser.add_argument("--promo-weight", type=float, default=0.1)
+    # Fine-tuning options
+    parser.add_argument("--finetune", action="store_true",
+                        help="Enable fine-tuning mode: loads only model weights (no optimizer/scheduler state), "
+                             "uses discriminative learning rates for backbone vs heads")
+    parser.add_argument("--pretrained", type=str, default=None,
+                        help="Path to pretrained checkpoint to load model weights from (finetune mode only). "
+                             "If not set, uses --resume path.")
+    parser.add_argument("--lr-backbone", type=float, default=5e-6,
+                        help="Learning rate for backbone (embeddings + transformer layers) in finetune mode")
+    parser.add_argument("--lr-heads", type=float, default=5e-5,
+                        help="Learning rate for output heads (policy, value, time, etc.) in finetune mode")
+    parser.add_argument("--freeze-layers", type=int, default=0,
+                        help="Number of transformer layers to freeze (from the bottom). 0 = freeze none.")
+    parser.add_argument("--dropout-override", type=float, default=None,
+                        help="Override dropout rate in model config (e.g. 0.2 for fine-tuning)")
+    parser.add_argument("--mix-general-data", type=str, default=None,
+                        help="Path to general training data dir. Mixes general data each epoch "
+                             "to prevent catastrophic forgetting (ratio set by --mix-ratio).")
+    parser.add_argument("--mix-ratio", type=float, default=0.2,
+                        help="Fraction of each epoch that comes from general data (0.0-1.0). Default: 0.2")
+    parser.add_argument("--val-data-dir", type=str, default=None,
+                        help="Separate directory for validation data (must contain train/ subdir with parquet files). "
+                             "If not set, validation is split from --data-dir using hash-based file assignment.")
     return parser.parse_args()
 
 
@@ -404,6 +424,7 @@ def train_one_epoch(
     run_dir: Path = None,
     resume_samples: int = 0,
     resume_micro_step: int = 0,
+    general_loader=None,
 ):
     model.train()
     totals = defaultdict(float)
@@ -419,7 +440,26 @@ def train_one_epoch(
     if resume_samples > 0:
         print(f"[train] Resuming epoch {epoch}: skipping {resume_samples:,} samples already processed")
 
+    # --- General data mixing setup ---
+    general_iter = None
+    mix_ratio = getattr(args, 'mix_ratio', 0.0) if general_loader is not None else 0.0
+    if general_loader is not None and mix_ratio > 0:
+        general_iter = iter(general_loader)
+        print(f"[train] Mixing {mix_ratio*100:.0f}% general data per epoch")
+
     for step, batch in enumerate(loader, start=1):
+        # --- General data mixing: probabilistically replace batch with general data ---
+        if general_iter is not None and mix_ratio > 0 and random.random() < mix_ratio:
+            try:
+                batch = next(general_iter)
+            except StopIteration:
+                # Restart general data iterator
+                general_iter = iter(general_loader)
+                try:
+                    batch = next(general_iter)
+                except StopIteration:
+                    pass  # Fall through to player data if general loader is empty
+
         batch = move_batch_to_device(batch, device, non_blocking)
 
         with autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
@@ -467,6 +507,8 @@ def train_one_epoch(
                 for name, value in metrics.items():
                     writer.add_scalar(f"train/{name}", value.item(), global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                if len(optimizer.param_groups) > 1:
+                    writer.add_scalar("train/lr_heads", optimizer.param_groups[1]["lr"], global_step)
 
                 elapsed = max(1e-6, time.perf_counter() - log_timer)
                 steps_since = max(1, global_step - last_log_step)
@@ -630,6 +672,102 @@ def load_checkpoint(path: Path, model, optimizer, scheduler=None, scaler=None, d
     return epoch, global_step, best_val_loss, run_dir, samples_consumed, micro_step
 
 
+def load_pretrained_weights(path: Path, model, device=None):
+    """Load only model weights from a checkpoint (for fine-tuning).
+    
+    Unlike load_checkpoint, this does NOT load optimizer, scheduler, or scaler state.
+    The model starts training fresh with a new optimizer, but initialized from
+    pretrained weights.
+    """
+    print(f"[finetune] Loading pretrained weights from {path}")
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    
+    model_state = checkpoint["model"]
+    try:
+        model.load_state_dict(model_state)
+    except RuntimeError:
+        # Handle torch.compile prefix
+        new_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
+        model.load_state_dict(new_state)
+    
+    config_name = checkpoint.get("config", "unknown")
+    # Backwards compat: strip legacy "-v2" suffix from old checkpoints
+    config_name = config_name.replace("-v2", "")
+    epoch = checkpoint.get("epoch", "?")
+    step = checkpoint.get("global_step", "?")
+    best_loss = checkpoint.get("best_val_loss", "?")
+    print(f"[finetune] Loaded {config_name} weights (epoch={epoch}, step={step}, best_val_loss={best_loss})")
+    print(f"[finetune] Optimizer/scheduler state NOT loaded (fresh training start)")
+
+
+# Head parameter name patterns — these get the higher learning rate in finetune mode
+_HEAD_PATTERNS = (
+    "policy_query", "policy_key", "policy_scale",
+    "resign_key", "flag_key",
+    "promo_bias_proj",
+    "start_square_head",
+    "value_head", "value_error_pool", "value_error_head",
+    "time_pooling", "time_head",
+)
+
+
+def build_finetune_param_groups(model, lr_backbone: float, lr_heads: float, 
+                                 weight_decay: float, freeze_layers: int = 0):
+    """Build parameter groups with discriminative learning rates for fine-tuning.
+    
+    Splits model parameters into:
+      - backbone (embeddings + transformer layers): lower LR
+      - heads (policy, value, time, promo, etc.): higher LR
+    
+    Optionally freezes the first N transformer layers entirely.
+    
+    Returns:
+        List of param group dicts for the optimizer.
+    """
+    backbone_params = []
+    head_params = []
+    frozen_count = 0
+    
+    for name, param in model.named_parameters():
+        # Check if this parameter belongs to a frozen layer
+        if freeze_layers > 0:
+            # Match patterns like "layers.0.", "layers.1.", etc.
+            # Also handle _orig_mod prefix from torch.compile
+            clean_name = name.replace("_orig_mod.", "")
+            is_frozen = False
+            for i in range(freeze_layers):
+                if f"layers.{i}." in clean_name:
+                    is_frozen = True
+                    break
+            if is_frozen:
+                param.requires_grad = False
+                frozen_count += 1
+                continue
+        
+        # Classify as head or backbone
+        is_head = any(pattern in name for pattern in _HEAD_PATTERNS)
+        if is_head:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+    
+    if frozen_count > 0:
+        print(f"[finetune] Frozen {frozen_count} parameters in first {freeze_layers} transformer layers")
+    
+    trainable_backbone = sum(p.numel() for p in backbone_params)
+    trainable_heads = sum(p.numel() for p in head_params)
+    total = trainable_backbone + trainable_heads
+    print(f"[finetune] Parameter groups:")
+    print(f"  Backbone: {trainable_backbone:,} params (lr={lr_backbone})")
+    print(f"  Heads:    {trainable_heads:,} params (lr={lr_heads})")
+    print(f"  Total trainable: {total:,}")
+    
+    return [
+        {"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay},
+        {"params": head_params, "lr": lr_heads, "weight_decay": weight_decay},
+    ]
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -643,20 +781,20 @@ def main() -> None:
 
     if args.config == "large":
         config = copy.deepcopy(CONFIG_LARGE)
-    elif args.config == "large-v2":
-        config = copy.deepcopy(CONFIG_LARGE_V2)
-    elif args.config == "small-v2":
-        config = copy.deepcopy(CONFIG_SMALL_V2)
     elif args.config == "tiny":
         config = copy.deepcopy(CONFIG_TINY)
-    elif args.config == "tiny-v2":
-        config = copy.deepcopy(CONFIG_TINY_V2)
     else:  # small (default)
         config = copy.deepcopy(CONFIG_SMALL)
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
         config['gradient_checkpointing'] = True
+    
+    # Apply dropout override for fine-tuning (modifies config before model creation)
+    if args.dropout_override is not None:
+        original_dropout = config.get('dropout', 0.1)
+        config['dropout'] = args.dropout_override
+        print(f"[config] Dropout override: {original_dropout} -> {args.dropout_override}")
     
     device = torch.device(args.device)
     configure_precision(device, args.disable_tf32)
@@ -676,6 +814,23 @@ def main() -> None:
             print(f"[train] torch.compile failed ({exc}); continuing without.")
     print(f"Using {args.config} config ({count_parameters(model):,} params, fp16 mixed precision)")
 
+    # --- Fine-tune: load pretrained weights BEFORE creating optimizer ---
+    if args.finetune:
+        pretrained_path = Path(args.pretrained) if args.pretrained else (Path(args.resume) if args.resume else None)
+        if pretrained_path is None:
+            raise ValueError("Fine-tune mode requires --pretrained or --resume to specify the pretrained checkpoint")
+        if not pretrained_path.exists():
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_path}")
+        load_pretrained_weights(pretrained_path, model, device)
+        
+        # Freeze layers if requested
+        # Build param groups with discriminative LRs
+        param_groups = build_finetune_param_groups(
+            model, args.lr_backbone, args.lr_heads, args.weight_decay, args.freeze_layers
+        )
+        # Re-count after freezing
+        print(f"[finetune] Trainable parameters after freezing: {count_parameters(model):,}")
+
     # Create dataloaders
     pin_memory = device.type == "cuda"
     non_blocking = pin_memory
@@ -688,8 +843,10 @@ def main() -> None:
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
+    val_data_source = args.val_data_dir if args.val_data_dir else args.data_dir
+    val_split_mode = 'train' if args.val_data_dir else 'val'  # If separate dir, load ALL files as val
     val_loader = create_dataloader(
-        args.data_dir, split='val',
+        val_data_source, split=val_split_mode,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=max(0, args.num_workers // 2),
@@ -697,19 +854,47 @@ def main() -> None:
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
 
+    # Optional: create general data loader for mixing (anti-catastrophic-forgetting)
+    general_loader = None
+    if args.mix_general_data:
+        general_data_path = Path(args.mix_general_data)
+        if not general_data_path.exists():
+            print(f"WARNING: --mix-general-data path {general_data_path} does not exist, skipping mixing")
+        else:
+            general_loader = create_dataloader(
+                str(general_data_path), split='train',
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=max(1, args.num_workers // 4),
+                pin_memory=pin_memory,
+                prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+            )
+            print(f"[finetune] General data mixing enabled: {args.mix_ratio*100:.0f}% from {general_data_path}")
+
     train_samples = count_samples(args.data_dir, 'train')
     val_samples = count_samples(args.data_dir, 'val')
     print(f"[dataset] Train samples: ~{train_samples:,} | Val samples: ~{val_samples:,}")
 
     # Optimizer
-    optimizer_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    optimizer_kwargs = {"weight_decay": args.weight_decay}
     if device.type == "cuda":
         optimizer_kwargs["fused"] = True
-    try:
-        optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
-    except TypeError:
-        optimizer_kwargs.pop("fused", None)
-        optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    
+    if args.finetune:
+        # Fine-tune: use discriminative LR param groups (lr is set per group)
+        try:
+            optimizer = torch.optim.AdamW(param_groups, **optimizer_kwargs)
+        except TypeError:
+            optimizer_kwargs.pop("fused", None)
+            optimizer = torch.optim.AdamW(param_groups, **optimizer_kwargs)
+    else:
+        # Normal training: single LR for all params
+        optimizer_kwargs["lr"] = args.lr
+        try:
+            optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+        except TypeError:
+            optimizer_kwargs.pop("fused", None)
+            optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
 
     # Scheduler
     approx_batches = max(1, math.ceil(train_samples / args.batch_size))
@@ -728,6 +913,8 @@ def main() -> None:
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     print(f"[scheduler] Linear warmup ({warmup_steps} steps) + cosine decay")
+    if args.finetune:
+        print(f"[scheduler] LR backbone: {args.lr_backbone} -> 0 | LR heads: {args.lr_heads} -> 0")
     
     # Mixed precision: use GradScaler for fp16 training
     scaler = GradScaler(enabled=device.type == "cuda")
@@ -740,7 +927,7 @@ def main() -> None:
     resume_samples = 0  # Samples already processed in current epoch
     resume_micro_step = 0  # Gradient accumulation step
 
-    if args.resume:
+    if args.resume and not args.finetune:
         resume_path = Path(args.resume)
         if not resume_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
@@ -785,6 +972,7 @@ def main() -> None:
                 epoch, global_step, args, non_blocking, profiler,
                 val_loader=val_loader, best_val_loss=best_val_loss, run_dir=run_dir,
                 resume_samples=resume_samples, resume_micro_step=resume_micro_step,
+                general_loader=general_loader,
             )
             
             # Reset resume state after first epoch (subsequent epochs start fresh)
@@ -824,8 +1012,9 @@ def main() -> None:
             ckpt_path = Path(args.checkpoint_dir) / f"chessformer_{args.config}_epoch{epoch:02d}.pt"
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, ckpt_path, args.config, run_dir, samples_consumed=0)
             
-            if val_stats['loss'] < best_val_loss:
-                best_val_loss = val_stats['loss']
+            val_loss = val_stats.get('loss', float('inf'))
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 best_path = Path(args.checkpoint_dir) / f"chessformer_{args.config}_best.pt"
                 save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, best_path, args.config, run_dir, samples_consumed=0)
 

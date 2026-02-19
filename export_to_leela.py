@@ -944,7 +944,7 @@ def main():
     )
     parser.add_argument(
         "--config", type=str, default="auto",
-        help="Model config: auto, tiny, small, large, tiny-v2, small-v2, large-v2"
+        help="Model config: auto, tiny, small, large"
     )
     parser.add_argument(
         "--device", type=str, default="cpu",
@@ -957,6 +957,19 @@ def main():
     parser.add_argument(
         "--model-py", type=str, default=None,
         help="Path to model.py (auto-detected from checkpoint dir)"
+    )
+    parser.add_argument(
+        "--elo", type=int, default=None,
+        help="Override DEFAULT_ELO for the exported model (default: 2300). "
+             "Set to the target player's rating for fine-tuned models."
+    )
+    parser.add_argument(
+        "--clock-seconds", type=float, default=None,
+        help="Override DEFAULT_CLOCK_S for the exported model (default: 300.0)"
+    )
+    parser.add_argument(
+        "--increment-seconds", type=float, default=None,
+        help="Override DEFAULT_INC_S for the exported model (default: 0.0)"
     )
     args = parser.parse_args()
 
@@ -994,6 +1007,17 @@ def main():
 
     # Create adapter
     adapter = MarvinLeelaAdapter(loaded.model).to(args.device)
+    
+    # Apply CLI overrides for conditioning defaults
+    if args.elo is not None:
+        adapter.DEFAULT_ELO = args.elo
+        print(f"[export] ELO override: {args.elo}")
+    if args.clock_seconds is not None:
+        adapter.DEFAULT_CLOCK_S = args.clock_seconds
+        print(f"[export] Clock override: {args.clock_seconds}s")
+    if args.increment_seconds is not None:
+        adapter.DEFAULT_INC_S = args.increment_seconds
+        print(f"[export] Increment override: {args.increment_seconds}s")
 
     # Quick sanity check
     print("Running sanity check...")
@@ -1034,8 +1058,9 @@ def main():
     print("  - Input format is INPUT_CLASSICAL_112_PLANE (no board canonicalization)")
     print("  - En passant info is NOT available in classical format")
     print("    (for EP support, need to modify for castling-plane format)")
-    print("  - ELO is hardcoded to 2300, clock to 300+0 (Blitz)")
-    print("  - Time history, increment, ply are hardcoded defaults")
+    print(f"  - ELO is set to {adapter.DEFAULT_ELO}, clock to {adapter.DEFAULT_CLOCK_S:.0f}+{adapter.DEFAULT_INC_S:.0f}")
+    print("  - Use --elo, --clock-seconds, --increment-seconds to change")
+    print("  - Time history, ply are hardcoded defaults")
     print("  - The model's time/style heads are not exposed to lc0")
     print("=" * 60)
 

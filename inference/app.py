@@ -11,7 +11,6 @@ import chess
 import chess.svg
 from flask import Flask, render_template, render_template_string, request, jsonify, Response
 import time
-import os
 
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_S, START_CLOCK_S
 
@@ -20,22 +19,16 @@ from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_
 # =============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(description="Marvin Chess Inference Server")
-    parser.add_argument("--large", action="store_true",
-                        help="Use the large model (marvin_large.pt). Default is small.")
-    parser.add_argument("--tiny", action="store_true",
-                        help="Use the tiny model (marvin_tiny.pt). Default is small.")
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Path to model weights (.pt file). "
+                             "Default: inference/marvin_large.pt")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to run the server on (default: 5000)")
     return parser.parse_args()
 
-# Parse args early so we can set env vars before config is imported
+# Parse args early so we can resolve checkpoint path before imports
 _cli_args = parse_args()
-if _cli_args.large:
-    os.environ["MARVIN_MODEL"] = "marvin_large.pt"
-elif _cli_args.tiny:
-    os.environ["MARVIN_MODEL"] = "marvin_tiny.pt"
-else:
-    os.environ["MARVIN_MODEL"] = "marvin_small.pt"
+
 from inference.engine_logic import analyze_position as analyze_position_core
 from inference.engine_logic import choose_engine_move as choose_engine_move_core
 from inference.runtime import (
@@ -61,10 +54,16 @@ from inference.encoding import ContextOptions, build_history_from_position, cano
 from inference.chessformer_policy import choose_move
 from inference.mcts import MCTSSettings, mcts_choose_move
 from inference.sampling import sample_from_logits
-from inference.config import get_model_name, print_config
+from inference.config import print_config
+
+# Resolve checkpoint path from CLI arg or default
+_checkpoint_path_arg = Path(_cli_args.weights) if _cli_args.weights else None
 
 print("Loading model...")
-print_config(repo_root)
+if _checkpoint_path_arg:
+    print(f"Weights: {_checkpoint_path_arg}")
+else:
+    print_config(repo_root)
 
 # Device selection: allow overriding via settings (auto|cuda|cpu)
 device_pref = str(game_settings.get("device", "auto")).lower()
@@ -94,15 +93,14 @@ if device.type == "cuda":
 else:
     print(f"[inference] Device selected: {device}")
 
-# Model/config selected via inference/config.py or env vars:
-#   MARVIN_MODEL=marvin_token_bf16.pt
-#   MARVIN_CONFIG=auto
+# Model loaded with auto-detected config from checkpoint weights
 loaded, model, _checkpoint_path = load_default_chessformer(
     repo_root=repo_root, 
     device=device,
+    checkpoint_path=_checkpoint_path_arg,
 )
 device = loaded.device
-print(f"Model loaded: {get_model_name()} (config: {loaded.config_name})")
+print(f"Model loaded: {_checkpoint_path.name} (config: {loaded.config_name})")
 print(f"[inference] Model device: {device}")
 
 # Handle torch.compile wrapper for metadata inspection

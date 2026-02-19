@@ -1,112 +1,81 @@
 # Marvin Chess
 
-<!-- Badges -->
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/holymolyyy/marvin)
 
-Marvin is a **human-like** chess transformer trained on millions of [Lichess](https://lichess.org) games. Unlike traditional engines that seek the absolute best move, Marvin is designed to mimic human play styles across skill levels (1200–2500 Elo).
-
-It is **time-aware**, meaning it adapts its play based on remaining clock time, opponent rating, and time control.
-
-## Architecture
-
-Marvin uses a transformer architecture with token-based conditioning, using techniques from [Leela Chess Zero](https://lczero.org/blog/2024/02/transformer-progress/) and Daniel Monroe's "[Mastering Chess with a Transformer Model](https://arxiv.org/abs/2409.12272)".
-
-Context (Elo, clock, time control) is injected via 6 conditioning tokens prepended to the 64 square tokens. The model produces three primary outputs:
-1.  **Policy**: Move probabilities (including resign/flag).
-2.  **Time**: A 256-bin classification for predicted thinking time.
-3.  **Value**: Win/Draw/Loss probabilities.
-
-### Model Sizes
-*   **Small** (`CONFIG_SMALL`): ~**23M parameters**. Compact and fast; the default for inference.
-*   **Large** (`CONFIG_LARGE`): ~**108M parameters**. Higher capacity for increased playing strength at a higher compute cost.
-
-## Results
-
-Marvin (23M params) has been evaluated against state-of-the-art human-mimicking models.
+Marvin is a **human-like** chess transformer trained on millions of [Lichess](https://lichess.org) games. Instead of playing the best move, it mimics human play across skill levels (1200-2400 Elo) and adapts to clock time and time control.
 
 <p align="center">
   <img src="docs/accuracy_comparison.png" width="700" alt="Move Matching Accuracy">
   <br>
-  <em><b>Figure 1:</b> Human move-matching accuracy comparison with <a href="https://arxiv.org/abs/2409.20553">Maia2</a> and <a href="https://arxiv.org/abs/2410.03893">Allie</a>.</em>
+  <em>Human move-matching accuracy vs <a href="https://arxiv.org/abs/2409.20553">Maia2</a> and <a href="https://arxiv.org/abs/2410.03893">Allie</a>.</em>
 </p>
 
+## Architecture
 
+Transformer with 6 conditioning tokens (Elo, clock, time control) prepended to 64 square tokens. Outputs: policy, value (WDL), and predicted thinking time.
 
-### Web Interface
-The project includes a GUI for seeing prediction distributions, live parameter tweaking, experimenting, and playing against the model.
-
-<p align="center">
-  <img src="docs/app_screenshot.png" width="800" alt="Web Interface">
-  <br>
-  <em><b>Figure 2:</b> The local web interface.</em>
-</p>
+Two sizes:
+- **Large** (~49M params) - full quality
+- **Tiny** (~5M params) - fast and lightweight
 
 ## Installation
-
-Tested on Linux/WSL with Python 3.10+.
 
 ```bash
 git clone https://github.com/zingalorp/marvin-chess.git
 cd marvin-chess
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ## Usage
 
-**Web interface:**
-```bash
-python -m inference.app
-```
-
-**UCI engine (PyTorch):**
-```bash
-python -m inference.uci_engine
-```
-
-**UCI engine (ONNX - lightweight, no PyTorch required):**
-```bash
-python -m inference.uci_onnx
-```
-
-The ONNX engine only requires `onnxruntime`, `chess`, and `numpy` - no PyTorch needed at runtime. For GPU acceleration, install `onnxruntime-gpu` instead.
-
-## ONNX Export
-
-To export the model to ONNX format for faster/lighter deployment:
-
-```bash
-python scripts/export_onnx.py
-```
-
-This creates two files in `inference/`:
-- `marvin_small.onnx` - The model graph (~1 MB)
-- `marvin_small.onnx.data` - The weights (~100 MB)
-
-Both files are required and must be kept together.
-
-
-## Play on Lichess
-
-You can challenge the Marvin bots directly on Lichess:
-
-*   [Marvin-1200](https://lichess.org/@/marvin-1200)
-*   [Marvin-1600](https://lichess.org/@/marvin-1600)
-*   [Marvin-2000](https://lichess.org/@/marvin-2000)
-*   [Marvin-2400](https://lichess.org/@/marvin-2400)
+| Mode | Command | Weights | Notes |
+|---|---|---|---|
+| Web interface | `python -m inference.app` | `.pt` | Full parameter control via UI |
+| UCI engine | `python -m inference.uci_engine` | `.pt` | All conditioning as UCI options |
+| UCI engine (no PyTorch) | `python -m inference.uci_onnx` | `.onnx` | Export first with `scripts/export_onnx.py` |
+| lc0 / chess GUI | see below | `.pb.gz` | Elo fixed per file, no Python needed |
 
 ## Model Weights
 
-Pretrained model weights are available on [Hugging Face](https://huggingface.co/holymolyyy/marvin).
+All weights are on [Hugging Face](https://huggingface.co/holymolyyy/marvin).
+
+- **`.pt`** - Native PyTorch checkpoints (`marvin_large.pt`, `marvin_tiny.pt`). Used by the app and UCI engine. All conditioning adjustable at runtime.
+- **`.onnx`** - Exported from `.pt` for use without PyTorch. Generated via `python scripts/export_onnx.py`.
+- **`.pb.gz`** - For use with [Leela Chess Zero](https://lczero.org). One file per Elo level (1600-2500 in steps of 100), with Elo baked in at export time.
+
+## Using Marvin with lc0
+
+The `.pb.gz` files drop into lc0 like any other weight file, as long as you use an **ONNX build** of lc0. The standard CUDA/DNNL builds use lc0's native backend and will not work.
+
+**Windows:** Download `lc0-vX.X.X-windows-onnx-dml.zip` from the [lc0 releases](https://github.com/LeelaChessZero/lc0/releases). Drop the `.pb.gz` into the lc0 folder, add lc0 as an engine in your GUI, and point it at the weights file. Works on any GPU and falls back to CPU automatically.
+
+**Linux:** No pre-built ONNX binary is available. Build lc0 from source with ONNX Runtime:
+```bash
+git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git && cd lc0
+./build.sh -Donnx_include=<ORT_PATH>/include -Donnx_libdir=<ORT_PATH>/lib
+```
+
+**Recommended lc0 settings:**
+
+| Option | Value | Notes |
+|---|---|---|
+| nodes | `1` | Policy-only play; can be increased for stronger play|
+| `--backend` | `onnx-cuda` or `onnx-cpu` | Required |
+| `--threads` | `1` | More threads reduces GPU throughput |
+| `--PolicyTemperature` | `0.0-1.0` | Lower = less random |
+
+## Play on Lichess
+
+[marvin-1200](https://lichess.org/@/marvin-1200) / [marvin-1600](https://lichess.org/@/marvin-1600) / [marvin-2000](https://lichess.org/@/marvin-2000) / [marvin-2400](https://lichess.org/@/marvin-2400)
 
 ## Acknowledgments
 
 - [Lichess](https://lichess.org) for training data and bot infrastructure
-- [Leela Chess Zero](https://lczero.org) for architectural techniques
-- [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework (integration is maintained separately)
+- [Leela Chess Zero](https://lczero.org) for architectural inspiration and the MCTS inference framework
+- [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) for the bot framework
 - [Chessground](https://github.com/lichess-org/chessground) for the web board UI
 
 ## License
