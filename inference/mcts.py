@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import time
@@ -10,6 +10,9 @@ import chess
 
 from inference.chessformer_policy import PolicyOutput
 from inference.encoding import ContextOptions, HISTORY_LEN, canonicalize, encode_board, make_model_batch
+
+if TYPE_CHECKING:
+    from inference.runtime import InferenceBackend
 
 
 _PROMO_INDEX = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
@@ -113,12 +116,11 @@ def _time_bin_mid_seconds(bin_idx: torch.Tensor, *, active_clock_s: torch.Tensor
 
 def _evaluate_position(
     *,
-    model: torch.nn.Module,
+    backend: "InferenceBackend",
     board: chess.Board,
     ctx: ContextOptions,
     root_turn: chess.Color,
     time_history_s: list[float] | None,
-    device: torch.device,
     contempt: float = 0.0,
 ) -> Tuple[Dict[chess.Move, float], float, float]:
     """Returns (priors over legal real moves, value for side-to-move, expected ponder time seconds)."""
@@ -133,12 +135,10 @@ def _evaluate_position(
         repetition_flags=repetition_flags,
         time_history_s=time_history_s,
         ctx=eff_ctx,
-        device=device,
+        device=backend.device,
     )
 
-    with torch.inference_mode():
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            move_logits, _v_raw, v_cls, _v_err, t_logits, _ss_logits, promo_logits = model(batch, return_promo=True)
+    move_logits, _v_raw, v_cls, _v_err, t_logits, _ss_logits, promo_logits = backend(batch, return_promo=True)
 
     move_logits = move_logits[0]  # (4098,)
     promo_p = torch.softmax(promo_logits[0].float(), dim=-1)  # (8,4)
@@ -188,108 +188,6 @@ def _evaluate_position(
     return priors, value, exp_time_s
 
 
-def _evaluate_positions_batch(
-    *,
-    model: torch.nn.Module,
-    boards: list[chess.Board],
-    ctx: ContextOptions,
-    root_turn: chess.Color,
-    time_histories_s: list[list[float] | None],
-    device: torch.device,
-    contempt: float = 0.0,
-) -> Tuple[list[Dict[chess.Move, float]], list[float], list[float]]:
-    """Batched version of `_evaluate_position`.
-
-    Returns:
-        priors_list: list of dicts mapping real legal moves -> prob
-        values: list of values from perspective of side-to-move at each board
-    """
-
-    if len(boards) != len(time_histories_s):
-        raise ValueError("boards and time_histories_s must have same length")
-    if not boards:
-        return [], []
-
-    batches: list[dict[str, torch.Tensor]] = []
-    canonicals: list[chess.Board] = []
-    real_turns: list[chess.Color] = []
-
-    for b, th in zip(boards, time_histories_s):
-        board_history, repetition_flags = _history_from_board(b)
-        eff_ctx = _ctx_for_side_to_move(ctx, root_turn=root_turn, node_turn=b.turn, halfmove_clock=int(b.halfmove_clock))
-        batches.append(
-            make_model_batch(
-                board=b,
-                board_history=board_history,
-                repetition_flags=repetition_flags,
-                time_history_s=th,
-                ctx=eff_ctx,
-                device=device,
-            )
-        )
-        real_turns.append(b.turn)
-        canonicals.append(canonicalize(b))
-
-    merged: dict[str, torch.Tensor] = {}
-    keys = list(batches[0].keys())
-    for k in keys:
-        merged[k] = torch.cat([bb[k] for bb in batches], dim=0)
-
-    with torch.inference_mode():
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            move_logits, _v_raw, v_cls, _v_err, t_logits, _ss_logits, promo_logits = model(merged, return_promo=True)
-
-    promo_p = torch.softmax(promo_logits.float(), dim=-1)  # (B,8,4)
-    wdl = torch.softmax(v_cls.float(), dim=-1)  # (B,3) ordered [L,D,W]
-    # Apply contempt: value = P(win) - P(loss) - contempt * P(draw)
-    values = (wdl[:, 2] - wdl[:, 0] - contempt * wdl[:, 1]).detach().cpu().numpy().astype(np.float64).tolist()
-
-    # Deterministic expected ponder time for each board (seconds).
-    # Need per-board active_clock_s after side-to-move alignment.
-    # eff_ctx is already used in make_model_batch; recompute active clocks here from ctx + turns.
-    active_clocks: list[float] = []
-    for b in boards:
-        eff_ctx = _ctx_for_side_to_move(ctx, root_turn=root_turn, node_turn=b.turn, halfmove_clock=int(b.halfmove_clock))
-        active_clocks.append(float(eff_ctx.active_clock_s))
-
-    t_probs = torch.softmax(t_logits.float(), dim=-1)  # (B,256)
-    bin_idx = torch.arange(t_probs.shape[-1], device=t_probs.device, dtype=torch.float32).view(1, -1)
-    active_clock_t = torch.tensor(active_clocks, device=t_probs.device, dtype=torch.float32).view(-1, 1)
-    bin_seconds = _time_bin_mid_seconds(bin_idx, active_clock_s=active_clock_t)
-    exp_times = torch.sum(t_probs * bin_seconds, dim=-1).detach().cpu().numpy().astype(np.float64).tolist()
-
-    priors_list: list[Dict[chess.Move, float]] = []
-
-    for i, canonical in enumerate(canonicals):
-        logits: list[float] = []
-        moves: list[chess.Move] = []
-
-        for mv in canonical.legal_moves:
-            base_idx = mv.from_square * 64 + mv.to_square
-            logit = float(move_logits[i, base_idx].item())
-            if mv.promotion is not None and 56 <= mv.to_square <= 63:
-                file_idx = mv.to_square - 56
-                p_idx = _PROMO_INDEX.get(mv.promotion, 0)
-                promo_prob = float(promo_p[i, file_idx, p_idx].item())
-                logit += float(np.log(max(1e-8, promo_prob)))
-
-            real_mv = _canonical_to_real_move(mv, real_turns[i])
-            moves.append(real_mv)
-            logits.append(logit)
-
-        if not moves:
-            priors_list.append({})
-            continue
-
-        x = np.array(logits, dtype=np.float64)
-        x = x - float(np.max(x))
-        probs = np.exp(x)
-        probs = probs / float(np.sum(probs) + 1e-12)
-        priors_list.append({mv: float(p) for mv, p in zip(moves, probs)})
-
-    return priors_list, [float(v) for v in values], [float(t) for t in exp_times]
-
-
 @dataclass
 class MCTSSettings:
     simulations: int = 256
@@ -312,10 +210,6 @@ class MCTSSettings:
     # as the value term (in the *parent player's* perspective) instead of implicitly using 0.0.
     # Set to 0.0 to keep legacy behavior.
     fpu_reduction: float = 0.20
-
-    # Leaf parallelism
-    leaf_batch_size: int = 1
-    virtual_loss: float = 1.0
 
     # Tree reuse: if True, preserve tree across searches for the same game
     tree_reuse: bool = False
@@ -492,11 +386,10 @@ def _prune_priors(priors: Dict[chess.Move, float], *, max_children: int) -> Dict
 
 def mcts_choose_move(
     *,
-    model: torch.nn.Module,
+    backend: "InferenceBackend",
     board: chess.Board,
     ctx: ContextOptions,
     time_history_s: list[float] | None,
-    device: torch.device,
     settings: MCTSSettings,
     rng: Optional[np.random.Generator] = None,
     stop_check: Callable[[], bool] | None = None,
@@ -552,12 +445,11 @@ def mcts_choose_move(
 
         # Root expansion (only if not reusing)
         priors, root_value, root_time_s = _evaluate_position(
-            model=model,
+            backend=backend,
             board=board,
             ctx=ctx,
             root_turn=root_turn,
             time_history_s=time_history_s,
-            device=device,
             contempt=float(settings.contempt),
         )
         root.pred_time_s = float(root_time_s)
@@ -604,8 +496,6 @@ def mcts_choose_move(
     # Run simulations
     sims = max(1, int(settings.simulations))
     max_depth = max(1, int(settings.max_depth))
-    leaf_batch_size = max(1, int(getattr(settings, "leaf_batch_size", 1)))
-    vloss = float(getattr(settings, "virtual_loss", 1.0))
 
     # Lightweight diagnostics counters (minimal overhead)
     done = 0
@@ -615,106 +505,61 @@ def mcts_choose_move(
         if stop_check is not None and stop_check():
             break
 
-        batch_n = min(leaf_batch_size, sims - done)
+        # --- Select a leaf ---
+        node = root
+        b = board.copy(stack=True)
+        th = list(time_history_s) if time_history_s is not None else None
+        path: list[_Node] = [node]
 
-        # Select up to `batch_n` leaves while applying virtual loss to discourage collisions.
-        leaves: list[tuple[list[_Node], _Node, chess.Board, list[float] | None, Optional[float]]] = []
-        for _ in range(batch_n):
-            if stop_check is not None and stop_check():
-                break
-            node = root
-            b = board.copy(stack=True)
-            th = list(time_history_s) if time_history_s is not None else None
-            path: list[_Node] = [node]
-
-            depth = 0
-            while node.expanded and node.children and depth < max_depth:
-                mv, child = _select_child(
-                    node,
-                    c_puct=float(settings.c_puct),
-                    fpu_reduction=float(getattr(settings, "fpu_reduction", 0.0)),
-                )
-                b.push(mv)
-                if th is not None:
-                    th = [float(getattr(node, "pred_time_s", 0.0))] + th[:-1]
-                node = child
-                path.append(node)
-                depth += 1
-
-                tv = _terminal_value_for_side_to_move(b)
-                if tv is not None:
-                    break
+        depth = 0
+        while node.expanded and node.children and depth < max_depth:
+            mv, child = _select_child(
+                node,
+                c_puct=float(settings.c_puct),
+                fpu_reduction=float(getattr(settings, "fpu_reduction", 0.0)),
+            )
+            b.push(mv)
+            if th is not None:
+                th = [float(getattr(node, "pred_time_s", 0.0))] + th[:-1]
+            node = child
+            path.append(node)
+            depth += 1
 
             tv = _terminal_value_for_side_to_move(b)
+            if tv is not None:
+                break
 
-            # Apply virtual loss along the selected path (from each node's side-to-move perspective).
-            # This makes subsequent selections in this batch less likely to pick the same line.
-            for n in path:
-                n.visit_count += 1
-                n.value_sum += -vloss
+        tv = _terminal_value_for_side_to_move(b)
 
-            leaves.append((path, node, b, th, tv))
-
-        # Evaluate all non-terminal leaves in a single forward pass.
-        eval_boards: list[chess.Board] = []
-        eval_th: list[list[float] | None] = []
-        eval_map: list[int] = []
-        for i, (_path, _node, b, th, tv) in enumerate(leaves):
-            if tv is None:
-                eval_boards.append(b)
-                eval_th.append(th)
-                eval_map.append(i)
-
-        eval_priors: list[Dict[chess.Move, float]] = []
-        eval_values: list[float] = []
-        eval_times: list[float] = []
-        if eval_boards:
-            eval_priors, eval_values, eval_times = _evaluate_positions_batch(
-                model=model,
-                boards=eval_boards,
+        # --- Evaluate the leaf ---
+        if tv is not None:
+            leaf_value = float(tv)
+        else:
+            priors2, leaf_value, leaf_time_s = _evaluate_position(
+                backend=backend,
+                board=b,
                 ctx=ctx,
                 root_turn=root_turn,
-                time_histories_s=eval_th,
-                device=device,
+                time_history_s=th,
                 contempt=float(settings.contempt),
             )
+            node.pred_time_s = float(leaf_time_s)
 
-        # Commit expansions + backups, removing virtual loss first.
-        eval_idx = 0
-        for i, (path, leaf_node, _b, _th, tv) in enumerate(leaves):
-            if tv is not None:
-                leaf_value = float(tv)
-            else:
-                priors2 = eval_priors[eval_idx]
-                leaf_value = float(eval_values[eval_idx])
-                leaf_time_s = float(eval_times[eval_idx])
-                eval_idx += 1
+            priors2 = _prune_priors(priors2, max_children=int(settings.max_children))
+            if not node.expanded:
+                for mv2, p2 in priors2.items():
+                    node.children[mv2] = _Node(p2)
+                node.expanded = True
+                node_count += len(priors2)
 
-                leaf_node.pred_time_s = leaf_time_s
+        # --- Backup ---
+        v = leaf_value
+        for n in reversed(path):
+            n.visit_count += 1
+            n.value_sum += v
+            v = -v
 
-                priors2 = _prune_priors(priors2, max_children=int(settings.max_children))
-                if not leaf_node.expanded:
-                    for mv2, p2 in priors2.items():
-                        leaf_node.children[mv2] = _Node(p2)
-                    leaf_node.expanded = True
-                    node_count += len(priors2)
-
-            # Remove the virtual loss applied during selection.
-            for n in path:
-                n.visit_count -= 1
-                n.value_sum -= -vloss
-
-            # Backup real evaluation (flip perspective each ply)
-            v = leaf_value
-            for n in reversed(path):
-                n.visit_count += 1
-                n.value_sum += v
-                v = -v
-
-        if not leaves:
-            break
-
-        done += len(leaves)
+        done += 1
         
         # Call progress callback with current stats
         if progress_callback is not None and root.children:

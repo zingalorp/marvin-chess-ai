@@ -5,6 +5,7 @@ import threading
 import time
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,28 +16,8 @@ import chess
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, START_CLOCK_S
 from inference.engine_logic import choose_engine_move, analyze_position
 from inference.mcts import MCTSResult, _Node
-from inference.runtime import load_default_chessformer
-from inference.config import get_model_name, print_config, get_model_path, get_config_name
-
-
-# =============================================================================
-# CLI ARGUMENT PARSING
-# =============================================================================
-def _parse_args():
-    parser = argparse.ArgumentParser(description="Marvin UCI Engine")
-    parser.add_argument("--large", action="store_true",
-                        help="Use the large model (marvin_large.pt). Default is small.")
-    parser.add_argument("--tiny", action="store_true",
-                        help="Use the tiny model (marvin_tiny.pt). Default is small.")
-    return parser.parse_args()
-
-_cli_args = _parse_args()
-if _cli_args.large:
-    os.environ["MARVIN_MODEL"] = "marvin_large.pt"
-elif _cli_args.tiny:
-    os.environ["MARVIN_MODEL"] = "marvin_tiny.pt"
-else:
-    os.environ["MARVIN_MODEL"] = "marvin_small.pt"
+from inference.runtime import load_default_backend, InferenceBackend
+from inference.backend import PyTorchBackend
 
 
 def _bool_from_uci(value: str) -> bool:
@@ -66,15 +47,14 @@ class _Option:
 
 
 class UciEngine:
-    def __init__(self) -> None:
+    def __init__(self, checkpoint_path: Path | None = None) -> None:
         # Load model without compilation for fast startup.
         # Compilation happens lazily in isready if CompileModel option is true.
-        # Model/config selected via inference/config.py or env vars:
-        #   MARVIN_MODEL=marvin_token_bf16.pt
-        #   MARVIN_CONFIG=auto
-        self.loaded, self.model, _ckpt = load_default_chessformer(compile_model=False)
+        self.backend, _ckpt = load_default_backend(
+            compile_model=False, checkpoint_path=checkpoint_path,
+        )
         self._model_compiled = False
-        print(f"# Model: {get_model_name()} (config: {self.loaded.config_name})", file=sys.stderr)
+        print(f"# Model: {_ckpt.name} (config: {self.backend.config_name}, backend: {self.backend.kind})", file=sys.stderr)
         
         # By default use a non-deterministic seed so separate engine processes
         # produce different sampled moves. Set the env var `MARVIN_DETERMINISTIC`
@@ -131,16 +111,19 @@ class UciEngine:
         self.options = self._build_options()
 
     def _maybe_compile_model(self) -> None:
-        """Compile model with torch.compile if CompileModel option is enabled."""
+        """Compile model with torch.compile if CompileModel option is enabled (PyTorch only)."""
         if self._model_compiled:
             return
         if not self.settings.get("compile_model", False):
+            return
+        if not isinstance(self.backend, PyTorchBackend):
+            self._model_compiled = True  # Nothing to compile for ONNX
             return
         
         print("Compiling model with torch.compile...", file=sys.stderr)
         start = time.time()
         try:
-            self.model = torch.compile(self.model)
+            self.backend._model = torch.compile(self.backend._model)
             self._model_compiled = True
             elapsed = time.time() - start
             print(f"Model compilation complete in {elapsed:.1f}s", file=sys.stderr)
@@ -198,7 +181,6 @@ class UciEngine:
             _Option("MCTSFinalTemperature", "string", str(self.settings["mcts_final_temperature"])),
             _Option("MCTSFinalTopP", "string", str(self.settings.get("mcts_final_top_p", 1.0))),
             _Option("MCTSMaxDepth", "spin", int(self.settings["mcts_max_depth"]), min=1, max=512),
-            _Option("MCTSLeafBatchSize", "spin", int(self.settings.get("mcts_leaf_batch_size", 1)), min=1, max=1024),
             _Option("MCTSAdaptive", "check", bool(self.settings["mcts_adaptive"])),
             _Option("MCTSAdaptiveScale", "string", str(self.settings["mcts_adaptive_scale"])),
             _Option("MCTSFPU", "string", str(self.settings.get("mcts_fpu_reduction", 0.0))),
@@ -295,8 +277,7 @@ class UciEngine:
                     time_hist = self._time_history_last8_newest_first()
                     
                     est_stats = analyze_position(
-                        model=self.model,
-                        device=self.loaded.device,
+                        backend=self.backend,
                         settings=self.settings,
                         rng=self.rng,
                         board=self.board,
@@ -488,8 +469,6 @@ class UciEngine:
             set_setting("mcts_final_top_p", float(value))
         elif name_key == "mctsmaxdepth":
             set_setting("mcts_max_depth", int(float(value)))
-        elif name_key == "mctsleafbatchsize":
-            set_setting("mcts_leaf_batch_size", max(1, int(float(value))))
         elif name_key == "mctsadaptive":
             set_setting("mcts_adaptive", _bool_from_uci(value))
         elif name_key == "mctsadaptivescale":
@@ -670,8 +649,7 @@ class UciEngine:
                 self._print(f"info string using real opponent rating: {self._real_opponent_rating}")
 
             out, engine_stats, _mcts_stats, mcts_result = choose_engine_move(
-                model=self.model,
-                device=self.loaded.device,
+                backend=self.backend,
                 settings=self.settings,
                 rng=self.rng,
                 board=board,
@@ -993,22 +971,14 @@ class UciEngine:
 
 
 def main() -> None:
-    import argparse
     parser = argparse.ArgumentParser(description="Marvin UCI Engine")
-    parser.add_argument("--large", action="store_true", help="Use large model")
-    parser.add_argument("--small", action="store_true", help="Use small model")
-    parser.add_argument("--tiny", action="store_true", help="Use tiny model")
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Path to model weights (.pt or .onnx). "
+                             "Default: inference/marvin_small.onnx")
     args = parser.parse_args()
 
-    # Set env vars so config.py picks them up before UciEngine.__init__
-    if args.large:
-        os.environ.setdefault("MARVIN_MODEL", "marvin_large.pt")
-    elif args.tiny:
-        os.environ.setdefault("MARVIN_MODEL", "marvin_tiny.pt")
-    elif args.small:
-        os.environ.setdefault("MARVIN_MODEL", "marvin_small.pt")
-
-    engine = UciEngine()
+    weights = Path(args.weights) if args.weights else None
+    engine = UciEngine(checkpoint_path=weights)
     engine.loop()
 
 

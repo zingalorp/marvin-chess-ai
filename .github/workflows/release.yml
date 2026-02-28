@@ -61,105 +61,31 @@ jobs:
       
       - name: Build release package
         run: |
-          python scripts/build_release.py --version ${{ steps.version.outputs.version }}
+          VERSION=${{ steps.version.outputs.version }}
+          STAGING=dist/marvin-v${VERSION}
+          mkdir -p ${STAGING}/inference
+          # Copy inference package
+          cp inference/*.py ${STAGING}/inference/
+          cp inference/marvin_small.onnx ${STAGING}/inference/
+          [ -f inference/marvin_small.onnx.data ] && cp inference/marvin_small.onnx.data ${STAGING}/inference/
+          # Copy top-level files
+          cp requirements.txt ${STAGING}/
+          echo "${VERSION}" > ${STAGING}/VERSION
+          # Create zip
+          cd dist && zip -r marvin-v${VERSION}.zip marvin-v${VERSION}/
       
       - name: Upload Python package
         uses: actions/upload-artifact@v4
         with:
-          name: marvin-onnx-python-v${{ steps.version.outputs.version }}
-          path: dist/marvin-onnx-v${{ steps.version.outputs.version }}.zip
+          name: marvin-v${{ steps.version.outputs.version }}
+          path: dist/marvin-v${{ steps.version.outputs.version }}.zip
 
-  # Build Windows executable (standalone, no Python needed)
-  build-windows-exe:
-    runs-on: windows-latest
-    needs: build-python
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements.txt
-          pip install onnx onnxruntime onnxscript pyinstaller
-      
-      - name: Download Model Weights
-        run: |
-          curl -L -o inference/marvin_small.pt https://huggingface.co/holymolyyy/marvin/resolve/main/marvin_small.pt
-        shell: bash
-      
-      - name: Export ONNX model
-        run: python scripts/export_onnx.py --device cpu
-        env:
-          PYTHONIOENCODING: utf-8
-      
-      - name: Build executable
-        run: python scripts/build_executable.py --version ${{ needs.build-python.outputs.version }} --no-zip
-      
-      - name: Create Windows archive
-        run: |
-          Compress-Archive -Path dist/marvin-onnx/* -DestinationPath dist/marvin-onnx-windows-v${{ needs.build-python.outputs.version }}.zip
-        shell: pwsh
-      
-      - name: Upload Windows executable
-        uses: actions/upload-artifact@v4
-        with:
-          name: marvin-onnx-windows-v${{ needs.build-python.outputs.version }}
-          path: dist/marvin-onnx-windows-v${{ needs.build-python.outputs.version }}.zip
 
-  # Build Linux executable (standalone, no Python needed)
-  build-linux-exe:
-    runs-on: ubuntu-latest
-    needs: build-python
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements.txt
-          pip install onnx onnxruntime onnxscript pyinstaller
-      
-      - name: Download Model Weights
-        run: |
-          curl -L -o inference/marvin_small.pt https://huggingface.co/holymolyyy/marvin/resolve/main/marvin_small.pt
-        shell: bash
-      
-      - name: Export ONNX model
-        run: python scripts/export_onnx.py --device cpu
-      
-      - name: Build executable
-        run: python scripts/build_executable.py --version ${{ needs.build-python.outputs.version }} --no-zip
-      
-      - name: Create Linux archive
-        run: |
-          cd dist && tar -czvf marvin-onnx-linux-v${{ needs.build-python.outputs.version }}.tar.gz marvin-onnx/
-      
-      - name: Upload Linux executable
-        uses: actions/upload-artifact@v4
-        with:
-          name: marvin-onnx-linux-v${{ needs.build-python.outputs.version }}
-          path: dist/marvin-onnx-linux-v${{ needs.build-python.outputs.version }}.tar.gz
 
   # Create GitHub Release
   release:
     runs-on: ubuntu-latest
-    needs: [build-python, build-windows-exe, build-linux-exe]
+    needs: [build-python]
     if: startsWith(github.ref, 'refs/tags/v')
     
     steps:
@@ -182,29 +108,17 @@ jobs:
             
             A human-like chess engine that mimics play styles across skill levels (1200-2400 Elo).
             
-            > **Note**: This release uses ONNX Runtime for **CPU inference only**. GPU acceleration is not included in the standalone executables. For GPU support, use the PyTorch-based engine from the source repository.
+            ### Download
             
-            ### Downloads
+            | File | Requirements |
+            |------|--------------|
+            | `marvin-v${{ needs.build-python.outputs.version }}.zip` | Python 3.10+ |
             
-            | Platform | File | Requirements |
-            |----------|------|--------------|
-            | **Windows (standalone)** | `marvin-onnx-windows-v${{ needs.build-python.outputs.version }}.zip` | None! Just extract and run |
-            | **Linux (standalone)** | `marvin-onnx-linux-v${{ needs.build-python.outputs.version }}.tar.gz` | None! Just extract and run |
-            | **Cross-platform (Python)** | `marvin-onnx-python-v${{ needs.build-python.outputs.version }}.zip` | Python 3.10+ |
+            ### Quick Start
             
-            ### Quick Start (Standalone)
-            
-            1. Download the file for your platform
-            2. Extract to a folder
-            3. Configure your chess GUI to use:
-               - Windows: `marvin-onnx.exe`
-               - Linux: `./marvin-onnx`
-            
-            ### Quick Start (Python)
-            
-            1. Download the Python package
-            2. Extract and run: `pip install -r requirements.txt`
-            3. Run: `python uci_onnx.py`
+            1. Download and extract the package
+            2. Install dependencies: `pip install -r requirements.txt`
+            3. Run: `python -m inference.uci_engine`
             
             ### UCI Options
             

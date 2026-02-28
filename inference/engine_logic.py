@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import torch
@@ -12,6 +12,9 @@ from inference.chessformer_policy import PolicyOutput, choose_move
 from inference.encoding import ContextOptions, build_history_from_position, canonicalize, make_model_batch
 from inference.mcts import MCTSSettings, MCTSResult, mcts_choose_move, find_subtree_by_move_sequence, _Node
 from inference.sampling import sample_from_logits
+
+if TYPE_CHECKING:
+    from inference.runtime import InferenceBackend
 
 
 PROMO_INDEX = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
@@ -37,93 +40,10 @@ def _time_bin_to_seconds(bin_idx: int, active_clock_s: float) -> float:
     return float((scaled_mid**2) * max(1e-6, active_clock_s))
 
 
-# Model uses 6 conditioning tokens prepended to 64 square tokens = 70 total tokens
-NUM_COND_TOKENS = 6
-
-
-def _extract_attention_64(
-    model: torch.nn.Module,
-    *,
-    real_turn: chess.Color,
-    layer: int,
-    head_agg: str,
-) -> list[float] | None:
-    """Extract 64x64 attention matrix (flattened in real square indexing).
-    
-    The model has 70 tokens (6 conditioning + 64 squares). This extracts only 
-    the 64x64 square-to-square attention from the attention matrix.
-    """
-
-    head_agg = str(head_agg or "avg").lower().strip()
-    if head_agg not in ("avg", "max", "smolgen"):
-        head_agg = "avg"
-
-    orig_model = getattr(model, "_orig_mod", model)
-
-    def extract_64x64(attn_tensor: torch.Tensor) -> torch.Tensor | None:
-        """Extract the 64x64 square-to-square attention from the 70x70 attention tensor."""
-        if not torch.is_tensor(attn_tensor) or attn_tensor.ndim != 4:
-            return None
-        seq_len = attn_tensor.shape[-1]
-        if seq_len != 70:
-            return None
-        # Extract only square-to-square attention (skip first 6 conditioning tokens)
-        return attn_tensor[0, :, NUM_COND_TOKENS:, NUM_COND_TOKENS:].float()  # (H, 64, 64)
-
-    if head_agg == "smolgen":
-        bias_h: torch.Tensor | None = None
-        for mod in orig_model.modules():
-            b = getattr(mod, "last_smolgen_bias", None)
-            if b is None:
-                continue
-            bias_h = extract_64x64(b)
-            if bias_h is not None:
-                break
-
-        if bias_h is None:
-            return None
-
-        probs_h = torch.softmax(bias_h, dim=-1)
-        mat = probs_h.mean(dim=0)
-    else:
-        layers_h: list[torch.Tensor] = []
-        for mod in orig_model.modules():
-            attn = getattr(mod, "last_attn_probs", None)
-            if attn is None:
-                continue
-            attn_64 = extract_64x64(attn)
-            if attn_64 is not None:
-                layers_h.append(attn_64)
-
-        if not layers_h:
-            return None
-
-        if int(layer) >= 0:
-            idx = int(layer)
-            if idx >= len(layers_h):
-                idx = len(layers_h) - 1
-            layers_h = [layers_h[idx]]
-
-        if head_agg == "avg":
-            mats = [a.mean(dim=0) for a in layers_h]
-            mat = torch.stack(mats, dim=0).mean(dim=0)
-        else:
-            mats = [a.max(dim=0).values for a in layers_h]
-            mat = mats[0]
-            for m in mats[1:]:
-                mat = torch.maximum(mat, m)
-
-    if real_turn == chess.BLACK:
-        perm = torch.tensor([_mirror_square(i) for i in range(64)], device=mat.device, dtype=torch.long)
-        mat = mat.index_select(0, perm).index_select(1, perm)
-
-    return mat.detach().cpu().reshape(-1).tolist()
-
 
 def analyze_position(
     *,
-    model: torch.nn.Module,
-    device: torch.device,
+    backend: "InferenceBackend",
     settings: dict,
     rng: np.random.Generator,
     board: chess.Board,
@@ -136,7 +56,9 @@ def analyze_position(
     tc_base_s: float | None = None,
     initial_fen: str = chess.STARTING_FEN,
 ) -> dict:
-    """Same analysis as `inference/app.py.analyze_position`, but dependency-injected."""
+    """Analyse the current position and return policy/value/time statistics."""
+
+    device = backend.device
 
     _final_board, board_history, repetition_flags = build_history_from_position(chess.Board(initial_fen), moves_uci)
 
@@ -180,19 +102,8 @@ def analyze_position(
             lm[..., 4097] = True
         batch_for_rf["legal_mask"] = lm
 
-    with torch.inference_mode():
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            (m_logits, v_raw, v_cls, v_err, t_logits, _ss_logits, p_logits) = model(batch, return_promo=True)
-            (m_logits_rf, *_rest) = model(batch_for_rf, return_promo=False)
-
-    attention64 = None
-    if bool(settings.get("show_attention", False)):
-        attention64 = _extract_attention_64(
-            model,
-            real_turn=board.turn,
-            layer=int(settings.get("attn_layer", -1)),
-            head_agg=str(settings.get("attn_head_agg", "avg")),
-        )
+    (m_logits, v_raw, v_cls, v_err, t_logits, _ss_logits, p_logits) = backend(batch, return_promo=True)
+    (m_logits_rf, *_rest) = backend(batch_for_rf, return_promo=False)
 
     m_logits = m_logits[0]
     promo_p = torch.softmax(p_logits[0].float(), dim=-1)
@@ -322,14 +233,12 @@ def analyze_position(
         "time_sample_prob": float(time_sample_prob),
         "expected_time_s": float(expected_time_s),
         "mode_time_s": float(mode_time_s),
-        "attention64": attention64,
     }
 
 
 def choose_engine_move(
     *,
-    model: torch.nn.Module,
-    device: torch.device,
+    backend: "InferenceBackend",
     settings: dict,
     rng: np.random.Generator,
     board: chess.Board,
@@ -346,7 +255,7 @@ def choose_engine_move(
     mcts_reuse_moves: list[chess.Move] | None = None,
     initial_fen: str = chess.STARTING_FEN,
 ) -> tuple[PolicyOutput, dict, dict | None, MCTSResult | None]:
-    """Implements the engine selection path from `_play_engine_move` in `inference/app.py`.
+    """Implements the engine selection path.
 
     Returns: (policy_out, analysis_dict, mcts_stats_or_none, mcts_result_or_none)
     
@@ -358,8 +267,7 @@ def choose_engine_move(
         return PolicyOutput(move=None, policy_prob=1.0), {}, None, None
 
     engine_stats = analyze_position(
-        model=model,
-        device=device,
+        backend=backend,
         settings=settings,
         rng=rng,
         board=board,
@@ -408,12 +316,9 @@ def choose_engine_move(
     )
 
     mcts_stats = None
-    use_mcts = bool(settings.get("use_mcts", False))
-    mcts_start_ply = int(settings.get("mcts_start_ply", 0))
-    current_ply = len(moves_uci)
-    
+
     # Check if we should use MCTS (enabled and past start ply)
-    if use_mcts and current_ply >= mcts_start_ply:
+    if use_mcts_this_move:
         sims = int(settings.get("mcts_simulations", 128))
         cpuct = float(settings.get("mcts_c_puct", 1.5))
 
@@ -454,7 +359,6 @@ def choose_engine_move(
             fpu_reduction=float(settings.get("mcts_fpu_reduction", 0.0)),
             contempt=float(settings.get("mcts_contempt", 0.15)),
             tree_reuse=bool(settings.get("mcts_tree_reuse", False)),
-            leaf_batch_size=int(settings.get("mcts_leaf_batch_size", 8)),
         )
 
         # Track MCTS execution time for timing simulation
@@ -466,11 +370,10 @@ def choose_engine_move(
             reuse_root = find_subtree_by_move_sequence(mcts_reuse_root, mcts_reuse_moves)
         
         mcts_result = mcts_choose_move(
-            model=model,
+            backend=backend,
             board=board,
             ctx=ctx,
             time_history_s=time_history_s,
-            device=device,
             settings=mcts_settings,
             rng=rng,
             stop_check=stop_check,
@@ -501,7 +404,7 @@ def choose_engine_move(
             effective_temperature = float(settings["temperature"])
         
         out = choose_move(
-            model=model,
+            backend=backend,
             board=board,
             board_history=bh,
             repetition_flags=rf,
@@ -509,7 +412,6 @@ def choose_engine_move(
             temperature=effective_temperature,
             top_p=float(settings["top_p"]),
             time_history_s=time_history_s,
-            device=device,
             rng=rng,
         )
 

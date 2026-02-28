@@ -7,8 +7,11 @@ Model and config can be selected via:
 
 Available models (in inference/ folder):
 - marvin_large.pt           (large, ~49M params)
+- marvin_small.pt           (small, ~23M params)
 - marvin_tiny.pt            (tiny, ~5M params)
-- thomasso-large.pt         (large fine-tuned on thomasso's games)
+- marvin_large.onnx         (large, ONNX format)
+- marvin_small.onnx         (small, ONNX format)
+- marvin_tiny.onnx          (tiny, ONNX format)
 
 Available configs:
 - "auto"  : Auto-detect from checkpoint (recommended)
@@ -25,7 +28,7 @@ from pathlib import Path
 # =============================================================================
 
 # Model checkpoint filename (relative to inference/ folder)
-DEFAULT_MODEL = "marvin_large.pt"
+DEFAULT_MODEL = "marvin_small.onnx"
 
 # Model config: "auto", "tiny", "small", "large"
 # "auto" will detect from checkpoint keys (recommended)

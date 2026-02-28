@@ -20,8 +20,8 @@ from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_
 def parse_args():
     parser = argparse.ArgumentParser(description="Marvin Chess Inference Server")
     parser.add_argument("--weights", type=str, default=None,
-                        help="Path to model weights (.pt file). "
-                             "Default: inference/marvin_large.pt")
+                        help="Path to model weights (.pt or .onnx file). "
+                             "Default: inference/marvin_small.onnx")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to run the server on (default: 5000)")
     return parser.parse_args()
@@ -32,10 +32,8 @@ _cli_args = parse_args()
 from inference.engine_logic import analyze_position as analyze_position_core
 from inference.engine_logic import choose_engine_move as choose_engine_move_core
 from inference.runtime import (
-    count_attn_layers,
-    default_device,
     ensure_repo_on_syspath,
-    load_default_chessformer,
+    load_default_backend,
     resolve_repo_root,
 )
 
@@ -65,52 +63,14 @@ if _checkpoint_path_arg:
 else:
     print_config(repo_root)
 
-# Device selection: allow overriding via settings (auto|cuda|cpu)
-device_pref = str(game_settings.get("device", "auto")).lower()
-if device_pref == "auto":
-    device = default_device()
-elif device_pref == "cuda":
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        print("[inference] Warning: requested device 'cuda' but CUDA is not available; falling back to 'cpu'.")
-        device = torch.device("cpu")
-elif device_pref == "cpu":
-    device = torch.device("cpu")
-else:
-    try:
-        device = torch.device(device_pref)
-    except Exception:
-        print(f"[inference] Warning: unrecognized device '{device_pref}'; falling back to auto-detection.")
-        device = default_device()
-
-if device.type == "cuda":
-    try:
-        gpu_name = torch.cuda.get_device_name(device)
-        print(f"[inference] Device selected: {device} ({gpu_name})")
-    except Exception:
-        print(f"[inference] Device selected: {device}")
-else:
-    print(f"[inference] Device selected: {device}")
-
-# Model loaded with auto-detected config from checkpoint weights
-loaded, model, _checkpoint_path = load_default_chessformer(
-    repo_root=repo_root, 
-    device=device,
+# Load backend (auto-detects .pt vs .onnx and picks best device)
+backend, _checkpoint_path = load_default_backend(
+    repo_root=repo_root,
     checkpoint_path=_checkpoint_path_arg,
 )
-device = loaded.device
-print(f"Model loaded: {_checkpoint_path.name} (config: {loaded.config_name})")
-print(f"[inference] Model device: {device}")
-
-# Handle torch.compile wrapper for metadata inspection
-orig_model = getattr(model, "_orig_mod", model)
-ATTN_NUM_LAYERS = count_attn_layers(model)
-ATTN_HAS_SMOLGEN = bool(getattr(orig_model, "smolgen", None) is not None)
-
-# Expose read-only attention metadata to the frontend via the settings blob.
-game_settings["attn_num_layers"] = int(ATTN_NUM_LAYERS)
-game_settings["attn_has_smolgen"] = bool(ATTN_HAS_SMOLGEN)
+device = backend.device
+print(f"Model loaded: {_checkpoint_path.name} (config: {backend.config_name}, backend: {backend.kind})")
+print(f"[inference] Device: {device}")
 
 # ==========================================
 # 2. ANALYSIS LOGIC
@@ -121,98 +81,6 @@ rng = np.random.default_rng(DEFAULT_RNG_SEED)
 def _mirror_square(sq: int) -> int: return sq ^ 56
 
 
-# Model uses 6 conditioning tokens prepended to 64 square tokens = 70 total tokens
-NUM_COND_TOKENS = 6
-
-
-def _extract_attention_64(
-    model: torch.nn.Module,
-    *,
-    real_turn: chess.Color,
-    layer: int,
-    head_agg: str,
-) -> list[float] | None:
-    """Extract a 64x64 attention matrix according to visualization settings.
-
-    Returns flattened list length 4096 in *real* board square indexing (python-chess: a1=0..h8=63).
-    Requires the model's attention modules to have `last_attn_probs` populated from a just-completed forward.
-    
-    The model has 70 tokens (6 conditioning + 64 squares). This extracts only 
-    the 64x64 square-to-square attention.
-
-    head_agg:
-      - 'avg': average over heads (and over layers if layer == -1)
-      - 'max': elementwise max over heads (and over layers if layer == -1)
-      - 'smolgen': use smolgen bias only (softmax over bias), averaged over heads
-    """
-
-    head_agg = str(head_agg or "avg").lower().strip()
-    if head_agg not in ("avg", "max", "smolgen"):
-        head_agg = "avg"
-
-    orig_model = getattr(model, "_orig_mod", model)
-
-    def extract_64x64(attn_tensor: torch.Tensor) -> torch.Tensor | None:
-        """Extract the 64x64 square-to-square attention from the 70x70 attention tensor."""
-        if not torch.is_tensor(attn_tensor) or attn_tensor.ndim != 4:
-            return None
-        seq_len = attn_tensor.shape[-1]
-        if seq_len != 70:
-            return None
-        # Extract only square-to-square attention (skip first 6 conditioning tokens)
-        return attn_tensor[0, :, NUM_COND_TOKENS:, NUM_COND_TOKENS:].float()  # (H, 64, 64)
-
-    # Smolgen-only view (pure dynamic bias).
-    if head_agg == "smolgen":
-        bias_h: torch.Tensor | None = None
-        for mod in orig_model.modules():
-            b = getattr(mod, "last_smolgen_bias", None)
-            if b is None:
-                continue
-            bias_h = extract_64x64(b)
-            if bias_h is not None:
-                break
-
-        if bias_h is None:
-            return None
-
-        # Convert smolgen logits to attention probabilities.
-        probs_h = torch.softmax(bias_h, dim=-1)  # (H, 64, 64)
-        mat = probs_h.mean(dim=0)  # (64, 64)
-    else:
-        layers_h: list[torch.Tensor] = []
-        for mod in orig_model.modules():
-            attn = getattr(mod, "last_attn_probs", None)
-            if attn is None:
-                continue
-            attn_64 = extract_64x64(attn)
-            if attn_64 is not None:
-                layers_h.append(attn_64)  # (H, 64, 64)
-
-        if not layers_h:
-            return None
-
-        if int(layer) >= 0:
-            idx = int(layer)
-            if idx >= len(layers_h):
-                idx = len(layers_h) - 1
-            layers_h = [layers_h[idx]]
-
-        if head_agg == "avg":
-            mats = [a.mean(dim=0) for a in layers_h]  # (64,64) per layer
-            mat = torch.stack(mats, dim=0).mean(dim=0)
-        else:  # 'max'
-            mats = [a.max(dim=0).values for a in layers_h]  # (64,64) per layer
-            mat = mats[0]
-            for m in mats[1:]:
-                mat = torch.maximum(mat, m)
-
-    # Model uses canonical boards (mirrors when black-to-move). Convert back to real-square indexing.
-    if real_turn == chess.BLACK:
-        perm = torch.tensor([_mirror_square(i) for i in range(64)], device=mat.device, dtype=torch.long)
-        mat = mat.index_select(0, perm).index_select(1, perm)
-
-    return mat.detach().cpu().reshape(-1).tolist()
 def _softmax_1d(x: torch.Tensor) -> torch.Tensor:
     x = x.float() - torch.max(x)
     return torch.softmax(x, dim=0)
@@ -281,8 +149,7 @@ def analyze_position(
     time_history_s: list[float] | None = None,
 ) -> dict:
     return analyze_position_core(
-        model=model,
-        device=loaded.device,
+        backend=backend,
         settings=game_settings,
         rng=rng,
         board=board,
@@ -641,7 +508,6 @@ def prepare_response(board):
         "max_cursor": len(game_state["history"]),
         "is_game_over": board.is_game_over(),
         "result": board.result() if board.is_game_over() else "",
-        "attention64": current_stats.get("attention64"),
         "settings": game_settings,
         "legal_moves": legal_moves,
         "last_move": last_move,
@@ -722,29 +588,6 @@ def update_settings():
         game_settings['show_mcts_stats'] = bool(data['show_mcts_stats'])
     if 'show_arrows' in data:
         game_settings['show_arrows'] = bool(data['show_arrows'])
-    if 'show_attention' in data:
-        game_settings['show_attention'] = bool(data['show_attention'])
-
-    if 'attn_layer' in data:
-        try:
-            game_settings['attn_layer'] = int(float(data['attn_layer']))
-        except Exception:
-            game_settings['attn_layer'] = int(game_settings.get('attn_layer', -1))
-
-    if 'attn_head_agg' in data:
-        v = str(data['attn_head_agg']).lower().strip()
-        if v not in ('avg', 'max', 'smolgen'):
-            v = 'avg'
-        # If smolgen is unavailable, fall back to avg.
-        if v == 'smolgen' and not bool(game_settings.get('attn_has_smolgen', False)):
-            v = 'avg'
-        game_settings['attn_head_agg'] = v
-
-    if 'attn_focus' in data:
-        v = str(data['attn_focus']).lower().strip()
-        if v not in ('outbound', 'inbound'):
-            v = 'outbound'
-        game_settings['attn_focus'] = v
 
     # Sampling-related settings changes should reset the per-position sampled-time cache.
     if any(k in data for k in ('time_temperature', 'time_top_p', 'use_real_time', 'use_mode_time', 'use_expected_time')):
@@ -803,8 +646,7 @@ def _play_engine_move(board):
                         mcts_reuse_moves.append(chess.Move.from_uci(moves_uci[i]))
     
     out, engine_stats, mcts_stats, mcts_result = choose_engine_move_core(
-        model=model,
-        device=loaded.device,
+        backend=backend,
         settings=game_settings,
         rng=rng,
         board=board,

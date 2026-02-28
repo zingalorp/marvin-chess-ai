@@ -1,7 +1,5 @@
 """
-ONNX Export Script for Marvin Chess AI
-
-Exports the Chessformer PyTorch model to ONNX format for use with ONNX Runtime.
+Exports the Marvin PyTorch model to ONNX format for use with ONNX Runtime.
 Supports CUDA acceleration via CUDAExecutionProvider.
 """
 

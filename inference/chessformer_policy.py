@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -10,6 +10,9 @@ import chess
 
 from inference.encoding import ContextOptions, canonicalize, make_model_batch
 from inference.sampling import sample_from_logits, select_promo
+
+if TYPE_CHECKING:
+    from inference.runtime import InferenceBackend
 
 
 @dataclass
@@ -38,7 +41,7 @@ def _canonical_to_real_move(move: chess.Move, real_turn: chess.Color) -> chess.M
 
 def choose_move(
     *,
-    model: torch.nn.Module,
+    backend: "InferenceBackend",
     board: chess.Board,
     board_history,
     repetition_flags,
@@ -46,7 +49,6 @@ def choose_move(
     time_history_s: Optional[list[float]] = None,
     temperature: float,
     top_p: float,
-    device: torch.device,
     rng: Optional[np.random.Generator] = None,
 ) -> PolicyOutput:
     """Runs a single forward pass and samples a legal move.
@@ -64,13 +66,10 @@ def choose_move(
         repetition_flags=repetition_flags,
         time_history_s=time_history_s,
         ctx=ctx,
-        device=device,
+        device=backend.device,
     )
 
-    # Ask for promotion logits.
-    with torch.inference_mode():
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            outputs = model(batch, return_promo=True)
+    outputs = backend(batch, return_promo=True)
 
     move_logits = outputs[0].squeeze(0)  # (4098,)
     promo_logits = outputs[-1].squeeze(0)  # (8,4)

@@ -25,9 +25,6 @@
 !benchmark_lc0.py
 !export_to_leela.py
 
-# Wrapper script for UCI engine
-!marvin_wrapper.sh
-
 # Documentation & Config
 !.gitignore
 !README.md
