@@ -22,7 +22,6 @@
 !scripts/*.py
 
 # Leela integration scripts
-!benchmark_lc0.py
 !export_to_leela.py
 
 # Documentation & Config
