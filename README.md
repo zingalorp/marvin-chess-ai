@@ -32,17 +32,21 @@ pip install -r requirements.txt
 
 ## Usage
 
-| Mode | Command | Weights | Notes |
-|---|---|---|---|
-| Web interface | `python -m inference.app` | `.pt` | Full parameter control via UI |
-| UCI engine | `python -m inference.uci_engine` | `.pt` | All conditioning as UCI options |
-| lc0 / chess GUI | `lc0 --weights "marvin_1600.pb.gz" --backend=onnx-cuda` | `.pb.gz` | Frozen Elo and Time context, no Python needed |
+| Mode | Command | Notes |
+|---|---|---|
+| Web interface | `python -m inference.app` | Full parameter control via UI |
+| UCI engine | `python -m inference.uci_engine` | All conditioning as UCI options |
+| lc0 / chess GUI | `lc0 --weights "marvin_1600.pb.gz" --backend=onnx-cuda` | Frozen Elo and Time context, no Python needed |
+
+Both `app.py` and `uci_engine.py` default to `marvin_small.onnx`. Use `--weights <path>` to load a different model (`.pt` or `.onnx`):
+
 
 ## Model Weights
 
 All weights are on [Hugging Face](https://huggingface.co/holymolyyy/marvin).
 
-- **`.pt`** - Native PyTorch weights (`marvin_large.pt`, `marvin_small.pt`, `marvin_tiny.pt`). Used in `app.py` and `uci_engine.py`. All conditioning adjustable at runtime.
+- **`.onnx`** - ONNX Runtime weights (`marvin_large.onnx`, `marvin_small.onnx`, `marvin_tiny.onnx`). Default format for `app.py` and `uci_engine.py`. Faster startup, runs on CPU or GPU via ONNX Runtime.
+- **`.pt`** - Native PyTorch weights (`marvin_large.pt`, `marvin_small.pt`, `marvin_tiny.pt`). Also supported by `app.py` and `uci_engine.py`. Needed for training and export.
 - **`.pb.gz`** - For use with [Leela Chess Zero](https://lczero.org). One file per Elo level (1200-2400), with frozen Elo and time context.
 
 ## Using Marvin with lc0
