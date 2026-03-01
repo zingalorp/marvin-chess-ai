@@ -7,7 +7,9 @@ import argparse
 from pathlib import Path
 import numpy as np
 import chess
+import chess.pgn
 import chess.svg
+import io
 from flask import Flask, render_template, render_template_string, request, jsonify, Response
 import time
 
@@ -96,13 +98,6 @@ def _time_bin_to_seconds(bin_idx: int, active_clock_s: float) -> float:
     return float((scaled_mid ** 2) * max(1e-6, active_clock_s))
 
 
-def _format_clock_s(sec: float) -> str:
-    sec = max(0.0, float(sec))
-    m = int(sec) // 60
-    s = int(sec) % 60
-    return f"{m}:{s:02d}"
-
-
 def _apply_ply_clock(clock_s: float, *, spent_s: float, inc_s: float) -> float:
     # Simple Fischer clock: subtract, clamp at 0, then add increment.
     return max(0.0, float(clock_s) - max(0.0, float(spent_s))) + float(inc_s)
@@ -168,17 +163,17 @@ def analyze_position(
     )
 
 def format_stats_html(data: dict) -> str:
-    if not data: return "<div style='color:#666;padding:10px'><i>Evaluating...</i></div>"
-    def mk_bar(p, c='#4caf50'): return f"<div style='background:{c}; width:{max(0,min(100,p*100))}%; height:100%;'></div>"
+    if not data: return "<div style='color:#666;padding:8px'>Evaluating...</div>"
+    def mk_bar(p, c='#629924'): return f"<div style='background:{c}; width:{max(0,min(100,p*100))}%; height:100%;'></div>"
     
-    rows = "".join([f"<div class='row'><span class='lbl'>{m['label']}</span><div class='bar-bg'>{mk_bar(m['prob'], '#2196F3')}</div><span class='val'>{m['prob']:.1%}</span></div>" for m in data['top_moves']])
+    rows = "".join([f"<div class='row'><span class='lbl'>{m['label']}</span><div class='bar-bg'>{mk_bar(m['prob'], '#629924')}</div><span class='val'>{m['prob']:.1%}</span></div>" for m in data['top_moves']])
     
     extras = f"<div class='sub'>Resign: {data['resign']:.1%} | Flag: {data['flag']:.1%}</div>"
     
     policy_html = f"<div class='panel'><h3>Policy (Effective)</h3><div class='policy-scroll'>{rows}</div>{extras}</div>"
 
     w, d, l = data['wdl']['w'], data['wdl']['d'], data['wdl']['l']
-    wdl_html = f"<div class='panel'><h3>WDL</h3><div style='display:flex;height:8px;border-radius:2px;overflow:hidden;'><div style='width:{w*100}%;background:#4caf50'></div><div style='width:{d*100}%;background:#9e9e9e'></div><div style='width:{l*100}%;background:#f44336'></div></div><div class='sub'>W {w:.1%} D {d:.1%} L {l:.1%}</div></div>"
+    wdl_html = f"<div class='panel'><h3>WDL</h3><div style='display:flex;height:4px;overflow:hidden;'><div style='width:{w*100}%;background:#629924'></div><div style='width:{d*100}%;background:#555'></div><div style='width:{l*100}%;background:#c44'></div></div><div class='sub'>W {w:.1%} D {d:.1%} L {l:.1%}</div></div>"
     
     val_html = f"<div class='panel'><h3>Value (Win%)</h3><div class='big-val'>{data['value']:.1%} <span class='err'>±{data['value_error']:.1%}</span></div></div>"
     
@@ -204,10 +199,10 @@ def format_stats_html(data: dict) -> str:
 
         for i, item in enumerate(time_dist):
             h = (item['prob'] / max_p) * 100
-            color = '#2196F3'
+            color = '#555'
             if i == mode_idx:
-                color = '#ffeb3b' # Yellow for Mode
-            bars.append(f"<div title='{item['sec']:.1f}s ({item['prob']:.1%})' style='flex:1; background:{color}; height:{h}%; border-radius:1px 1px 0 0; min-width:2px;'></div>")
+                color = '#888' # Lighter for Mode
+            bars.append(f"<div title='{item['sec']:.1f}s ({item['prob']:.1%})' style='flex:1; background:{color}; height:{h}%; min-width:2px;'></div>")
         
         start_t = time_dist[0]['sec']
         end_t = time_dist[-1]['sec']
@@ -226,16 +221,16 @@ def format_stats_html(data: dict) -> str:
             if closest_i >= 0:
                 N = len(time_dist)
                 pct = ((closest_i + 0.5) / N) * 100
-                marker_html += f"<div style='position:absolute; left:{pct}%; bottom:0; height:100%; width:1px; border-left:1px dashed #ff9800; opacity:0.9; pointer-events:none; z-index:9;' title='Expected: {expected_t:.1f}s'></div>"
+                marker_html += f"<div style='position:absolute; left:{pct}%; bottom:0; height:100%; width:1px; border-left:1px dashed #cc8833; opacity:0.9; pointer-events:none; z-index:9;' title='Expected: {expected_t:.1f}s'></div>"
 
         graph_html = f"""
-        <div style="position:relative; height:60px; margin-top:8px; background:#111; padding:4px; border-radius:4px;">
+        <div style="position:relative; height:60px; margin-top:8px; background:#111; padding:4px; border:1px solid #252525;">
             <div style="display:flex; align-items:flex-end; height:100%; gap:1px;">
                 {"".join(bars)}
             </div>
             {marker_html}
         </div>
-        <div style="display:flex; justify-content:space-between; font-size:10px; color:#666; margin-top:2px; padding:0 2px;">
+        <div style="display:flex; justify-content:space-between; font-size:9px; color:#666; margin-top:2px; padding:0 2px;">
             <span>{start_t:.1f}s</span>
             <span>{end_t:.1f}s</span>
         </div>
@@ -243,11 +238,11 @@ def format_stats_html(data: dict) -> str:
         
         sampled_txt = ""
         if sampled is not None:
-            sampled_txt = f"<div class='sub'>Sampled: <b style='color:#eee'>{sampled:.1f}s</b> <span style='color:#666'>({sampled_prob:.1%})</span>"
+            sampled_txt = f"<div class='sub'>Sampled: <b style='color:#eee'>{sampled:.1f}s</b> <span style='color:#777'>({sampled_prob:.1%})</span>"
             if mode_t is not None:
-                sampled_txt += f" | Mode: <b style='color:#ffeb3b'>{mode_t:.1f}s</b>"
+                sampled_txt += f" | Mode: <b style='color:#aaa'>{mode_t:.1f}s</b>"
             if expected_t is not None:
-                sampled_txt += f" | Exp: <span style='color:#ff9800'>{expected_t:.1f}s</span>"
+                sampled_txt += f" | Exp: <span style='color:#cc8833'>{expected_t:.1f}s</span>"
             sampled_txt += "</div>"
             
         time_top_p = data.get('time_top_p', 0.95)
@@ -277,7 +272,7 @@ def format_mcts_stats_html(stats: dict) -> str:
     
     # Header
     rows += """
-    <div class='row' style='font-size:10px; color:#888; border-bottom:1px solid #333; padding-bottom:2px; margin-bottom:4px;'>
+    <div class='row' style='font-size:9px; color:#777; border-bottom:1px solid #222; padding-bottom:2px; margin-bottom:4px;'>
         <span style='width:40px;'>Move</span>
         <span style='flex:1;'>Visits</span>
         <span style='width:30px; text-align:right;'>N</span>
@@ -294,15 +289,15 @@ def format_mcts_stats_html(stats: dict) -> str:
         
         # Bar for visits
         width = (visits / max_visits) * 100
-        bar = f"<div style='background:#4caf50; width:{width}%; height:100%;'></div>"
+        bar = f"<div style='background:#629924; width:{width}%; height:100%;'></div>"
         
         rows += f"""
-        <div class='row' style='font-size:11px; gap:4px;'>
-            <span class='lbl' style='width:40px; font-family:monospace;'>{move}</span>
+        <div class='row' style='font-size:10px; gap:4px;'>
+            <span class='lbl' style='width:40px;'>{move}</span>
             <div class='bar-bg' style='flex:1;'>{bar}</div>
             <span class='val' style='width:30px; text-align:right;'>{visits}</span>
             <span class='val' style='width:40px; text-align:right; color:#aaa;'>{q:+.2f}</span>
-            <span class='val' style='width:30px; text-align:right; color:#666;'>{prior:.0%}</span>
+            <span class='val' style='width:30px; text-align:right; color:#777;'>{prior:.0%}</span>
         </div>
         """
         
@@ -336,6 +331,18 @@ game_state = {
 mcts_progress_queue = queue.Queue()
 mcts_progress_lock = threading.Lock()
 mcts_final_stats = None  # Store final stats for display after MCTS completes
+
+# Background MCTS analysis state
+_analysis_thread = None
+_analysis_cancel = threading.Event()
+_analysis_done = threading.Event()
+_analysis_done.set()  # Start in 'done' state
+
+# Background engine move state
+_engine_thread = None
+_engine_cancel = threading.Event()
+_engine_done = threading.Event()
+_engine_done.set()  # Start in 'done' state
 
 
 def _mcts_progress_callback(stats: dict) -> None:
@@ -439,44 +446,13 @@ def prepare_response(board):
     top_move_uci = None
     if current_stats.get('top_moves') and len(current_stats['top_moves']) > 0:
         top_move_uci = current_stats['top_moves'][0].get('uci')
-    
-    # Construct Engine Inputs HTML
-    if board.turn == game_settings["human_color"]:
-        act_color = "White" if board.turn == chess.WHITE else "Black"
-        act_elo = game_settings["human_elo"]
-        opp_elo = game_settings["engine_elo"]
-        act_clk = clocks[board.turn]
-        opp_clk = clocks[not board.turn]
-    else:
-        act_color = "White" if board.turn == chess.WHITE else "Black"
-        act_elo = game_settings["engine_elo"]
-        opp_elo = game_settings["human_elo"]
-        act_clk = clocks[board.turn]
-        opp_clk = clocks[not board.turn]
 
-    castling_str = board.fen().split(' ')[2]
-    ep_str = board.fen().split(' ')[3]
-    
-    inputs_html = f"""
-    <div style="font-size:14px; font-weight:bold; margin-bottom:10px; border-bottom:1px solid #333; padding-bottom:5px; margin-top:20px;">ENGINE INPUTS</div>
-    <div style="font-size:12px; color:#aaa; line-height:1.8;">
-        <div style="display:flex; justify-content:space-between"><span>Side to Move</span> <b style="color:#eee">{act_color}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>Active Clock</span> <b style="color:#eee">{_format_clock_s(act_clk)}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>Opponent Clock</span> <b style="color:#eee">{_format_clock_s(opp_clk)}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>Active ELO</span> <b style="color:#eee">{act_elo}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>Opponent ELO</span> <b style="color:#eee">{opp_elo}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>Halfmove Clock</span> <b style="color:#eee">{board.halfmove_clock}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>Castling</span> <b style="color:#eee">{castling_str}</b></div>
-        <div style="display:flex; justify-content:space-between"><span>En Passant</span> <b style="color:#eee">{ep_str}</b></div>
-    </div>
-    """
-    
-    prev_html = "<div style='color:#666;font-style:italic;padding:10px'>Start of game.</div>"
+    prev_html = "<div style='color:#666;padding:8px'>Start of game.</div>"
     if game_state["cursor"] > 0:
         prev_item = game_state["history"][game_state["cursor"] - 1]
         prev_html = prev_item.get('prev_stats_html', '')
         if not prev_html:
-            prev_html = "<div style='padding:10px'>Human moved.</div>"
+            prev_html = "<div style='padding:8px'>Human moved.</div>"
 
     # GENERATE PGN for the full line
     pgn_board = chess.Board()
@@ -503,11 +479,15 @@ def prepare_response(board):
     # Check if in check
     in_check = board.is_check()
 
+    # Build clock state for frontend ticking clock display
+    clocks_white = float(clocks[chess.WHITE])
+    clocks_black = float(clocks[chess.BLACK])
+    active_color = "white" if board.turn == chess.WHITE else "black"
+    
     return jsonify({
         "fen": fen,
         "orientation": "white" if game_settings["human_color"] == chess.WHITE else "black",
         "current_stats": current_html,
-        "engine_inputs": inputs_html,
         "prev_engine_stats": prev_html,
         "pgn": pgn_str,
         "cursor": game_state["cursor"],
@@ -518,17 +498,191 @@ def prepare_response(board):
         "legal_moves": legal_moves,
         "last_move": last_move,
         "in_check": in_check,
-        "top_move_uci": top_move_uci
+        "top_move_uci": top_move_uci,
+        "clocks": {"white": clocks_white, "black": clocks_black, "active": active_color},
+        "value_white": float(current_stats.get("value", 0.5)) if board.turn == chess.WHITE else 1.0 - float(current_stats.get("value", 0.5)),
+        "wdl": current_stats.get("wdl", {"w": 0.33, "d": 0.34, "l": 0.33}),
     })
 
 @app.route('/')
 def index():
+    # Cancel any running analysis or engine move
+    _analysis_cancel.set()
+    if _analysis_thread is not None:
+        _analysis_thread.join(timeout=2.0)
+    _analysis_done.set()
+    _engine_cancel.set()
+    if _engine_thread is not None:
+        _engine_thread.join(timeout=2.0)
+    _engine_done.set()
+
+    # Reset game state on every page load so refresh = fresh start
+    game_state["history"] = []
+    game_state["cursor"] = 0
+    _clear_pos_cache()
+    _clear_mcts_tree()
     return render_template('index.html')
 
 @app.route('/state', methods=['GET'])
 def get_state():
     board = get_board_at_cursor()
     return prepare_response(board)
+
+
+@app.route('/load_pgn', methods=['POST'])
+def load_pgn():
+    """Load a PGN into the game history so users can analyze any game."""
+    data = request.json
+    pgn_text = data.get('pgn', '')
+    if not pgn_text.strip():
+        return jsonify({"error": "Empty PGN"}), 400
+
+    try:
+        pgn_io = io.StringIO(pgn_text)
+        game = chess.pgn.read_game(pgn_io)
+        if game is None:
+            return jsonify({"error": "Could not parse PGN"}), 400
+
+        # Replay moves into history
+        board = chess.Board()
+        new_history = []
+        for move in game.mainline_moves():
+            if move not in board.legal_moves:
+                break
+            new_history.append({
+                'uci': move.uci(),
+                'pred_time_s': 0.0,
+                'pred_time_prob': 0.0,
+                'prev_stats_html': '<div style="padding:10px; color:#aaa">Imported move</div>',
+            })
+            board.push(move)
+
+        game_state["history"] = new_history
+        game_state["cursor"] = 0  # Start at beginning so user can navigate
+        _clear_pos_cache()
+        _clear_mcts_tree()
+
+        board_at_cursor = get_board_at_cursor()
+        return prepare_response(board_at_cursor)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+def _run_analysis_thread(board, moves_uci, cursor_now, time_hist, clocks, analyze_settings, mcts_reuse_root, mcts_reuse_moves):
+    """Run MCTS analysis in a background thread."""
+    global mcts_final_stats
+    try:
+        def stop_check():
+            return _analysis_cancel.is_set()
+
+        out, engine_stats, mcts_stats, mcts_result = choose_engine_move_core(
+            backend=backend,
+            settings=analyze_settings,
+            rng=rng,
+            board=board,
+            moves_uci=moves_uci,
+            active_clock_s=float(clocks[board.turn]),
+            opponent_clock_s=float(clocks[not board.turn]),
+            active_inc_s=float(game_settings.get("inc_s", INC_S)),
+            opponent_inc_s=float(game_settings.get("inc_s", INC_S)),
+            time_history_s=time_hist,
+            stop_check=stop_check,
+            allow_ponder_sleep=False,
+            mcts_progress_callback=_mcts_progress_callback,
+            mcts_reuse_root=mcts_reuse_root,
+            mcts_reuse_moves=mcts_reuse_moves,
+        )
+
+        # Store MCTS result for tree reuse
+        if mcts_result is not None:
+            game_state["last_mcts_result"] = mcts_result
+            game_state["last_mcts_ply"] = cursor_now
+    except Exception as e:
+        print(f"MCTS analysis error: {e}")
+    finally:
+        _analysis_done.set()
+
+
+@app.route('/analyze_mcts', methods=['POST'])
+def analyze_mcts_endpoint():
+    """Start MCTS analysis on the current position in a background thread."""
+    global mcts_final_stats, _analysis_thread
+
+    # If already running, don't start another
+    if not _analysis_done.is_set():
+        return jsonify({"status": "already_running"}), 200
+
+    # Clear any previous MCTS stats
+    with mcts_progress_lock:
+        mcts_final_stats = None
+    while not mcts_progress_queue.empty():
+        try:
+            mcts_progress_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    board = get_board_at_cursor()
+    if board.is_game_over():
+        return jsonify({"status": "game_over"}), 200
+
+    moves_uci = get_uci_list_at_cursor()
+    cursor_now = game_state["cursor"]
+    time_hist = _pred_time_history_s_at_cursor(cursor_now)
+    clocks = _clocks_at_cursor(cursor_now)
+
+    # Prepare tree reuse data
+    mcts_reuse_root = None
+    mcts_reuse_moves = []
+    if (
+        game_settings.get("mcts_tree_reuse", False)
+        and game_state.get("last_mcts_result") is not None
+        and game_state.get("last_mcts_ply", -1) >= 0
+    ):
+        last_result = game_state["last_mcts_result"]
+        if last_result.chosen_move is not None:
+            moves_since = cursor_now - game_state["last_mcts_ply"]
+            if 0 < moves_since <= 2:
+                mcts_reuse_root = last_result.root
+                for i in range(game_state["last_mcts_ply"], cursor_now):
+                    if i < len(moves_uci):
+                        mcts_reuse_moves.append(chess.Move.from_uci(moves_uci[i]))
+
+    # Force MCTS on for this analysis
+    analyze_settings = dict(game_settings)
+    analyze_settings['use_mcts'] = True
+    analyze_settings['show_mcts_stats'] = True
+
+    # Start background thread
+    _analysis_cancel.clear()
+    _analysis_done.clear()
+    _analysis_thread = threading.Thread(
+        target=_run_analysis_thread,
+        args=(board, moves_uci, cursor_now, time_hist, clocks, analyze_settings, mcts_reuse_root, mcts_reuse_moves),
+        daemon=True
+    )
+    _analysis_thread.start()
+    return jsonify({"status": "started"}), 200
+
+
+@app.route('/analysis_status', methods=['GET'])
+def analysis_status():
+    """Check if background MCTS analysis is complete."""
+    done = _analysis_done.is_set()
+    if done:
+        return get_state()
+    return jsonify({"status": "running"}), 200
+
+
+@app.route('/cancel_analysis', methods=['POST'])
+def cancel_analysis():
+    """Request cancellation of the running background analysis."""
+    _analysis_cancel.set()
+    # Wait briefly for thread to finish
+    if _analysis_thread is not None:
+        _analysis_thread.join(timeout=2.0)
+    _analysis_done.set()
+    return jsonify({"status": "cancelled"}), 200
 
 @app.route('/settings', methods=['POST'])
 def update_settings():
@@ -574,10 +728,6 @@ def update_settings():
         game_settings['mcts_c_puct'] = float(data['mcts_c_puct'])
     if 'mcts_max_children' in data:
         game_settings['mcts_max_children'] = int(float(data['mcts_max_children']))
-    if 'mcts_root_dirichlet_alpha' in data:
-        game_settings['mcts_root_dirichlet_alpha'] = float(data['mcts_root_dirichlet_alpha'])
-    if 'mcts_root_exploration_frac' in data:
-        game_settings['mcts_root_exploration_frac'] = float(data['mcts_root_exploration_frac'])
     if 'mcts_final_temperature' in data:
         game_settings['mcts_final_temperature'] = float(data['mcts_final_temperature'])
     if 'mcts_max_depth' in data:
@@ -594,6 +744,10 @@ def update_settings():
         game_settings['show_mcts_stats'] = bool(data['show_mcts_stats'])
     if 'show_arrows' in data:
         game_settings['show_arrows'] = bool(data['show_arrows'])
+    if 'opening_temperature' in data:
+        game_settings['opening_temperature'] = float(data['opening_temperature'])
+    if 'opening_length' in data:
+        game_settings['opening_length'] = int(float(data['opening_length']))
 
     # Sampling-related settings changes should reset the per-position sampled-time cache.
     if any(k in data for k in ('time_temperature', 'time_top_p', 'use_real_time', 'use_mode_time', 'use_expected_time')):
@@ -618,7 +772,16 @@ def navigate():
     elif action == 'end': game_state["cursor"] = len(game_state["history"])
     return get_state()
 
-def _play_engine_move(board):
+@app.route('/navigate_to', methods=['POST'])
+def navigate_to():
+    """Jump directly to a specific ply number."""
+    data = request.json
+    target = int(data.get('ply', 0))
+    target = max(0, min(len(game_state["history"]), target))
+    game_state["cursor"] = target
+    return get_state()
+
+def _play_engine_move(board, stop_check=None):
     if board.is_game_over():
         return
 
@@ -662,7 +825,7 @@ def _play_engine_move(board):
         active_inc_s=float(game_settings.get("inc_s", INC_S)),
         opponent_inc_s=float(game_settings.get("inc_s", INC_S)),
         time_history_s=time_hist_engine,
-        stop_check=None,
+        stop_check=stop_check,
         allow_ponder_sleep=True,
         mcts_progress_callback=progress_cb,
         mcts_reuse_root=mcts_reuse_root,
@@ -688,7 +851,7 @@ def _play_engine_move(board):
     
     if out.is_resign:
         chosen_txt = "Resigns"
-        chosen_html = f"<div class='chosen-move' style='color:#f44336'>Engine Resigns ({out.policy_prob:.1%})</div>"
+        chosen_html = f"<div class='chosen-move' style='color:#c44'>Engine Resigns ({out.policy_prob:.1%})</div>"
         full_prev_html = f"<div style='padding:4px'>{stats_html}</div>{chosen_html}"
         game_state["history"].append({
             'uci': 'resign',
@@ -698,7 +861,7 @@ def _play_engine_move(board):
         })
     elif out.is_flag:
         chosen_txt = "Flags"
-        chosen_html = f"<div class='chosen-move' style='color:#f44336'>Engine Flags ({out.policy_prob:.1%})</div>"
+        chosen_html = f"<div class='chosen-move' style='color:#c44'>Engine Flags ({out.policy_prob:.1%})</div>"
         full_prev_html = f"<div style='padding:4px'>{stats_html}</div>{chosen_html}"
         game_state["history"].append({
             'uci': 'flag',
@@ -787,13 +950,29 @@ def make_move():
 
     return get_state()
 
+def _run_engine_move_thread(board):
+    """Run engine move in a background thread."""
+    try:
+        def stop_check():
+            return _engine_cancel.is_set()
+        _play_engine_move(board, stop_check=stop_check)
+    except Exception as e:
+        print(f"Engine move error: {e}")
+    finally:
+        _engine_done.set()
+
+
 @app.route('/engine_move', methods=['POST'])
 def engine_move_endpoint():
-    global mcts_final_stats
+    global mcts_final_stats, _engine_thread
+
+    # If already running, don't start another
+    if not _engine_done.is_set():
+        return jsonify({"status": "already_running"}), 200
+
     # Clear any previous MCTS stats
     with mcts_progress_lock:
         mcts_final_stats = None
-    # Drain the queue
     while not mcts_progress_queue.empty():
         try:
             mcts_progress_queue.get_nowait()
@@ -801,10 +980,38 @@ def engine_move_endpoint():
             break
     
     board = get_board_at_cursor()
-    # Only play if it is NOT the human's turn (i.e. it is engine's turn)
-    if not board.is_game_over() and board.turn != game_settings['human_color']:
-        _play_engine_move(board)
-    return get_state()
+    if board.is_game_over() or board.turn == game_settings['human_color']:
+        return get_state()
+
+    # Start engine move in background thread
+    _engine_cancel.clear()
+    _engine_done.clear()
+    _engine_thread = threading.Thread(
+        target=_run_engine_move_thread,
+        args=(board,),
+        daemon=True
+    )
+    _engine_thread.start()
+    return jsonify({"status": "started"}), 200
+
+
+@app.route('/engine_move_status', methods=['GET'])
+def engine_move_status():
+    """Check if background engine move is complete."""
+    done = _engine_done.is_set()
+    if done:
+        return get_state()
+    return jsonify({"status": "running"}), 200
+
+
+@app.route('/cancel_engine_move', methods=['POST'])
+def cancel_engine_move():
+    """Request cancellation of the running engine move."""
+    _engine_cancel.set()
+    if _engine_thread is not None:
+        _engine_thread.join(timeout=2.0)
+    _engine_done.set()
+    return jsonify({"status": "cancelled"}), 200
 
 
 @app.route('/mcts_progress')
@@ -838,6 +1045,16 @@ def get_mcts_stats():
 
 @app.route('/reset', methods=['POST'])
 def reset():
+    # Cancel any running analysis or engine move
+    _analysis_cancel.set()
+    if _analysis_thread is not None:
+        _analysis_thread.join(timeout=2.0)
+    _analysis_done.set()
+    _engine_cancel.set()
+    if _engine_thread is not None:
+        _engine_thread.join(timeout=2.0)
+    _engine_done.set()
+
     game_state["history"] = []
     game_state["cursor"] = 0
     _clear_pos_cache()
@@ -850,4 +1067,4 @@ def reset():
 if __name__ == '__main__':
     port = _cli_args.port
     print(f"Starting Flask Server on http://localhost:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

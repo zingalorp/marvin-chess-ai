@@ -6,7 +6,7 @@ import chess
 # Settings (Defaults) copied from `inference/app.py`.
 DEFAULT_GAME_SETTINGS: dict = {
     "temperature": 0.9,
-    "time_temperature": 0.5,
+    "time_temperature": 0.9,
     "top_p": 0.95,
     "time_top_p": 0.95,
     "opening_temperature": 1.2,
@@ -33,6 +33,7 @@ DEFAULT_GAME_SETTINGS: dict = {
     "mcts_max_children": 48,
     "mcts_root_dirichlet_alpha": 0.0,
     "mcts_root_exploration_frac": 0.0,
+
     "mcts_final_temperature": 0.0,
     "mcts_final_top_p": 0.90,  # Top-p (nucleus) sampling for final move selection (1.0 = disabled)
     "mcts_max_depth": 96,
