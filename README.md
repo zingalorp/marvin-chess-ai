@@ -74,6 +74,9 @@ git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git && cd l
 
 [marvin-1200](https://lichess.org/@/marvin-1200) / [marvin-1600](https://lichess.org/@/marvin-1600) / [marvin-2000](https://lichess.org/@/marvin-2000) / [marvin-2400](https://lichess.org/@/marvin-2400)
 
+## Finetune to 'Clone' a player
+I've included a `process_pgn_player.py` script that processes a pgn of a single user into the processed dataset format for finetuning a marvin model. Seems to work well with players with ~10k+ games. Recommended 5-8 training epochs.
+
 ## Acknowledgments
 
 - [Lichess](https://lichess.org) for training data and bot infrastructure
