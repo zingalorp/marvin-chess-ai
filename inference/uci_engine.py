@@ -9,9 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 import os
 import chess
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, START_CLOCK_S
 from inference.engine_logic import choose_engine_move, analyze_position
@@ -118,6 +122,9 @@ class UciEngine:
             return
         if not isinstance(self.backend, PyTorchBackend):
             self._model_compiled = True  # Nothing to compile for ONNX
+            return
+        if torch is None:
+            self._model_compiled = True
             return
         
         print("Compiling model with torch.compile...", file=sys.stderr)

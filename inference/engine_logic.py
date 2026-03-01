@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Union
 
 import numpy as np
-import torch
 import chess
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
 from inference.chessformer_policy import PolicyOutput, choose_move
 from inference.encoding import ContextOptions, build_history_from_position, canonicalize, make_model_batch
@@ -30,9 +34,27 @@ def _canonical_to_real_move(move: chess.Move, real_turn: chess.Color) -> chess.M
     return chess.Move(_mirror_square(move.from_square), _mirror_square(move.to_square), promotion=move.promotion)
 
 
-def _softmax_1d(x: torch.Tensor) -> torch.Tensor:
-    x = x.float() - torch.max(x)
-    return torch.softmax(x, dim=0)
+# --- numpy-friendly helpers (work with both np.ndarray and torch.Tensor) ---
+
+def _as_numpy(x: "Union[np.ndarray, torch.Tensor]") -> np.ndarray:
+    """Convert to numpy array, handling torch tensors gracefully."""
+    if torch is not None and isinstance(x, torch.Tensor):
+        return x.detach().float().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
+def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically-stable softmax over numpy array."""
+    x = x.astype(np.float64)
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return (e / np.sum(e, axis=axis, keepdims=True)).astype(np.float32)
+
+
+def _softmax_1d(x: "Union[np.ndarray, torch.Tensor]") -> np.ndarray:
+    """1-D softmax returning numpy array."""
+    a = _as_numpy(x).ravel()
+    return _softmax_np(a)
 
 
 def _time_bin_to_seconds(bin_idx: int, active_clock_s: float) -> float:
@@ -96,7 +118,7 @@ def analyze_position(
     # For analysis only: unmask resign/flag so we can inspect their probabilities.
     batch_for_rf = dict(batch)
     if "legal_mask" in batch_for_rf:
-        lm = batch_for_rf["legal_mask"].clone()
+        lm = batch_for_rf["legal_mask"].copy()
         if lm.shape[-1] > 4097:
             lm[..., 4096] = True
             lm[..., 4097] = True
@@ -105,8 +127,8 @@ def analyze_position(
     (m_logits, v_raw, v_cls, v_err, t_logits, _ss_logits, p_logits) = backend(batch, return_promo=True)
     (m_logits_rf, *_rest) = backend(batch_for_rf, return_promo=False)
 
-    m_logits = m_logits[0]
-    promo_p = torch.softmax(p_logits[0].float(), dim=-1)
+    m_logits = _as_numpy(m_logits[0])
+    promo_p = _softmax_np(_as_numpy(p_logits[0]), axis=-1)
 
     # Effective Policy
     canonical_board = canonicalize(board)
@@ -114,11 +136,11 @@ def analyze_position(
 
     for mv in canonical_board.legal_moves:
         base_idx = mv.from_square * 64 + mv.to_square
-        logit = float(m_logits[base_idx].item())
+        logit = float(m_logits[base_idx])
         if mv.promotion is not None and 56 <= mv.to_square <= 63:
             file_idx = mv.to_square - 56
             p_idx = PROMO_INDEX.get(mv.promotion, 0)
-            promo_prob = float(promo_p[file_idx, p_idx].item())
+            promo_prob = float(promo_p[file_idx, p_idx])
             logit += float(np.log(max(1e-8, promo_prob)))
         legal_moves_data.append({"move": mv, "logit": logit})
 
@@ -126,15 +148,16 @@ def analyze_position(
         policy_display = []
     else:
         T = max(1e-4, float(settings["temperature"]))
-        logits_vec = torch.tensor([x["logit"] for x in legal_moves_data], device=device)
+        logits_vec = np.array([x["logit"] for x in legal_moves_data], dtype=np.float64)
         logits_vec = logits_vec / T
-        probs_vec = torch.softmax(logits_vec, dim=0)
+        probs_vec = _softmax_np(logits_vec.astype(np.float32))
 
-        sorted_probs, sorted_indices = torch.sort(probs_vec, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=0)
+        sorted_indices = np.argsort(-probs_vec)
+        sorted_probs = probs_vec[sorted_indices]
+        cumulative_probs = np.cumsum(sorted_probs)
 
         target_p = float(settings["top_p"])
-        cutoff_index = torch.searchsorted(cumulative_probs, target_p).item()
+        cutoff_index = int(np.searchsorted(cumulative_probs, target_p))
         # `cutoff_index` is an index (0-based). We want a *count* of items to keep.
         # Ensure we keep at least 1 move, including the single-legal-move case.
         cutoff_count = min(len(sorted_probs), int(cutoff_index) + 1)
@@ -159,15 +182,15 @@ def analyze_position(
 
     # Apply Time Temperature
     T_time = max(1e-4, float(settings.get("time_temperature", 1.0)))
-    t_logits_scaled = t_logits[0].float() / T_time
-    time_p = torch.softmax(t_logits_scaled - torch.max(t_logits_scaled), dim=0)
+    t_logits_np = _as_numpy(t_logits[0])
+    t_logits_scaled = t_logits_np / T_time
+    t_probs = _softmax_np(t_logits_scaled)
 
     # Time Distribution (Top X%)
     target_time_p = float(settings.get("time_top_p", 0.95))
-    t_probs = time_p.cpu().numpy()
 
     # Calculate raw stats (Temp=1.0) for "True" Model Opinion
-    t_probs_raw = torch.softmax(t_logits[0].float(), dim=0).cpu().numpy()
+    t_probs_raw = _softmax_np(t_logits_np)
 
     # Mode (Argmax)
     mode_bin = int(np.argmax(t_probs_raw))
@@ -215,16 +238,18 @@ def analyze_position(
     # Use the analysis forward-pass logits where resign/flag are unmasked.
     raw_policy_all = _softmax_1d(m_logits_rf[0])
 
-    win_prob = float(torch.sigmoid(v_raw[0].squeeze(-1)).item())
+    v_raw_np = _as_numpy(v_raw[0]).ravel()
+    win_prob = float(1.0 / (1.0 + np.exp(-v_raw_np[0])))  # sigmoid
 
-    pred_sq_error = float(v_err[0].squeeze(-1).item())
+    v_err_np = _as_numpy(v_err[0]).ravel()
+    pred_sq_error = float(v_err_np[0])
     error_bar = float(np.sqrt(max(0.0, pred_sq_error)))
 
     return {
         "top_moves": policy_display,
-        "resign": float(raw_policy_all[4096].item()),
-        "flag": float(raw_policy_all[4097].item()),
-        "wdl": {"w": wdl[2].item(), "d": wdl[1].item(), "l": wdl[0].item()},
+        "resign": float(raw_policy_all[4096]),
+        "flag": float(raw_policy_all[4097]),
+        "wdl": {"w": float(wdl[2]), "d": float(wdl[1]), "l": float(wdl[0])},
         "value": win_prob,
         "value_error": error_bar,
         "time_dist": time_dist,

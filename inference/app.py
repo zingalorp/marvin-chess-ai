@@ -6,11 +6,15 @@ import threading
 import argparse
 from pathlib import Path
 import numpy as np
-import torch
 import chess
 import chess.svg
 from flask import Flask, render_template, render_template_string, request, jsonify, Response
 import time
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_S, START_CLOCK_S
 
@@ -81,9 +85,11 @@ rng = np.random.default_rng(DEFAULT_RNG_SEED)
 def _mirror_square(sq: int) -> int: return sq ^ 56
 
 
-def _softmax_1d(x: torch.Tensor) -> torch.Tensor:
-    x = x.float() - torch.max(x)
-    return torch.softmax(x, dim=0)
+def _softmax_1d(x) -> np.ndarray:
+    a = np.asarray(x, dtype=np.float64).ravel()
+    a = a - np.max(a)
+    e = np.exp(a)
+    return (e / np.sum(e)).astype(np.float32)
 def _time_bin_to_seconds(bin_idx: int, active_clock_s: float) -> float:
     scaled_mid = (bin_idx + 0.5) / 256.0
     # Inverse of sqrt scaling: target = sqrt(time_ratio), so time_ratio = target^2

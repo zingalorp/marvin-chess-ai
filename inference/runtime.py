@@ -4,9 +4,11 @@ import sys
 from pathlib import Path
 from typing import Union
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
-from inference.model_loader import LoadedModel, load_chessformer
 from inference.config import get_model_path, get_config_name
 from inference.backend import PyTorchBackend, OnnxBackend
 
@@ -30,15 +32,34 @@ def ensure_repo_on_syspath(repo_root: Path) -> None:
         sys.path.insert(0, str(repo_root))
 
 
-def default_device() -> torch.device:
+def default_device() -> "str | torch.device":
+    """Return the best device as a plain string when torch is unavailable,
+    or a ``torch.device`` when torch is available."""
     import os
     override = os.environ.get("MARVIN_DEVICE")
     if override:
-        return torch.device(override)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch is not None:
+            return torch.device(override)
+        return override
+    if torch is not None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Without torch, check via onnxruntime if CUDA is available.
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            return "cuda"
+    except ImportError:
+        pass
+    return "cpu"
 
 
-def load_default_chessformer(*, repo_root: Path | None = None, device: torch.device | None = None, compile_model: bool = True, checkpoint_path: Path | None = None, config_name: str | None = None) -> tuple[LoadedModel, torch.nn.Module, Path]:
+def load_default_chessformer(*, repo_root: Path | None = None, device: "torch.device | None" = None, compile_model: bool = True, checkpoint_path: Path | None = None, config_name: str | None = None) -> "tuple[object, torch.nn.Module, Path]":
+    """Load a PyTorch checkpoint. Requires torch."""
+    if torch is None:
+        raise ImportError("PyTorch is required to load .pt checkpoints. Install it or use .onnx weights.")
+
+    from inference.model_loader import LoadedModel, load_chessformer
+
     repo_root = (repo_root or resolve_repo_root()).resolve()
     ensure_repo_on_syspath(repo_root)
 
@@ -76,7 +97,7 @@ def load_default_chessformer(*, repo_root: Path | None = None, device: torch.dev
 def load_default_backend(
     *,
     repo_root: Path | None = None,
-    device: torch.device | None = None,
+    device: "str | torch.device | None" = None,
     compile_model: bool = True,
     checkpoint_path: Path | None = None,
     config_name: str | None = None,
@@ -115,10 +136,12 @@ def load_default_backend(
                 config_name = "unknown"
 
         backend: InferenceBackend = OnnxBackend(checkpoint_path, device=device, config_name=config_name)
-        print(f"[runtime] Loaded ONNX backend: {checkpoint_path.name} (config: {config_name}, device: {device})")
+        print(f"[runtime] Loaded ONNX backend: {checkpoint_path.name} (config: {config_name}, device: {backend.device})")
         return backend, checkpoint_path
 
-    # Default: PyTorch .pt weights
+    # Default: PyTorch .pt weights (requires torch)
+    if torch is None:
+        raise ImportError("PyTorch is required to load .pt checkpoints. Install it or use .onnx weights.")
     loaded, model, checkpoint_path = load_default_chessformer(
         repo_root=repo_root,
         device=device,

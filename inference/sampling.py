@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
 
 PROMO_INDEX_TO_CHAR = {0: "q", 1: "r", 2: "b", 3: "n"}
@@ -14,6 +18,13 @@ PROMO_INDEX_TO_CHAR = {0: "q", 1: "r", 2: "b", 3: "n"}
 class SampleResult:
     move_index: int
     prob: float
+
+
+def _to_numpy_1d(x: "Union[np.ndarray, torch.Tensor]") -> np.ndarray:
+    """Convert a 1-D tensor/array to a numpy float array."""
+    if torch is not None and isinstance(x, torch.Tensor):
+        return x.detach().float().cpu().numpy()
+    return np.asarray(x, dtype=np.float64)
 
 
 def _top_p_filter(probs: np.ndarray, top_p: float) -> np.ndarray:
@@ -45,7 +56,7 @@ def _top_p_filter(probs: np.ndarray, top_p: float) -> np.ndarray:
 
 
 def sample_from_logits(
-    logits: torch.Tensor,
+    logits: "Union[np.ndarray, torch.Tensor]",
     *,
     temperature: float = 1.0,
     top_p: float = 1.0,
@@ -55,7 +66,7 @@ def sample_from_logits(
     if rng is None:
         rng = np.random.default_rng()
 
-    x = logits.detach().float().cpu().numpy()
+    x = _to_numpy_1d(logits)
     if temperature <= 0.0:
         idx = int(np.argmax(x))
         return SampleResult(move_index=idx, prob=1.0)
@@ -71,7 +82,7 @@ def sample_from_logits(
 
 
 def select_promo(
-    promo_logits_row: torch.Tensor,
+    promo_logits_row: "Union[np.ndarray, torch.Tensor]",
     *,
     temperature: float,
     top_p: float,

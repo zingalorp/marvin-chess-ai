@@ -26,6 +26,7 @@ from model import (
     Chessformer,
     CONFIG_LARGE,
     CONFIG_SMALL,
+    CONFIG_SMALL_NOTIME,
     CONFIG_TINY,
 )
 
@@ -33,7 +34,7 @@ from model import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chessformer trainer")
     parser.add_argument("--data-dir", default="data", help="Root directory containing train/val/test splits")
-    parser.add_argument("--config", choices=["large", "small", "tiny"], default="small")
+    parser.add_argument("--config", choices=["large", "small", "small-notime", "tiny"], default="small")
     parser.add_argument("--batch-size", type=int, default=640)  # 640 for small config, 256 for large config
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1.25e-4)  # 1.25e-4 for small config, 5e-5 for large config
@@ -783,6 +784,8 @@ def main() -> None:
         config = copy.deepcopy(CONFIG_LARGE)
     elif args.config == "tiny":
         config = copy.deepcopy(CONFIG_TINY)
+    elif args.config == "small-notime":
+        config = copy.deepcopy(CONFIG_SMALL_NOTIME)
     else:  # small (default)
         config = copy.deepcopy(CONFIG_SMALL)
     

@@ -35,8 +35,8 @@ class Mish(nn.Module):
 # =============================================================================
 # MODEL CONFIGURATIONS
 # =============================================================================
-# All configs use token-based conditioning (6 tokens prepended to 64 square tokens)
-# for ELO, time control, urgency, increment, and move timing.
+# All configs use token-based conditioning (7 tokens prepended to 64 square tokens)
+# for ELO, opponent ELO, time control, urgency, increment, and move timing.
 # Per-square encoding handles ONLY board state (piece history, EP, castling, rep flags).
 
 # Large config (~49M params)
@@ -93,6 +93,27 @@ CONFIG_TINY = {
     "smolgen_per_head": 64,
 }
 
+# Small-NoTime config (~23M params, same architecture as Small but without any time context)
+# Removes all time-related conditioning: TC category, remaining clock, increment,
+# my last move time, opponent last move time. Only ELO conditioning token is kept.
+CONFIG_SMALL_NOTIME = {
+    "d_model": 448,
+    "n_layers": 12,
+    "n_heads": 14,
+    "d_head": 32,
+    "d_ff": 448,
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 8,
+    "num_piece_types": 13,
+    "num_tc_cats": 3,
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 256,
+    "smolgen_per_head": 256,
+    "no_time_context": True,
+}
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
     def __init__(self, dim, eps=1e-6):
@@ -115,7 +136,8 @@ NUM_TIME_LOG_BINS = 16
 NUM_ELO_ANCHORS = 14  # 1200-2500 in 100 ELO increments
 NUM_TC_CATEGORIES = 3  # Blitz, Rapid, Classical
 NUM_INC_CATEGORIES = 5  # 0, 1, 2, 5, 10+
-NUM_CONDITIONING_TOKENS = 6  # ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
+NUM_CONDITIONING_TOKENS = 7  # ELO, OPP_ELO, TC, URGENCY, INC, MY_TIME, OPP_TIME
+NUM_CONDITIONING_TOKENS_ELO_ONLY = 2  # ELO + OPP_ELO only (no time context)
 
 
 def log_bin_time(seconds: torch.Tensor, num_bins: int = NUM_TIME_LOG_BINS) -> torch.Tensor:
@@ -158,12 +180,13 @@ class TokenConditioningEncoder(nn.Module):
     Encode global context as explicit tokens prepended to the square sequence.
     
     Tokens:
-    1. [ELO_TOKEN] - Interpolated embedding for player skill level
-    2. [TC_TOKEN] - Time control category (Blitz, Rapid, Classical)
-    3. [URGENCY_TOKEN] - Log-binned remaining time
-    4. [INC_TOKEN] - Increment category (0, 1, 2, 5, 10+)
-    5. [MY_LAST_TIME] - Log-binned time spent on my last move
-    6. [OPP_LAST_TIME] - Log-binned time spent on opponent's last move
+    1. [ELO_TOKEN] - Interpolated embedding for active player skill level
+    2. [OPP_ELO_TOKEN] - Interpolated embedding for opponent skill level
+    3. [TC_TOKEN] - Time control category (Blitz, Rapid, Classical)
+    4. [URGENCY_TOKEN] - Log-binned remaining time
+    5. [INC_TOKEN] - Increment category (0, 1, 2, 5, 10+)
+    6. [MY_LAST_TIME] - Log-binned time spent on my last move
+    7. [OPP_LAST_TIME] - Log-binned time spent on opponent's last move
     
     This approach lets the model attend to conditioning information directly 
     through self-attention.
@@ -180,6 +203,9 @@ class TokenConditioningEncoder(nn.Module):
             requires_grad=False
         )
         self.elo_embeddings = nn.Embedding(NUM_ELO_ANCHORS, d_model)
+        
+        # Opponent ELO: Separate interpolated embedding (same anchor scheme)
+        self.opp_elo_embeddings = nn.Embedding(NUM_ELO_ANCHORS, d_model)
         
         # TC: Categorical embedding (Blitz=0, Rapid=1, Classical=2)
         self.tc_embedding = nn.Embedding(NUM_TC_CATEGORIES, d_model)
@@ -206,15 +232,19 @@ class TokenConditioningEncoder(nn.Module):
             persistent=False
         )
     
-    def _interpolate_elo(self, elo: torch.Tensor) -> torch.Tensor:
+    def _interpolate_elo(self, elo: torch.Tensor, embedding_table: nn.Embedding = None) -> torch.Tensor:
         """
         Interpolate ELO embedding from anchor points.
         
         Args:
             elo: (B,) raw ELO values
+            embedding_table: which embedding to use (defaults to self.elo_embeddings)
         Returns:
             (B, d_model) interpolated embeddings
         """
+        if embedding_table is None:
+            embedding_table = self.elo_embeddings
+        
         B = elo.shape[0]
         device = elo.device
         
@@ -242,14 +272,15 @@ class TokenConditioningEncoder(nn.Module):
         t = t.clamp(0, 1).unsqueeze(1)  # (B, 1)
         
         # Get embeddings and interpolate
-        lower_emb = self.elo_embeddings(lower_idx)  # (B, d_model)
-        upper_emb = self.elo_embeddings(upper_idx)  # (B, d_model)
+        lower_emb = embedding_table(lower_idx)  # (B, d_model)
+        upper_emb = embedding_table(upper_idx)  # (B, d_model)
         
         return (1 - t) * lower_emb + t * upper_emb  # (B, d_model)
     
     def forward(
         self,
         player_elo: torch.Tensor,      # (B,) raw ELO
+        opp_elo: torch.Tensor,         # (B,) raw opponent ELO
         tc_cat: torch.Tensor,           # (B,) 0=Blitz, 1=Rapid, 2=Classical
         remaining_time: torch.Tensor,   # (B,) seconds remaining
         increment: torch.Tensor,        # (B,) increment in seconds
@@ -260,41 +291,113 @@ class TokenConditioningEncoder(nn.Module):
         Generate conditioning token embeddings.
         
         Returns:
-            (B, 6, d_model) - 6 conditioning tokens
+            (B, 7, d_model) - 7 conditioning tokens
         """
         B = player_elo.shape[0]
         
         # 1. ELO token (interpolated)
         elo_token = self._interpolate_elo(player_elo)  # (B, d_model)
         
-        # 2. TC token (categorical)
+        # 2. Opponent ELO token (interpolated, separate embedding table)
+        opp_elo_token = self._interpolate_elo(opp_elo, self.opp_elo_embeddings)  # (B, d_model)
+        
+        # 3. TC token (categorical)
         tc_token = self.tc_embedding(tc_cat)  # (B, d_model)
         
-        # 3. Urgency token (log-binned remaining time)
+        # 4. Urgency token (log-binned remaining time)
         urgency_bins = log_bin_time(remaining_time)
         urgency_token = self.urgency_embedding(urgency_bins)  # (B, d_model)
         
-        # 4. Increment token (categorical)
+        # 5. Increment token (categorical)
         inc_bins = bin_increment(increment)
         inc_token = self.inc_embedding(inc_bins)  # (B, d_model)
         
-        # 5. My last move time token (log-binned)
+        # 6. My last move time token (log-binned)
         my_time_bins = log_bin_time(my_last_time)
         my_time_token = self.my_time_embedding(my_time_bins)  # (B, d_model)
         
-        # 6. Opponent's last move time token (log-binned)
+        # 7. Opponent's last move time token (log-binned)
         opp_time_bins = log_bin_time(opp_last_time)
         opp_time_token = self.opp_time_embedding(opp_time_bins)  # (B, d_model)
         
-        # Stack tokens: (B, 6, d_model)
+        # Stack tokens: (B, 7, d_model)
         tokens = torch.stack([
-            elo_token, tc_token, urgency_token,
+            elo_token, opp_elo_token, tc_token, urgency_token,
             inc_token, my_time_token, opp_time_token
         ], dim=1)
         
         # Add position embeddings
         tokens = tokens + self.token_pos_embedding(self.token_pos_ids)  # broadcast over B
         
+        return tokens
+
+
+class EloOnlyConditioningEncoder(nn.Module):
+    """
+    Conditioning encoder with ELO + opponent ELO — no time context at all.
+    
+    Used for the no-time-context model variant. Two tokens [ELO_TOKEN, OPP_ELO_TOKEN]
+    are prepended to the 64 square tokens (total sequence length = 66).
+    No time control, remaining clock, increment, or move timing information.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        self.num_tokens = NUM_CONDITIONING_TOKENS_ELO_ONLY  # 2
+        
+        # ELO: Interpolated embedding with anchor points (same as TokenConditioningEncoder)
+        self.elo_anchors = nn.Parameter(
+            torch.tensor([1200.0, 1300.0, 1400.0, 1500.0, 1600.0, 1700.0, 1800.0,
+                          1900.0, 2000.0, 2100.0, 2200.0, 2300.0, 2400.0, 2500.0]),
+            requires_grad=False
+        )
+        self.elo_embeddings = nn.Embedding(NUM_ELO_ANCHORS, d_model)
+        
+        # Opponent ELO: Separate interpolated embedding (same anchor scheme)
+        self.opp_elo_embeddings = nn.Embedding(NUM_ELO_ANCHORS, d_model)
+        
+        # Position embeddings for the 2 conditioning tokens
+        self.token_pos_embedding = nn.Embedding(NUM_CONDITIONING_TOKENS_ELO_ONLY, d_model)
+        
+        self.register_buffer(
+            "token_pos_ids",
+            torch.arange(NUM_CONDITIONING_TOKENS_ELO_ONLY, dtype=torch.long),
+            persistent=False
+        )
+    
+    def _interpolate_elo(self, elo: torch.Tensor, embedding_table: nn.Embedding = None) -> torch.Tensor:
+        """Interpolate ELO embedding from anchor points."""
+        if embedding_table is None:
+            embedding_table = self.elo_embeddings
+        B = elo.shape[0]
+        elo_clamped = elo.clamp(self.elo_anchors[0], self.elo_anchors[-1])
+        anchors = self.elo_anchors
+        below_mask = elo_clamped.unsqueeze(1) >= anchors.unsqueeze(0)
+        lower_idx = below_mask.sum(dim=1) - 1
+        lower_idx = lower_idx.clamp(0, NUM_ELO_ANCHORS - 2)
+        upper_idx = lower_idx + 1
+        lower_anchor = anchors[lower_idx]
+        upper_anchor = anchors[upper_idx]
+        t = (elo_clamped - lower_anchor) / (upper_anchor - lower_anchor + 1e-6)
+        t = t.clamp(0, 1).unsqueeze(1)
+        lower_emb = embedding_table(lower_idx)
+        upper_emb = embedding_table(upper_idx)
+        return (1 - t) * lower_emb + t * upper_emb
+    
+    def forward(self, player_elo: torch.Tensor, opp_elo: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Generate conditioning token embeddings (ELO + opponent ELO only).
+        
+        Extra kwargs (tc_cat, remaining_time, etc.) are accepted and ignored
+        for interface compatibility with TokenConditioningEncoder.
+        
+        Returns:
+            (B, 2, d_model) - two conditioning tokens [ELO, OPP_ELO]
+        """
+        elo_token = self._interpolate_elo(player_elo)  # (B, d_model)
+        opp_elo_token = self._interpolate_elo(opp_elo, self.opp_elo_embeddings)  # (B, d_model)
+        tokens = torch.stack([elo_token, opp_elo_token], dim=1)  # (B, 2, d_model)
+        tokens = tokens + self.token_pos_embedding(self.token_pos_ids)
         return tokens
 
 
@@ -720,13 +823,17 @@ class Chessformer(nn.Module):
     """
     Chessformer model with token-based conditioning.
     
-    Uses 6 conditioning tokens prepended to 64 square tokens for:
-    - ELO (interpolated embedding)
+    By default, uses 7 conditioning tokens prepended to 64 square tokens for:
+    - Active player ELO (interpolated embedding)
+    - Opponent ELO (interpolated embedding, separate weights)
     - Time control category (Blitz/Rapid/Classical)
     - Urgency (remaining time)
     - Increment category
     - My last move time
     - Opponent's last move time
+    
+    With config['no_time_context'] = True, uses 2 conditioning tokens (ELO + OPP_ELO),
+    removing all time-related context for a purely position-based model.
     
     Per-square encoding handles only board state (piece history, EP, castling, rep flags).
     All global/game context is provided via the conditioning tokens.
@@ -735,9 +842,19 @@ class Chessformer(nn.Module):
         super().__init__()
         self.config = config
         d_model = config['d_model']
+        self.no_time_context = config.get('no_time_context', False)
         
-        # Token-based conditioning (6 tokens prepended to 64 square tokens = 70 total)
-        self.token_conditioning = TokenConditioningEncoder(d_model)
+        # Token-based conditioning
+        if self.no_time_context:
+            # ELO + OPP_ELO: 2 tokens prepended to 64 square tokens = 66 total
+            self.token_conditioning = EloOnlyConditioningEncoder(d_model)
+            self.num_cond_tokens = NUM_CONDITIONING_TOKENS_ELO_ONLY
+        else:
+            # Full: 7 tokens prepended to 64 square tokens = 71 total
+            self.token_conditioning = TokenConditioningEncoder(d_model)
+            self.num_cond_tokens = NUM_CONDITIONING_TOKENS
+        
+        self.total_seq_len = self.num_cond_tokens + NUM_SQUARES  # 65 or 70
         
         # Gradient checkpointing for memory-efficient training
         self.gradient_checkpointing = config.get('gradient_checkpointing', False)
@@ -748,15 +865,16 @@ class Chessformer(nn.Module):
         # Transformer body - using TransformerBlock with Mish activation
         self.rel_pos_gen = RelativePositionGenerator(config['max_rel_dist'])
         
-        # Extended relative position for 70 tokens (6 conditioning + 64 squares)
+        # Extended relative position for total_seq_len tokens
         # Conditioning tokens use the max distance bucket for all positions
-        ext_indices = torch.zeros(70, 70, dtype=torch.long)
-        # Fill in square-to-square relative positions (tokens 6-69)
-        ext_indices[NUM_CONDITIONING_TOKENS:, NUM_CONDITIONING_TOKENS:] = self.rel_pos_gen.indices
+        L = self.total_seq_len
+        ext_indices = torch.zeros(L, L, dtype=torch.long)
+        # Fill in square-to-square relative positions
+        ext_indices[self.num_cond_tokens:, self.num_cond_tokens:] = self.rel_pos_gen.indices
         # All other positions (involving conditioning tokens) use max bucket
         max_bucket = self.rel_pos_gen.num_buckets - 1
-        ext_indices[:NUM_CONDITIONING_TOKENS, :] = max_bucket
-        ext_indices[:, :NUM_CONDITIONING_TOKENS] = max_bucket
+        ext_indices[:self.num_cond_tokens, :] = max_bucket
+        ext_indices[:, :self.num_cond_tokens] = max_bucket
         self.register_buffer("extended_rel_indices", ext_indices)
         
         self.layers = nn.ModuleList([
@@ -843,12 +961,10 @@ class Chessformer(nn.Module):
         """
         # Extract inputs from batch
         board_history = batch['board_history']
-        time_history = batch['time_history']
         rep_flags = batch['rep_flags']
         castling = batch['castling']
         ep_mask = batch['ep_mask']
         scalars = batch['scalars']
-        tc_cat = batch['tc_cat']
         legal_mask = batch.get('legal_mask', None)
         
         B = board_history.shape[0]
@@ -858,55 +974,69 @@ class Chessformer(nn.Module):
         x = self.input_encoder(board_history, rep_flags, castling, ep_mask)
         
         # Token conditioning: prepend conditioning tokens to the sequence
-        # Extract raw values for token conditioning
         # ELO: denormalize from scalars (was (elo - 1900) / 700)
         player_elo_raw = scalars[:, 0] * 700 + 1900  # (B,)
+        # Opponent ELO: denormalize from scalars (was (elo - 1900) / 700)
+        opp_elo_raw = scalars[:, 1] * 700 + 1900  # (B,)
         
-        # TC category is already in the batch
-        # tc_cat: (B,) with values 0=Blitz, 1=Rapid, 2=Classical
-        
-        # Remaining time: denormalize from scalars (was log1p(seconds) / 10)
-        # Use exp(x) - 1 instead of expm1 for ONNX compatibility
-        remaining_time_raw = torch.exp(scalars[:, 3] * 10) - 1  # (B,)
-        
-        # Increment: denormalize from scalars (was inc / 30)
-        increment_raw = (scalars[:, 5] * 30).long()  # (B,)
-        
-        # My last move time: time_history[:, 1] (index 1 is my last move, index 0 is opponent's last)
-        # Denormalize from /60 and handle edge cases
-        my_last_time_raw = time_history[:, 1] * 60  # (B,) in seconds
-        
-        # Opponent's last move time: time_history[:, 0]
-        opp_last_time_raw = time_history[:, 0] * 60  # (B,) in seconds
-        
-        # Generate conditioning token embeddings
-        cond_tokens = self.token_conditioning(
-            player_elo=player_elo_raw,
-            tc_cat=tc_cat,
-            remaining_time=remaining_time_raw,
-            increment=increment_raw,
-            my_last_time=my_last_time_raw,
-            opp_last_time=opp_last_time_raw,
-        )  # (B, 6, d_model)
+        if self.no_time_context:
+            # ELO + OPP_ELO conditioning — no time information at all
+            cond_tokens = self.token_conditioning(
+                player_elo=player_elo_raw,
+                opp_elo=opp_elo_raw,
+            )  # (B, 2, d_model)
+        else:
+            time_history = batch['time_history']
+            tc_cat = batch['tc_cat']
+            
+            # TC category is already in the batch
+            # tc_cat: (B,) with values 0=Blitz, 1=Rapid, 2=Classical
+            
+            # Remaining time: denormalize from scalars (was log1p(seconds) / 10)
+            # Use exp(x) - 1 instead of expm1 for ONNX compatibility
+            remaining_time_raw = torch.exp(scalars[:, 3] * 10) - 1  # (B,)
+            
+            # Increment: denormalize from scalars (was inc / 30)
+            increment_raw = (scalars[:, 5] * 30).long()  # (B,)
+            
+            # My last move time: time_history[:, 1] (index 1 is my last move, index 0 is opponent's last)
+            # Denormalize from /60 and handle edge cases
+            my_last_time_raw = time_history[:, 1] * 60  # (B,) in seconds
+            
+            # Opponent's last move time: time_history[:, 0]
+            opp_last_time_raw = time_history[:, 0] * 60  # (B,) in seconds
+            
+            # Generate conditioning token embeddings
+            cond_tokens = self.token_conditioning(
+                player_elo=player_elo_raw,
+                opp_elo=opp_elo_raw,
+                tc_cat=tc_cat,
+                remaining_time=remaining_time_raw,
+                increment=increment_raw,
+                my_last_time=my_last_time_raw,
+                opp_last_time=opp_last_time_raw,
+            )  # (B, 7, d_model)
         
         # Prepend conditioning tokens to square tokens
-        x = torch.cat([cond_tokens, x], dim=1)  # (B, 70, d_model)
+        NC = self.num_cond_tokens
+        L = self.total_seq_len
+        x = torch.cat([cond_tokens, x], dim=1)  # (B, L, d_model)
         
         # Compute smolgen bias once (shared across layers)
         # Smolgen is designed for 64x64 square attention, apply only to square-to-square
         smolgen_bias = None
         if self.use_smolgen:
             # Compute smolgen on square tokens only
-            square_tokens = x[:, NUM_CONDITIONING_TOKENS:, :]  # (B, 64, d_model)
+            square_tokens = x[:, NC:, :]  # (B, 64, d_model)
             smolgen_bias_64 = self.smolgen(square_tokens)  # (B, n_heads, 64, 64)
             
-            # Extend to 70x70 with zeros for conditioning token interactions
+            # Extend to LxL with zeros for conditioning token interactions
             n_heads = smolgen_bias_64.shape[1]
             smolgen_bias = torch.zeros(
-                B, n_heads, 70, 70, 
+                B, n_heads, L, L, 
                 device=device, dtype=smolgen_bias_64.dtype
             )
-            smolgen_bias[:, :, NUM_CONDITIONING_TOKENS:, NUM_CONDITIONING_TOKENS:] = smolgen_bias_64
+            smolgen_bias[:, :, NC:, NC:] = smolgen_bias_64
         
         # Transformer layers
         for layer in self.layers:
@@ -918,10 +1048,10 @@ class Chessformer(nn.Module):
                 )
             else:
                 x = layer(x, rel_indices=self.extended_rel_indices, smolgen_bias=smolgen_bias)
-        x = self.norm_f(x)  # (B, 70, d_model)
+        x = self.norm_f(x)  # (B, L, d_model)
         
         # Extract square tokens for output heads
-        x_squares = x[:, NUM_CONDITIONING_TOKENS:, :]  # (B, 64, d_model)
+        x_squares = x[:, NC:, :]  # (B, 64, d_model)
         
         # --- Policy Head ---
         pol_q = self.policy_query(x_squares)  # (B, 64, d_model)
@@ -1000,7 +1130,7 @@ if __name__ == "__main__":
     print("MODEL CONFIGS")
     print("=" * 60)
     
-    for name, config in [("TINY", CONFIG_TINY), ("SMALL", CONFIG_SMALL), ("LARGE", CONFIG_LARGE)]:
+    for name, config in [("TINY", CONFIG_TINY), ("SMALL", CONFIG_SMALL), ("LARGE", CONFIG_LARGE), ("SMALL_NOTIME", CONFIG_SMALL_NOTIME)]:
         print(f"\n--- CONFIG_{name} ---")
         model = Chessformer(config)
         print(f"Parameters: {count_parameters(model):,}")

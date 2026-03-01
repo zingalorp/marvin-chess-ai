@@ -8,7 +8,7 @@ from typing import Any, Dict, Literal, Tuple
 import torch
 
 
-ConfigName = Literal["small", "large", "tiny", "auto"]
+ConfigName = Literal["small", "small-notime", "large", "tiny", "auto"]
 
 
 @dataclass(frozen=True)
@@ -29,24 +29,35 @@ def _load_model_module(model_py_path: Path):
 
 
 def _detect_config_from_state(state: Dict[str, Any]) -> str:
-    """Auto-detect which config (tiny/small/large) was used based on state_dict weight shapes."""
+    """Auto-detect which config (tiny/small/small-notime/large) was used based on state_dict weight shapes."""
     # Normalize keys (strip _orig_mod. prefix if present)
     normalized_state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
     
     # Check d_model size from a known layer to distinguish tiny vs small vs large
     # tiny: d_model=256, small: d_model=448, large: d_model=608
+    d_model = None
     for key, value in normalized_state.items():
         if "layers.0.attn.q_proj.weight" in key:
             d_model = value.shape[0]
-            if d_model >= 550:
-                return "large"
-            elif d_model >= 400:
-                return "small"
-            else:
-                return "tiny"
+            break
     
-    # Default to small if we can't determine
-    return "small"
+    if d_model is None:
+        return "small"
+    
+    # Check for no-time-context variant: EloOnlyConditioningEncoder has 2-token pos embedding
+    # vs TokenConditioningEncoder which has 7-token pos embedding
+    elo_only = False
+    for key, value in normalized_state.items():
+        if "token_conditioning.token_pos_embedding.weight" in key:
+            elo_only = value.shape[0] == 2
+            break
+    
+    if d_model >= 550:
+        return "large"
+    elif d_model >= 400:
+        return "small-notime" if elo_only else "small"
+    else:
+        return "tiny"
 
 
 def load_chessformer(
@@ -86,6 +97,8 @@ def load_chessformer(
         config = dict(module.CONFIG_LARGE)
     elif config_name == "tiny":
         config = dict(module.CONFIG_TINY)
+    elif config_name == "small-notime":
+        config = dict(module.CONFIG_SMALL_NOTIME)
     else:  # small (default)
         config = dict(module.CONFIG_SMALL)
 

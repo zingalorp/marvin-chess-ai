@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import time
-import torch
 import chess
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
 from inference.chessformer_policy import PolicyOutput
 from inference.encoding import ContextOptions, HISTORY_LEN, canonicalize, encode_board, make_model_batch
@@ -103,7 +107,7 @@ def _ctx_for_side_to_move(base: ContextOptions, *, root_turn: chess.Color, node_
     )
 
 
-def _time_bin_mid_seconds(bin_idx: torch.Tensor, *, active_clock_s: torch.Tensor) -> torch.Tensor:
+def _time_bin_mid_seconds(bin_idx: np.ndarray, *, active_clock_s: float) -> np.ndarray:
     """Map time-bin indices to seconds using the same sqrt-scaling as training.
 
     Training encoding uses: scaled = sqrt(time_ratio) in [0,1], discretized into 256 bins.
@@ -111,7 +115,22 @@ def _time_bin_mid_seconds(bin_idx: torch.Tensor, *, active_clock_s: torch.Tensor
     """
 
     scaled_mid = (bin_idx + 0.5) / 256.0
-    return (scaled_mid * scaled_mid) * torch.clamp(active_clock_s, min=1e-6)
+    return (scaled_mid * scaled_mid) * max(1e-6, active_clock_s)
+
+
+def _as_numpy(x: "Union[np.ndarray, object]") -> np.ndarray:
+    """Convert to numpy, handling torch tensors if torch is available."""
+    if torch is not None and isinstance(x, torch.Tensor):
+        return x.detach().float().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
+def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically-stable softmax over numpy array."""
+    x = x.astype(np.float64)
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return (e / np.sum(e, axis=axis, keepdims=True)).astype(np.float32)
 
 
 def _evaluate_position(
@@ -140,22 +159,21 @@ def _evaluate_position(
 
     move_logits, _v_raw, v_cls, _v_err, t_logits, _ss_logits, promo_logits = backend(batch, return_promo=True)
 
-    move_logits = move_logits[0]  # (4098,)
-    promo_p = torch.softmax(promo_logits[0].float(), dim=-1)  # (8,4)
+    move_logits = _as_numpy(move_logits[0])  # (4098,)
+    promo_p = _softmax_np(_as_numpy(promo_logits[0]), axis=-1)  # (8,4)
 
     # NOTE: The model's WDL head is ordered as [Loss, Draw, Win].
-    wdl = torch.softmax(v_cls[0].float(), dim=-1)
+    wdl = _softmax_np(_as_numpy(v_cls[0]))
     # Apply contempt: penalize draws to avoid drawish positions when ahead
     # value = P(win) - P(loss) - contempt * P(draw)
-    value = float((wdl[2] - wdl[0] - contempt * wdl[1]).item())
+    value = float(wdl[2] - wdl[0] - contempt * wdl[1])
 
     # Deterministic expected ponder time (seconds) for the side-to-move at this node.
     # This is used to fill simulated time_history entries downstream.
-    t_probs = torch.softmax(t_logits[0].float(), dim=-1)  # (256,)
-    bin_idx = torch.arange(t_probs.shape[0], device=t_probs.device, dtype=torch.float32)
-    active_clock = torch.tensor(float(eff_ctx.active_clock_s), device=t_probs.device, dtype=torch.float32)
-    bin_seconds = _time_bin_mid_seconds(bin_idx, active_clock_s=active_clock)
-    exp_time_s = float(torch.sum(t_probs * bin_seconds).item())
+    t_probs = _softmax_np(_as_numpy(t_logits[0]))  # (256,)
+    bin_idx = np.arange(t_probs.shape[0], dtype=np.float32)
+    bin_seconds = _time_bin_mid_seconds(bin_idx, active_clock_s=float(eff_ctx.active_clock_s))
+    exp_time_s = float(np.sum(t_probs * bin_seconds))
 
     real_turn = board.turn
     canonical = canonicalize(board)
@@ -165,11 +183,11 @@ def _evaluate_position(
 
     for mv in canonical.legal_moves:
         base_idx = mv.from_square * 64 + mv.to_square
-        logit = float(move_logits[base_idx].item())
+        logit = float(move_logits[base_idx])
         if mv.promotion is not None and 56 <= mv.to_square <= 63:
             file_idx = mv.to_square - 56
             p_idx = _PROMO_INDEX.get(mv.promotion, 0)
-            promo_prob = float(promo_p[file_idx, p_idx].item())
+            promo_prob = float(promo_p[file_idx, p_idx])
             logit += float(np.log(max(1e-8, promo_prob)))
 
         real_mv = _canonical_to_real_move(mv, real_turn)
