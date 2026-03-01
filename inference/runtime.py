@@ -31,6 +31,10 @@ def ensure_repo_on_syspath(repo_root: Path) -> None:
 
 
 def default_device() -> torch.device:
+    import os
+    override = os.environ.get("MARVIN_DEVICE")
+    if override:
+        return torch.device(override)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 

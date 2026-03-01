@@ -7,6 +7,7 @@
 
 # Data preprocessing
 !process_pgn.py
+!process_pgn_player.py
 
 # Evaluation
 !compare_ACPL.py
@@ -19,7 +20,9 @@
 
 # Scripts
 !scripts/
-!scripts/*.py
+!scripts/export_onnx.py
+!scripts/export_to_leela.py
+!scripts/export_model.py
 
 # Leela integration scripts
 !export_to_leela.py
