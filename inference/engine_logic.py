@@ -178,6 +178,48 @@ def analyze_position(
                 label = real_mv.uci()
             policy_display.append({"label": label, "prob": prob, "uci": real_mv.uci()})
 
+    # ── Per-move value evaluation ──
+    # For each candidate move, push it and run a quick forward pass to get the
+    # resulting value.  Value from the child position is from the opponent's POV,
+    # so we negate (1 − win_prob) to express it for the player who made the move.
+    if policy_display:
+        child_moves_uci = list(moves_uci)  # will be extended per child
+        for entry in policy_display:
+            try:
+                child_board = board.copy()
+                child_board.push(chess.Move.from_uci(entry["uci"]))
+                child_uci = child_moves_uci + [entry["uci"]]
+                _cb, child_hist, child_rep = build_history_from_position(
+                    chess.Board(initial_fen), child_uci
+                )
+                # In the child position, the side-to-move is the opponent.
+                # Swap elo / clocks accordingly.
+                child_ctx = ContextOptions(
+                    active_elo=opp_elo,
+                    opponent_elo=active_elo,
+                    active_clock_s=opponent_clock_s,
+                    opponent_clock_s=active_clock_s,
+                    active_inc_s=float(opponent_inc_s) if opponent_inc_s else 0.0,
+                    opponent_inc_s=float(active_inc_s) if active_inc_s else 0.0,
+                    tc_base_s=ctx.tc_base_s,
+                    halfmove_clock=int(child_board.halfmove_clock),
+                )
+                child_batch = make_model_batch(
+                    board=child_board,
+                    board_history=child_hist,
+                    repetition_flags=child_rep,
+                    time_history_s=time_history_s,
+                    ctx=child_ctx,
+                    device=device,
+                )
+                (_, cv_raw, *_cr) = backend(child_batch, return_promo=False)
+                cv_np = _as_numpy(cv_raw[0]).ravel()
+                child_win = float(1.0 / (1.0 + np.exp(-cv_np[0])))
+                # child_win is P(child side wins).  Our value = 1 − child_win.
+                entry["value"] = round(1.0 - child_win, 4)
+            except Exception:
+                entry["value"] = None
+
     wdl = _softmax_1d(v_cls[0])
 
     # Apply Time Temperature

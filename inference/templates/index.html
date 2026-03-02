@@ -70,10 +70,30 @@
             color: #7ab832;
             font-weight: 700;
             font-size: 11px;
-            min-width: 42px;
+            min-width: 48px;
             text-align: right;
             display: inline-block;
+            cursor: pointer;
+            user-select: none;
+            flex-shrink: 0;
+            margin-left: auto;
         }
+        .setting-val:hover { text-decoration: underline; text-underline-offset: 2px; }
+        .setting-val-input {
+            background: #0d0d0d;
+            border: 1px solid #3a3a3a;
+            color: #7ab832;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            font-weight: 700;
+            width: 56px;
+            text-align: right;
+            padding: 1px 4px;
+            outline: none;
+            margin-left: auto;
+            flex-shrink: 0;
+        }
+        .setting-val-input:focus { border-color: #629924; }
         .info-icon {
             cursor: help;
             color: #3a3a3a;
@@ -142,11 +162,18 @@
             color: #666;
             text-transform: uppercase;
             letter-spacing: 1px;
-            margin: 16px 0 8px 0;
-            padding-bottom: 4px;
-            border-bottom: 1px solid #222;
+            margin: 20px 0 10px 0;
+            padding: 8px 0 4px 0;
+            border-bottom: 1px solid #2a2a2a;
+            border-top: 1px solid #1a1a1a;
         }
-        .section-header:first-of-type { margin-top: 0; }
+        .section-header:first-of-type { margin-top: 0; border-top: none; padding-top: 0; }
+
+        /* ── play mode (zen) ── */
+        body.play-mode .sidebar { visibility: hidden; }
+        body.play-mode #eval-bar { visibility: hidden; }
+        body.play-mode #eval-graph-container { visibility: hidden; }
+        body.play-mode #mcts-stats-container { visibility: hidden !important; }
 
         /* ── elo lock ── */
         .lock-btn {
@@ -200,34 +227,42 @@
             cursor: default;
             flex-shrink: 0;
             height: 500px;
+            display: flex;
+            flex-direction: column;
         }
-        #eval-bar-fill {
-            position: absolute;
-            bottom: 0; left: 0; right: 0;
+        /* WDL segments: Loss on top (black), Draw in middle (gray), Win on bottom (white) */
+        #wdl-loss {
+            background: #1e1e1e;
+            transition: flex 0.3s ease;
+            flex: 0.33;
+            position: relative;
+        }
+        #wdl-draw {
+            background: #666;
+            transition: flex 0.3s ease;
+            flex: 0.34;
+            position: relative;
+        }
+        #wdl-win {
             background: #c8c8c8;
-            transition: height 0.3s ease;
-            height: 50%;
+            transition: flex 0.3s ease;
+            flex: 0.33;
+            position: relative;
         }
-        #eval-bar-label-top {
+        .wdl-label {
             position: absolute;
-            top: 2px; left: 0; right: 0;
+            left: 0; right: 0;
             text-align: center;
-            font-size: 8px;
+            font-size: 7px;
             font-weight: 700;
-            color: #888;
-            z-index: 2;
             pointer-events: none;
+            line-height: 1;
+            padding: 1px 0;
         }
-        #eval-bar-label-bottom {
-            position: absolute;
-            bottom: 2px; left: 0; right: 0;
-            text-align: center;
-            font-size: 8px;
-            font-weight: 700;
-            color: #222;
-            z-index: 2;
-            pointer-events: none;
-        }
+        /* Label colors for contrast against segment backgrounds */
+        #wdl-win .wdl-label { bottom: 2px; color: #222; }
+        #wdl-loss .wdl-label { top: 2px; color: #aaa; }
+        #wdl-draw .wdl-label { top: 50%; transform: translateY(-50%); color: #fff; }
 
         /* ── clocks ── */
         .clock-row {
@@ -402,7 +437,7 @@
             white-space: pre-wrap;
             width: 100%;
             min-height: 28px;
-            max-height: 80px;
+            max-height: 160px;
             overflow-y: auto;
             background: transparent;
             border: none;
@@ -430,7 +465,7 @@
         #eval-graph-container { margin-top: 4px; width: 522px; }
         #eval-graph {
             width: 100%;
-            height: 44px;
+            height: 80px;
             background: #141414;
             border: 1px solid #2a2a2a;
             display: block;
@@ -521,7 +556,7 @@
                 Start Clock (s) <span id="v-startclock" class="setting-val">300</span>
                 <span class="info-icon" title="Simulated starting clock time fed to the model. Affects time distribution predictions.">ⓘ</span>
             </div>
-            <input type="range" id="i-startclock" min="10" max="600" step="10" value="300">
+            <input type="range" id="i-startclock" min="10" max="1800" step="10" value="300">
         </div>
 
         <div class="setting-group">
@@ -583,6 +618,14 @@
 
         <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
             <div class="setting-label" style="margin:0">
+                Play Mode
+                <span class="info-icon" title="Hide all evaluation info (arrows, eval bar, stats, graph) for a clean playing experience">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-playmode" onchange="togglePlayMode()">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
                 Show Best Move Arrow
                 <span class="info-icon" title="Draw an arrow on the board showing the model's top predicted move">ⓘ</span>
             </div>
@@ -612,7 +655,7 @@
                 Time Temp <span id="v-ttemp" class="setting-val">0.9</span>
                 <span class="info-icon" title="Temperature for predicted thinking time distribution. Lower = more deterministic timing.">ⓘ</span>
             </div>
-            <input type="range" id="i-ttemp" min="0.1" max="5.0" step="0.1" value="0.9">
+            <input type="range" id="i-ttemp" min="0.1" max="2.0" step="0.1" value="0.9">
         </div>
 
         <div class="setting-group">
@@ -664,7 +707,7 @@
                     Simulations <span id="v-mcts-sims" class="setting-val">256</span>
                     <span class="info-icon" title="Number of search iterations. More = stronger play but slower. Overridden when Adaptive is on.">ⓘ</span>
                 </div>
-                <input type="range" id="i-mcts-sims" min="16" max="5000" step="16" value="256">
+                <input type="range" id="i-mcts-sims" min="0" max="1000" step="1" value="226">
             </div>
 
             <div class="setting-group">
@@ -677,18 +720,18 @@
 
             <div class="setting-group">
                 <div class="setting-label">
-                    Max Children <span id="v-mcts-k" class="setting-val">48</span>
+                    Max Children <span id="v-mcts-k" class="setting-val">16</span>
                     <span class="info-icon" title="Maximum number of child moves to expand per node. Higher = wider but slower search.">ⓘ</span>
                 </div>
-                <input type="range" id="i-mcts-k" min="8" max="128" step="8" value="48">
+                <input type="range" id="i-mcts-k" min="1" max="64" step="1" value="16">
             </div>
 
             <div class="setting-group">
                 <div class="setting-label">
-                    Max Depth <span id="v-mcts-depth" class="setting-val">96</span>
+                    Max Depth <span id="v-mcts-depth" class="setting-val">24</span>
                     <span class="info-icon" title="Maximum search depth in the tree (plies).">ⓘ</span>
                 </div>
-                <input type="range" id="i-mcts-depth" min="1" max="200" step="1" value="96">
+                <input type="range" id="i-mcts-depth" min="1" max="200" step="1" value="24">
             </div>
 
             <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #1a1a1a; padding-top:5px;">
@@ -702,10 +745,10 @@
             <div id="adaptive-params" style="display:none; margin-bottom:10px; border-bottom:1px solid #1a1a1a; padding-bottom:5px;">
                 <div class="setting-group">
                     <div class="setting-label">
-                        Scaling Factor <span id="v-mcts-ascale" class="setting-val">150</span>
+                        Scaling Factor <span id="v-mcts-ascale" class="setting-val">30</span>
                         <span class="info-icon" title="Higher = more simulations in complex/uncertain positions. Controls how aggressively adaptive MCTS scales up search effort.">ⓘ</span>
                     </div>
-                    <input type="range" id="i-mcts-ascale" min="10" max="1000" step="10" value="150">
+                    <input type="range" id="i-mcts-ascale" min="10" max="1000" step="10" value="30">
                 </div>
             </div>
 
@@ -735,11 +778,11 @@
         </div>
 
         <div class="board-with-eval">
-            <!-- Eval bar (Lichess-style vertical bar) -->
-            <div id="eval-bar" title="Evaluation from White's perspective">
-                <div id="eval-bar-fill"></div>
-                <div id="eval-bar-label-top"></div>
-                <div id="eval-bar-label-bottom"></div>
+            <!-- WDL bar (vertical: Loss top, Draw middle, Win bottom) -->
+            <div id="eval-bar" title="Win / Draw / Loss from White's perspective">
+                <div id="wdl-loss"><span class="wdl-label"></span></div>
+                <div id="wdl-draw"><span class="wdl-label"></span></div>
+                <div id="wdl-win"><span class="wdl-label"></span></div>
             </div>
             <div id="board-wrap">
                 <div id="board" class="cg-wrap"></div>
@@ -772,7 +815,7 @@
 
         <!-- Eval Graph -->
         <div id="eval-graph-container">
-            <canvas id="eval-graph" height="50"></canvas>
+            <canvas id="eval-graph" height="80"></canvas>
         </div>
 
         <!-- PGN (editable — paste a PGN to analyze) -->
@@ -902,20 +945,33 @@ function stopClockTicking() {
 // Eval bar & graph
 // ============================
 function updateEvalBar(valueWhite) {
-    var pct = Math.max(2, Math.min(98, valueWhite * 100));
-    var fillPct = boardOrientation === 'white' ? pct : (100 - pct);
-    $('#eval-bar-fill').css('height', fillPct + '%');
+    // Legacy — kept for eval history graph
+}
 
-    // Labels: show advantage
-    var advantage = Math.abs(valueWhite - 0.5) * 2;
-    var label = advantage < 0.05 ? '' : (advantage * 100).toFixed(0);
-    if (valueWhite > 0.5) {
-        $('#eval-bar-label-bottom').text(label);
-        $('#eval-bar-label-top').text('');
+function updateWDLBar(wdl) {
+    if (!wdl) return;
+    var w = wdl.w || 0, d = wdl.d || 0, l = wdl.l || 0;
+    // wdl is always from White's perspective.
+    // Bar layout: top=loss (black), middle=draw (gray), bottom=win (white).
+    var winVal, lossVal;
+    if (boardOrientation === 'white') {
+        winVal = w; lossVal = l;  // White bottom = White win
     } else {
-        $('#eval-bar-label-top').text(label);
-        $('#eval-bar-label-bottom').text('');
+        winVal = l; lossVal = w;  // White bottom = Black win (= White loss)
     }
+    // Use flex proportions (minimum 0.5% so segments don't vanish completely)
+    var wFlex = Math.max(0.005, winVal);
+    var dFlex = Math.max(0.005, d);
+    var lFlex = Math.max(0.005, lossVal);
+    document.getElementById('wdl-loss').style.flex = lFlex;
+    document.getElementById('wdl-draw').style.flex = dFlex;
+    document.getElementById('wdl-win').style.flex = wFlex;
+    // Show percentage label in the largest segment, clear others
+    $('.wdl-label').text('');
+    var largest = Math.max(winVal, d, lossVal);
+    if (largest === winVal) { $('#wdl-win .wdl-label').text((winVal * 100).toFixed(0) + '%'); }
+    else if (largest === lossVal) { $('#wdl-loss .wdl-label').text((lossVal * 100).toFixed(0) + '%'); }
+    else { $('#wdl-draw .wdl-label').text((d * 100).toFixed(0) + '%'); }
 }
 
 function drawEvalGraph() {
@@ -1027,10 +1083,26 @@ function renderMctsStats(stats) {
     for (var i = 0; i < children.length && i < 15; i++) {
         var c = children[i];
         var width = maxVisits > 0 ? (c.visits / maxVisits * 100) : 0;
-        var qColor = c.q >= 0 ? '#629924' : '#c44';
+        // Q-value color: green (+1) → yellow (0) → red (−1)
+        var qv = Math.max(-1, Math.min(1, c.q));
+        var v01 = (qv + 1) / 2;  // map to 0..1
+        var qr, qg, qb;
+        if (v01 >= 0.5) {
+            var t = (v01 - 0.5) * 2;
+            qr = Math.round(0xb5 + (0x62 - 0xb5) * t);
+            qg = Math.round(0xa0 + (0x99 - 0xa0) * t);
+            qb = Math.round(0x30 + (0x24 - 0x30) * t);
+        } else {
+            var t = v01 * 2;
+            qr = Math.round(0xcc + (0xb5 - 0xcc) * t);
+            qg = Math.round(0x44 + (0xa0 - 0x44) * t);
+            qb = Math.round(0x44 + (0x30 - 0x44) * t);
+        }
+        var qColor = '#' + qr.toString(16).padStart(2,'0') + qg.toString(16).padStart(2,'0') + qb.toString(16).padStart(2,'0');
+        var label = c.san || c.move;
         rows += '<div class="row" style="font-size:10px; gap:4px;">' +
-            '<span class="lbl" style="width:40px;">' + c.move + '</span>' +
-            '<div class="bar-bg" style="flex:1;"><div style="background:#629924; width:' + width + '%; height:100%;"></div></div>' +
+            '<span class="lbl" style="width:40px;">' + label + '</span>' +
+            '<div class="bar-bg" style="flex:1;"><div style="background:' + qColor + '; width:' + width + '%; height:100%;"></div></div>' +
             '<span class="val" style="width:35px; text-align:right;">' + c.visits + '</span>' +
             '<span class="val" style="width:40px; text-align:right; color:' + qColor + ';">' + (c.q >= 0 ? '+' : '') + c.q.toFixed(2) + '</span>' +
             '</div>';
@@ -1311,6 +1383,80 @@ function updateBoardPosition(fen) {
 }
 
 // ============================
+// Non-linear MCTS sims slider
+// ============================
+// Quadratic mapping: slider 0-1000 → sims 1-5000
+// Low end: 0→1, 100→50, 200→200, 500→1250, 1000→5000
+function sliderToSims(v) {
+    v = Number(v);
+    return Math.max(1, Math.round((v / 1000) * (v / 1000) * 5000));
+}
+function simsToSlider(sims) {
+    sims = Number(sims);
+    return Math.round(Math.sqrt(sims / 5000) * 1000);
+}
+
+// ============================
+// Play Mode (Zen Mode)
+// ============================
+var playMode = false;
+window.togglePlayMode = function() {
+    playMode = $('#i-playmode').is(':checked');
+    if (playMode) {
+        $('body').addClass('play-mode');
+        // Also disable arrows while in play mode
+        if (cg) cg.setAutoShapes([]);
+    } else {
+        $('body').removeClass('play-mode');
+        drawTopMoveArrow();
+    }
+}
+
+// ============================
+// Editable setting values (click to type)
+// ============================
+function makeEditable(valSelector, inputSelector, formatFn) {
+    $(document).on('click', valSelector, function() {
+        var $val = $(this);
+        var $input = $(inputSelector);
+        if ($val.data('editing')) return;
+        $val.data('editing', true);
+        var currentText = $val.text();
+        var $edit = $('<input type=\"text\" class=\"setting-val-input\">').val(currentText);
+        $val.hide().after($edit);
+        $edit.focus().select();
+        function commit() {
+            var raw = $edit.val().trim();
+            var num = parseFloat(raw);
+            if (!isNaN(num)) {
+                // Set the slider
+                if ($input.attr('id') === 'i-mcts-sims') {
+                    // Non-linear: user typed actual sims, convert to slider
+                    num = Math.max(1, Math.min(5000, num));
+                    $input.val(simsToSlider(num));
+                    $val.text(num);
+                } else {
+                    var min = parseFloat($input.attr('min'));
+                    var max = parseFloat($input.attr('max'));
+                    if (!isNaN(min)) num = Math.max(min, num);
+                    if (!isNaN(max)) num = Math.min(max, num);
+                    $input.val(num);
+                    $val.text(formatFn ? formatFn(num) : num);
+                }
+                $input.trigger('change');
+            }
+            $edit.remove();
+            $val.show();
+            $val.data('editing', false);
+        }
+        $edit.on('blur', commit).on('keydown', function(e) {
+            if (e.key === 'Enter') commit();
+            if (e.key === 'Escape') { $edit.remove(); $val.show(); $val.data('editing', false); }
+        });
+    });
+}
+
+// ============================
 // Settings panel toggles
 // ============================
 window.toggleAutoPlayPanel = function() {
@@ -1343,7 +1489,7 @@ window.toggleAdaptivePanel = function() {
 // ============================
 function drawTopMoveArrow() {
     if (!cg) return;
-    if (!showArrows || !topMoveUci || topMoveUci.length < 4) {
+    if (playMode || !showArrows || !topMoveUci || topMoveUci.length < 4) {
         cg.setAutoShapes([]);
         return;
     }
@@ -1358,6 +1504,7 @@ function drawTopMoveArrow() {
 // Settings sync
 // ============================
 function sendSettings() {
+    var mctsSimsActual = sliderToSims($('#i-mcts-sims').val());
     var payload = {
         auto_play: $('#i-autoplay').is(':checked'),
         show_arrows: $('#i-arrows').is(':checked'),
@@ -1369,7 +1516,7 @@ function sendSettings() {
         opening_length: $('#i-olen').val(),
         use_mcts: $('#i-use-mcts').is(':checked'),
         show_mcts_stats: $('#i-mcts-stats').is(':checked'),
-        mcts_simulations: $('#i-mcts-sims').val(),
+        mcts_simulations: mctsSimsActual,
         mcts_c_puct: $('#i-mcts-cpuct').val(),
         mcts_max_children: $('#i-mcts-k').val(),
         mcts_max_depth: $('#i-mcts-depth').val(),
@@ -1399,7 +1546,7 @@ function sendSettings() {
     $('#v-helo').text(payload.human_elo);
     $('#v-startclock').text(payload.start_clock_s);
     $('#v-inc').text(payload.inc_s);
-    $('#v-mcts-sims').text(payload.mcts_simulations);
+    $('#v-mcts-sims').text(mctsSimsActual);
     $('#v-mcts-cpuct').text(payload.mcts_c_puct);
     $('#v-mcts-k').text(payload.mcts_max_children);
     $('#v-mcts-depth').text(payload.mcts_max_depth);
@@ -1495,7 +1642,7 @@ $('#i-topp').on('input', function() { $('#v-topp').text($(this).val()); });
 $('#i-ttopp').on('input', function() { $('#v-ttopp').text($(this).val()); });
 $('#i-otemp').on('input', function() { $('#v-otemp').text($(this).val()); });
 $('#i-olen').on('input', function() { $('#v-olen').text($(this).val()); });
-$('#i-mcts-sims').on('input', function() { $('#v-mcts-sims').text($(this).val()); });
+$('#i-mcts-sims').on('input', function() { $('#v-mcts-sims').text(sliderToSims($(this).val())); });
 $('#i-mcts-cpuct').on('input', function() { $('#v-mcts-cpuct').text($(this).val()); });
 $('#i-mcts-k').on('input', function() { $('#v-mcts-k').text($(this).val()); });
 $('#i-mcts-depth').on('input', function() { $('#v-mcts-depth').text($(this).val()); });
@@ -1503,6 +1650,24 @@ $('#i-mcts-ascale').on('input', function() { $('#v-mcts-ascale').text($(this).va
 $('#i-mcts-ft').on('input', function() { $('#v-mcts-ft').text($(this).val()); });
 $('#i-startclock').on('input', function() { $('#v-startclock').text($(this).val()); });
 $('#i-inc').on('input', function() { $('#v-inc').text($(this).val()); });
+
+// Editable values: click green value to type a number directly
+makeEditable('#v-temp', '#i-temp');
+makeEditable('#v-topp', '#i-topp');
+makeEditable('#v-ttemp', '#i-ttemp');
+makeEditable('#v-ttopp', '#i-ttopp');
+makeEditable('#v-otemp', '#i-otemp');
+makeEditable('#v-olen', '#i-olen');
+makeEditable('#v-eelo', '#i-eelo');
+makeEditable('#v-helo', '#i-helo');
+makeEditable('#v-startclock', '#i-startclock');
+makeEditable('#v-inc', '#i-inc');
+makeEditable('#v-mcts-sims', '#i-mcts-sims');
+makeEditable('#v-mcts-cpuct', '#i-mcts-cpuct');
+makeEditable('#v-mcts-k', '#i-mcts-k');
+makeEditable('#v-mcts-depth', '#i-mcts-depth');
+makeEditable('#v-mcts-ascale', '#i-mcts-ascale');
+makeEditable('#v-mcts-ft', '#i-mcts-ft');
 
 $('#i-eelo').on('input', function() {
     var val = $(this).val(); $('#v-eelo').text(val);
@@ -1514,7 +1679,7 @@ $('#i-helo').on('input', function() {
 });
 
 // Change events -> sendSettings
-$('#i-autoplay, #i-arrows, #i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-otemp, #i-olen, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-tree-reuse, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-startclock, #i-inc').on('change', function() {
+$('#i-autoplay, #i-arrows, #i-playmode, #i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-otemp, #i-olen, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-tree-reuse, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-startclock, #i-inc').on('change', function() {
     sendSettings();
 });
 
@@ -1630,6 +1795,10 @@ function updateUI(data) {
     if (data.value_white !== undefined) {
         updateEvalBar(data.value_white);
     }
+    // WDL bar
+    if (data.wdl) {
+        updateWDLBar(data.wdl);
+    }
 
     // Eval history — store value at current cursor for the graph
     if (data.value_white !== undefined && cursor <= max_cursor) {
@@ -1672,13 +1841,13 @@ function updateUI(data) {
         $('#i-mcts-stats').prop('checked', !!s.show_mcts_stats);
         showMctsStats = !!s.show_mcts_stats;
         toggleMctsStatsVisibility();
-        $('#i-mcts-sims').val(s.mcts_simulations); $('#v-mcts-sims').text(s.mcts_simulations);
+        $('#i-mcts-sims').val(simsToSlider(s.mcts_simulations)); $('#v-mcts-sims').text(s.mcts_simulations);
         $('#i-mcts-cpuct').val(s.mcts_c_puct); $('#v-mcts-cpuct').text(s.mcts_c_puct);
         $('#i-mcts-k').val(s.mcts_max_children); $('#v-mcts-k').text(s.mcts_max_children);
-        $('#i-mcts-depth').val(s.mcts_max_depth || 96); $('#v-mcts-depth').text(s.mcts_max_depth || 96);
+        $('#i-mcts-depth').val(s.mcts_max_depth || 24); $('#v-mcts-depth').text(s.mcts_max_depth || 24);
         $('#i-mcts-adaptive').prop('checked', !!s.mcts_adaptive);
         toggleAdaptivePanel();
-        $('#i-mcts-ascale').val(s.mcts_adaptive_scale || 150); $('#v-mcts-ascale').text(s.mcts_adaptive_scale || 150);
+        $('#i-mcts-ascale').val(s.mcts_adaptive_scale || 30); $('#v-mcts-ascale').text(s.mcts_adaptive_scale || 30);
         $('#i-mcts-tree-reuse').prop('checked', !!s.mcts_tree_reuse);
         $('#i-mcts-ft').val(s.mcts_final_temperature); $('#v-mcts-ft').text(s.mcts_final_temperature);
 

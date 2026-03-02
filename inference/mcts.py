@@ -585,8 +585,13 @@ def mcts_choose_move(
                 progress_stats = []
                 for m in root.children:
                     child = root.children[m]
+                    try:
+                        san = board.san(m)
+                    except Exception:
+                        san = m.uci()
                     progress_stats.append({
                         "move": m.uci(),
+                        "san": san,
                         "visits": child.visit_count,
                         "q": -child.q() if child.visit_count > 0 else 0.0,
                         "prior": child.prior
@@ -619,8 +624,13 @@ def mcts_choose_move(
         child = root.children[m]
         # child.q() is value for the player to move at the child node (opponent of root).
         # We negate it to get value for root player.
+        try:
+            san = board.san(m)
+        except Exception:
+            san = m.uci()
         children_stats.append({
             "move": m.uci(),
+            "san": san,
             "visits": child.visit_count,
             "q": -child.q(),
             "prior": child.prior

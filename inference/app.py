@@ -166,14 +166,36 @@ def format_stats_html(data: dict) -> str:
     if not data: return "<div style='color:#666;padding:8px'>Evaluating...</div>"
     def mk_bar(p, c='#629924'): return f"<div style='background:{c}; width:{max(0,min(100,p*100))}%; height:100%;'></div>"
     
-    rows = "".join([f"<div class='row'><span class='lbl'>{m['label']}</span><div class='bar-bg'>{mk_bar(m['prob'], '#629924')}</div><span class='val'>{m['prob']:.1%}</span></div>" for m in data['top_moves']])
+    def _value_color(v):
+        """Color by model value: green (good, v≥0.6) → yellow (neutral, ~0.5) → red (bad, v≤0.4)."""
+        if v is None: return '#629924'  # fallback green
+        # Clamp to [0,1] and map: 0.0=red, 0.5=yellow, 1.0=green
+        v = max(0.0, min(1.0, v))
+        if v >= 0.5:
+            t = (v - 0.5) * 2  # 0..1 within yellow→green
+            r = int(0xb5 + (0x62 - 0xb5) * t)
+            g = int(0xa0 + (0x99 - 0xa0) * t)
+            b = int(0x30 + (0x24 - 0x30) * t)
+        else:
+            t = v * 2  # 0..1 within red→yellow
+            r = int(0xcc + (0xb5 - 0xcc) * t)
+            g = int(0x44 + (0xa0 - 0x44) * t)
+            b = int(0x44 + (0x30 - 0x44) * t)
+        return f'#{r:02x}{g:02x}{b:02x}'
+    
+    rows = ""
+    for m in data['top_moves']:
+        mv_val = m.get('value')  # per-move value (win% for side to move)
+        color = _value_color(mv_val)
+        eval_txt = f"<span class='val' style='color:{color}; width:32px;'>{mv_val:.0%}</span>" if mv_val is not None else "<span class='val' style='width:32px;'></span>"
+        rows += f"<div class='row'><span class='lbl'>{m['label']}</span><div class='bar-bg'>{mk_bar(m['prob'], color)}</div><span class='val'>{m['prob']:.1%}</span>{eval_txt}</div>"
     
     extras = f"<div class='sub'>Resign: {data['resign']:.1%} | Flag: {data['flag']:.1%}</div>"
     
     policy_html = f"<div class='panel'><h3>Policy (Effective)</h3><div class='policy-scroll'>{rows}</div>{extras}</div>"
 
     w, d, l = data['wdl']['w'], data['wdl']['d'], data['wdl']['l']
-    wdl_html = f"<div class='panel'><h3>WDL</h3><div style='display:flex;height:4px;overflow:hidden;'><div style='width:{w*100}%;background:#629924'></div><div style='width:{d*100}%;background:#555'></div><div style='width:{l*100}%;background:#c44'></div></div><div class='sub'>W {w:.1%} D {d:.1%} L {l:.1%}</div></div>"
+    wdl_html = f"<div class='panel'><h3>WDL</h3><div style='display:flex;height:6px;overflow:hidden;margin-bottom:4px;'><div style='width:{w*100:.1f}%;background:#c8c8c8'></div><div style='width:{d*100:.1f}%;background:#555'></div><div style='width:{l*100:.1f}%;background:#1e1e1e;border:1px solid #333'></div></div><div class='sub'>W {w:.1%} &nbsp; D {d:.1%} &nbsp; L {l:.1%}</div></div>"
     
     val_html = f"<div class='panel'><h3>Value (Win%)</h3><div class='big-val'>{data['value']:.1%} <span class='err'>±{data['value_error']:.1%}</span></div></div>"
     
@@ -255,7 +277,8 @@ def format_stats_html(data: dict) -> str:
     return f"""
     <div class="stats-grid">
         <div style="grid-column: span 2">{policy_html}</div>
-        {wdl_html}{val_html}<div style="grid-column: span 2">{time_html}</div>
+        {wdl_html}{val_html}
+        <div style="grid-column: span 2">{time_html}</div>
     </div>
     """
 
@@ -281,22 +304,40 @@ def format_mcts_stats_html(stats: dict) -> str:
     </div>
     """
 
+    def _q_color(q):
+        """Color by Q-value: green (+1) → yellow (0) → red (−1)."""
+        v = (q + 1.0) / 2.0  # map [-1,+1] → [0,1]
+        v = max(0.0, min(1.0, v))
+        if v >= 0.5:
+            t = (v - 0.5) * 2
+            r = int(0xb5 + (0x62 - 0xb5) * t)
+            g = int(0xa0 + (0x99 - 0xa0) * t)
+            b = int(0x30 + (0x24 - 0x30) * t)
+        else:
+            t = v * 2
+            r = int(0xcc + (0xb5 - 0xcc) * t)
+            g = int(0x44 + (0xa0 - 0x44) * t)
+            b = int(0x44 + (0x30 - 0x44) * t)
+        return f'#{r:02x}{g:02x}{b:02x}'
+
     for child in children:
-        move = child['move']
+        move = child.get('san', child['move'])
         visits = child['visits']
         q = child['q']
         prior = child['prior']
         
-        # Bar for visits
+        # Bar colored by Q-value
         width = (visits / max_visits) * 100
-        bar = f"<div style='background:#629924; width:{width}%; height:100%;'></div>"
+        bar_color = _q_color(q)
+        bar = f"<div style='background:{bar_color}; width:{width}%; height:100%;'></div>"
+        q_color = _q_color(q)
         
         rows += f"""
         <div class='row' style='font-size:10px; gap:4px;'>
             <span class='lbl' style='width:40px;'>{move}</span>
             <div class='bar-bg' style='flex:1;'>{bar}</div>
             <span class='val' style='width:30px; text-align:right;'>{visits}</span>
-            <span class='val' style='width:40px; text-align:right; color:#aaa;'>{q:+.2f}</span>
+            <span class='val' style='width:40px; text-align:right; color:{q_color};'>{q:+.2f}</span>
             <span class='val' style='width:30px; text-align:right; color:#777;'>{prior:.0%}</span>
         </div>
         """
@@ -484,6 +525,13 @@ def prepare_response(board):
     clocks_black = float(clocks[chess.BLACK])
     active_color = "white" if board.turn == chess.WHITE else "black"
     
+    # WDL from White's perspective (model returns side-to-move perspective)
+    stm_wdl = current_stats.get("wdl", {"w": 0.33, "d": 0.34, "l": 0.33})
+    if board.turn == chess.WHITE:
+        wdl_white = stm_wdl
+    else:
+        wdl_white = {"w": stm_wdl["l"], "d": stm_wdl["d"], "l": stm_wdl["w"]}
+
     return jsonify({
         "fen": fen,
         "orientation": "white" if game_settings["human_color"] == chess.WHITE else "black",
@@ -501,7 +549,7 @@ def prepare_response(board):
         "top_move_uci": top_move_uci,
         "clocks": {"white": clocks_white, "black": clocks_black, "active": active_color},
         "value_white": float(current_stats.get("value", 0.5)) if board.turn == chess.WHITE else 1.0 - float(current_stats.get("value", 0.5)),
-        "wdl": current_stats.get("wdl", {"w": 0.33, "d": 0.34, "l": 0.33}),
+        "wdl": wdl_white,
     })
 
 @app.route('/')
