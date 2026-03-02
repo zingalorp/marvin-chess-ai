@@ -320,15 +320,41 @@
             display: flex;
             align-items: center;
             gap: 6px;
-            margin-bottom: 3px;
+            margin-bottom: 4px;
             font-size: 11px;
         }
         .lbl {
-            width: 48px;
+            width: 36px;
             font-weight: 700;
             color: #ccc;
             flex-shrink: 0;
         }
+        .games-pct {
+            width: 34px;
+            text-align: right;
+            font-size: 10px;
+            color: #999;
+            flex-shrink: 0;
+        }
+        /* WDL bar column */
+        .wdl-col {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+        .wdl-bar-row {
+            display: flex;
+            height: 14px;
+            overflow: hidden;
+            border-radius: 2px;
+        }
+        .wdl-seg-w { background: #c8c8c8; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+        .wdl-seg-d { background: #555;    display: flex; align-items: center; justify-content: center; overflow: hidden; }
+        .wdl-seg-b { background: #222;    display: flex; align-items: center; justify-content: center; overflow: hidden; border: 1px solid #333; box-sizing: border-box; }
+        .wdl-seg-label { font-size: 9px; font-weight: 600; white-space: nowrap; overflow: hidden; }
+        /* keep bar-bg for MCTS panel */
         .bar-bg {
             flex-grow: 1;
             height: 3px;
@@ -1568,6 +1594,19 @@ function sendSettings() {
 }
 
 var engineMovePoller = null;
+var evalMovesXhr = null;
+
+function fetchMoveEvals(atCursor) {
+    // Cancel any in-flight eval request (position changed before it finished)
+    if (evalMovesXhr) { evalMovesXhr.abort(); evalMovesXhr = null; }
+    evalMovesXhr = $.get('/eval_moves', { cursor: atCursor }, function(data) {
+        evalMovesXhr = null;
+        if (data.stale) return;  // board moved on, discard silently
+        if (cursor === atCursor) {
+            $('#current-stats').html(data.html);
+        }
+    });
+}
 
 function checkEngineMove(data) {
     if (!autoPlayEnabled) return;
@@ -1776,8 +1815,9 @@ function updateUI(data) {
     detectAndPlaySound(data.fen, prevFen, data.in_check, data.is_game_over);
     prevFen = data.fen;
 
-    // Stats
+    // Stats (fast path — per-move values arrive shortly via fetchMoveEvals)
     $('#current-stats').html(data.current_stats);
+    fetchMoveEvals(data.cursor);
 
 
     // PGN — only update if textarea is not focused (avoid overwriting user edits/paste)

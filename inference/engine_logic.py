@@ -77,8 +77,14 @@ def analyze_position(
     time_history_s: list[float] | None = None,
     tc_base_s: float | None = None,
     initial_fen: str = chess.STARTING_FEN,
+    skip_move_values: bool = False,
 ) -> dict:
-    """Analyse the current position and return policy/value/time statistics."""
+    """Analyse the current position and return policy/value/time statistics.
+
+    If *skip_move_values* is True the per-move forward passes are skipped and
+    ``top_moves[i]['value']`` will be None for all moves.  The caller can
+    fetch enriched stats later via a separate /eval_moves request.
+    """
 
     device = backend.device
 
@@ -182,7 +188,7 @@ def analyze_position(
     # For each candidate move, push it and run a quick forward pass to get the
     # resulting value.  Value from the child position is from the opponent's POV,
     # so we negate (1 − win_prob) to express it for the player who made the move.
-    if policy_display:
+    if policy_display and not skip_move_values:
         child_moves_uci = list(moves_uci)  # will be extended per child
         for entry in policy_display:
             try:

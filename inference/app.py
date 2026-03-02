@@ -148,6 +148,7 @@ def analyze_position(
     active_clock_s: float,
     opponent_clock_s: float,
     time_history_s: list[float] | None = None,
+    skip_move_values: bool = False,
 ) -> dict:
     return analyze_position_core(
         backend=backend,
@@ -160,44 +161,94 @@ def analyze_position(
         active_inc_s=float(game_settings.get("inc_s", INC_S)),
         opponent_inc_s=float(game_settings.get("inc_s", INC_S)),
         time_history_s=time_history_s,
+        skip_move_values=skip_move_values,
     )
 
 def format_stats_html(data: dict) -> str:
     if not data: return "<div style='color:#666;padding:8px'>Evaluating...</div>"
     def mk_bar(p, c='#629924'): return f"<div style='background:{c}; width:{max(0,min(100,p*100))}%; height:100%;'></div>"
-    
-    def _value_color(v):
-        """Color by model value: green (good, v≥0.6) → yellow (neutral, ~0.5) → red (bad, v≤0.4)."""
-        if v is None: return '#629924'  # fallback green
-        # Clamp to [0,1] and map: 0.0=red, 0.5=yellow, 1.0=green
-        v = max(0.0, min(1.0, v))
-        if v >= 0.5:
-            t = (v - 0.5) * 2  # 0..1 within yellow→green
-            r = int(0xb5 + (0x62 - 0xb5) * t)
-            g = int(0xa0 + (0x99 - 0xa0) * t)
-            b = int(0x30 + (0x24 - 0x30) * t)
-        else:
-            t = v * 2  # 0..1 within red→yellow
-            r = int(0xcc + (0xb5 - 0xcc) * t)
-            g = int(0x44 + (0xa0 - 0x44) * t)
-            b = int(0x44 + (0x30 - 0x44) * t)
-        return f'#{r:02x}{g:02x}{b:02x}'
-    
+
+    # All WDL/value data from engine is side-to-move perspective. Flip to White's perspective.
+    stm_is_black = data.get('stm', 'white') == 'black'
+    root_wdl = data['wdl']  # stm perspective
+    if stm_is_black:
+        # w/l swap so white segment = white's chances
+        root_wdl_white = {'w': root_wdl['l'], 'd': root_wdl['d'], 'l': root_wdl['w']}
+    else:
+        root_wdl_white = root_wdl
+
+    # Root draw rate (perspective-independent)
+    root_d = root_wdl['d']
+
+    def _wdl_from_value(v):
+        """Estimate (w, d, l) for a child move given its scalar win probability v.
+        We keep the root draw-rate anchored and scale it by how close v is to 0.5.
+        """
+        # draw fraction peaks at v=0.5, falls off toward 0/1
+        draw_scale = 1.0 - abs(v - 0.5) * 2.0  # 1 at v=0.5, 0 at v=0 or v=1
+        d_est = root_d * draw_scale
+        l_est = max(0.0, 1.0 - v - d_est)
+        # renormalise
+        total = v + d_est + l_est
+        if total > 0:
+            return v / total, d_est / total, l_est / total
+        return v, 0.0, 1.0 - v
+
+    def _wdl_bar(w, d, l, mv_val):
+        """Render a compact WDL bar with inline % labels."""
+        # Segment widths as percentages
+        wp, dp, lp = w * 100, d * 100, l * 100
+        # Label colour: white text on dark segments, dark text on white segment
+        w_lbl = f"<span class='wdl-seg-label' style='color:#222;'>{w:.0%}</span>" if wp > 12 else ""
+        d_lbl = f"<span class='wdl-seg-label' style='color:#aaa;'>{d:.0%}</span>" if dp > 10 else ""
+        l_lbl = f"<span class='wdl-seg-label' style='color:#aaa;'>{l:.0%}</span>" if lp > 12 else ""
+        return (
+            f"<div class='wdl-bar-row'>"
+            f"<div class='wdl-seg-w' style='width:{wp:.1f}%;'>{w_lbl}</div>"
+            f"<div class='wdl-seg-d' style='width:{dp:.1f}%;'>{d_lbl}</div>"
+            f"<div class='wdl-seg-b' style='width:{lp:.1f}%;'>{l_lbl}</div>"
+            f"</div>"
+        )
+
     rows = ""
     for m in data['top_moves']:
-        mv_val = m.get('value')  # per-move value (win% for side to move)
-        color = _value_color(mv_val)
-        eval_txt = f"<span class='val' style='color:{color}; width:32px;'>{mv_val:.0%}</span>" if mv_val is not None else "<span class='val' style='width:32px;'></span>"
-        rows += f"<div class='row'><span class='lbl'>{m['label']}</span><div class='bar-bg'>{mk_bar(m['prob'], color)}</div><span class='val'>{m['prob']:.1%}</span>{eval_txt}</div>"
-    
+        mv_val = m.get('value')  # win% for the side that just moved (stm before the move)
+
+        # Flip to White's perspective:
+        # entry['value'] = P(active player wins after this move) = P(opponent-of-child wins)
+        # When STM is Black, Black moved so child value is from White's POV already (1 - child_stm_win).
+        # When STM is White, White moved so child value is already White's win prob.
+        # In both cases entry['value'] = 1 - child_side_to_move_win, which equals
+        # the mover's win prob. Flip only when Black is to move.
+        if mv_val is not None and stm_is_black:
+            mv_val_white = 1.0 - mv_val
+        else:
+            mv_val_white = mv_val
+
+        # WDL bar: use per-move value if available, else fall back to root WDL (White perspective)
+        if mv_val_white is not None:
+            w_e, d_e, l_e = _wdl_from_value(mv_val_white)
+        else:
+            w_e, d_e, l_e = root_wdl_white['w'], root_wdl_white['d'], root_wdl_white['l']
+
+        wdl_col = f"<div class='wdl-col'>{_wdl_bar(w_e, d_e, l_e, mv_val)}</div>"
+        rows += (
+            f"<div class='row'>"
+            f"<span class='lbl'>{m['label']}</span>"
+            f"<span class='games-pct'>{m['prob']:.0%}</span>"
+            f"{wdl_col}"
+            f"</div>"
+        )
+
     extras = f"<div class='sub'>Resign: {data['resign']:.1%} | Flag: {data['flag']:.1%}</div>"
-    
+
     policy_html = f"<div class='panel'><h3>Policy (Effective)</h3><div class='policy-scroll'>{rows}</div>{extras}</div>"
 
-    w, d, l = data['wdl']['w'], data['wdl']['d'], data['wdl']['l']
+    w, d, l = root_wdl_white['w'], root_wdl_white['d'], root_wdl_white['l']
     wdl_html = f"<div class='panel'><h3>WDL</h3><div style='display:flex;height:6px;overflow:hidden;margin-bottom:4px;'><div style='width:{w*100:.1f}%;background:#c8c8c8'></div><div style='width:{d*100:.1f}%;background:#555'></div><div style='width:{l*100:.1f}%;background:#1e1e1e;border:1px solid #333'></div></div><div class='sub'>W {w:.1%} &nbsp; D {d:.1%} &nbsp; L {l:.1%}</div></div>"
     
-    val_html = f"<div class='panel'><h3>Value (Win%)</h3><div class='big-val'>{data['value']:.1%} <span class='err'>±{data['value_error']:.1%}</span></div></div>"
+    value_white = (1.0 - data['value']) if stm_is_black else data['value']
+    val_html = f"<div class='panel'><h3>Value (Win%)</h3><div class='big-val'>{value_white:.1%} <span class='err'>±{data['value_error']:.1%}</span></div></div>"
     
     sampled = data.get('time_sample_s', None)
     sampled_prob = data.get('time_sample_prob', None)
@@ -432,6 +483,7 @@ def prepare_response(board):
         active_clock_s=active_clock,
         opponent_clock_s=float(clocks[not board.turn]),
         time_history_s=time_hist,
+        skip_move_values=True,
     )
 
     # Persist the sampled time for this position so navigating away/back doesn't resample.
@@ -481,6 +533,7 @@ def prepare_response(board):
         'human': float(clocks[human_color]),
         'engine': float(clocks[not human_color]),
     }
+    current_stats['stm'] = 'white' if board.turn == chess.WHITE else 'black'
     current_html = format_stats_html(current_stats)
     
     # Extract top move UCI for arrow drawing
@@ -575,6 +628,55 @@ def index():
 def get_state():
     board = get_board_at_cursor()
     return prepare_response(board)
+
+
+@app.route('/eval_moves', methods=['GET'])
+def eval_moves():
+    """Slow path: run per-move forward passes and return updated stats HTML.
+
+    The client passes `cursor` so we can discard stale requests if the board
+    has already moved on.
+    """
+    expected_cursor = request.args.get('cursor', type=int, default=-1)
+    if game_state["cursor"] != expected_cursor:
+        return jsonify({"stale": True}), 200
+
+    board = get_board_at_cursor()
+    moves_uci = get_uci_list_at_cursor()
+    cursor = game_state["cursor"]
+    time_hist = _pred_time_history_s_at_cursor(cursor)
+    clocks = _clocks_at_cursor(cursor)
+
+    stats = analyze_position(
+        board,
+        moves_uci,
+        active_clock_s=float(clocks[board.turn]),
+        opponent_clock_s=float(clocks[not board.turn]),
+        time_history_s=time_hist,
+        skip_move_values=False,
+    )
+
+    # Re-apply cached / historical time sample so the time panel stays consistent
+    if cursor < len(game_state["history"]):
+        hist_item = game_state["history"][cursor]
+        if "pred_time_s" in hist_item:
+            stats["time_sample_s"] = float(hist_item["pred_time_s"])
+        if "pred_time_prob" in hist_item:
+            stats["time_sample_prob"] = float(hist_item["pred_time_prob"])
+    else:
+        cache = game_state.get("pos_cache", {})
+        entry = cache.get(cursor)
+        if entry:
+            stats["time_sample_s"] = float(entry.get("time_sample_s", stats.get("time_sample_s", 0.0)))
+            stats["time_sample_prob"] = float(entry.get("time_sample_prob", stats.get("time_sample_prob", 0.0)))
+
+    stats['stm'] = 'white' if board.turn == chess.WHITE else 'black'
+
+    # Final stale check (board may have moved while we were evaluating)
+    if game_state["cursor"] != expected_cursor:
+        return jsonify({"stale": True}), 200
+
+    return jsonify({"stale": False, "html": format_stats_html(stats)})
 
 
 @app.route('/load_pgn', methods=['POST'])
@@ -885,6 +987,7 @@ def _play_engine_move(board, stop_check=None):
         game_state["last_mcts_result"] = mcts_result
         game_state["last_mcts_ply"] = cursor_engine
 
+    engine_stats['stm'] = 'white' if board.turn == chess.WHITE else 'black'
     stats_html = format_stats_html(engine_stats)
     engine_pred_time_s = float(engine_stats.get("time_sample_s", 0.0))
     engine_pred_time_prob = float(engine_stats.get("time_sample_prob", 0.0))
