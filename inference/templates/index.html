@@ -463,7 +463,7 @@
             white-space: pre-wrap;
             width: 100%;
             min-height: 28px;
-            max-height: 160px;
+            max-height: 280px;
             overflow-y: auto;
             background: transparent;
             border: none;
@@ -1096,8 +1096,8 @@ function renderMctsStats(stats) {
     var progress = total > 0 ? (done / total * 100).toFixed(0) : 0;
     var maxVisits = children.length > 0 ? children[0].visits : 1;
 
-    // Update live arrow to show current best move during search
-    if (children.length > 0 && showArrows) {
+    // Update live arrow to show current best move during search (only while engine is thinking or analyzing)
+    if ((engineThinking || mctsAnalysisRunning) && children.length > 0 && showArrows) {
         var bestChild = children[0];
         if (bestChild.move && bestChild.move.length >= 4) {
             topMoveUci = bestChild.move;
@@ -1616,6 +1616,8 @@ function checkEngineMove(data) {
         if (engineTurn) {
             $('#status').text("Engine thinking...");
             engineThinking = true;
+            topMoveUci = null;   // clear stale arrow while engine thinks
+            drawTopMoveArrow();
             updateBoardPosition(data.fen);
             if (useMcts && showMctsStats) {
                 startMctsStream();

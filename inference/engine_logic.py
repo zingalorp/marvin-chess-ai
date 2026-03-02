@@ -189,6 +189,20 @@ def analyze_position(
     # resulting value.  Value from the child position is from the opponent's POV,
     # so we negate (1 − win_prob) to express it for the player who made the move.
     if policy_display and not skip_move_values:
+        # Build the child's time_history by prepending the parent's expected move time.
+        # The model expects time_history[0] to be the most recent move's time.
+        # At move 1 (all-zero parent history), passing zeros to the child causes extreme
+        # value predictions when increment > 0 because training never sees zero time at
+        # a position reached after a real move.  Using the expected time from the parent's
+        # time distribution gives the child a realistic, in-distribution time context.
+        t_logits_np_pre = _as_numpy(t_logits[0])
+        t_probs_pre = _softmax_np(t_logits_np_pre)
+        bins_pre = np.arange(len(t_probs_pre), dtype=np.float32)
+        expected_bin_pre = float(np.dot(t_probs_pre, bins_pre))
+        expected_time_pre = _time_bin_to_seconds(int(round(expected_bin_pre)), active_clock_s)
+        # Prepend this time to the parent's history (newest first, drop oldest).
+        child_time_history_s = [expected_time_pre] + list(time_history_s[:-1]) if time_history_s else [expected_time_pre] + [0.0] * 7
+
         child_moves_uci = list(moves_uci)  # will be extended per child
         for entry in policy_display:
             try:
@@ -214,7 +228,7 @@ def analyze_position(
                     board=child_board,
                     board_history=child_hist,
                     repetition_flags=child_rep,
-                    time_history_s=time_history_s,
+                    time_history_s=child_time_history_s,
                     ctx=child_ctx,
                     device=device,
                 )
@@ -458,12 +472,24 @@ def choose_engine_move(
         mcts_stats = out.stats
         
         mcts_elapsed_s = time.time() - mcts_start_time
-        
-        # Simulate remaining thinking time after MCTS if enabled
-        if bool(settings.get("mcts_simulate_time", False)):
+
+        # Simulate remaining thinking time if:
+        #   - UCI: MCTSSimulateTime is explicitly set, OR
+        #   - Web app: simulate_thinking_time is on (allow_ponder_sleep gates web-app calls)
+        should_sim_time = bool(settings.get("mcts_simulate_time", False)) or (
+            allow_ponder_sleep and bool(settings.get("simulate_thinking_time", False))
+        )
+        if should_sim_time:
             remaining_time = engine_pred_time_s - mcts_elapsed_s
             if remaining_time > 0:
-                time.sleep(remaining_time)
+                if stop_check is None:
+                    time.sleep(remaining_time)
+                else:
+                    deadline = time.time() + remaining_time
+                    while time.time() < deadline:
+                        if stop_check():
+                            break
+                        time.sleep(0.05)
         
         return out, engine_stats, mcts_stats, mcts_result
     else:

@@ -161,6 +161,7 @@ def analyze_position(
         active_inc_s=float(game_settings.get("inc_s", INC_S)),
         opponent_inc_s=float(game_settings.get("inc_s", INC_S)),
         time_history_s=time_history_s,
+        tc_base_s=float(game_settings.get("start_clock_s", START_CLOCK_S)),
         skip_move_values=skip_move_values,
     )
 
