@@ -998,20 +998,64 @@ def main():
     # available; also allows importing model.py by relative path.
     sys.path.insert(0, str(repo_root))
 
-    # Load Marvin model using the model_loader
-    from inference.model_loader import load_chessformer
-    loaded = load_chessformer(
-        model_py_path=model_py,
-        config_name=args.config,
-        checkpoint_path=checkpoint_path,
-        device=args.device,
-    )
-    print(f"Loaded model: {loaded.config_name}")
-    print(f"Parameters: {sum(p.numel() for p in loaded.model.parameters()):,}")
+    # Load Marvin model directly (inference.model_loader was removed; logic inlined here)
+    import importlib.util
+
+    def _load_model_module(path):
+        spec = importlib.util.spec_from_file_location("marvin_model", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _detect_config(state):
+        normalized = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        d_model = None
+        for key, value in normalized.items():
+            if "layers.0.attn.q_proj.weight" in key:
+                d_model = value.shape[0]
+                break
+        if d_model is None:
+            return "small"
+        elo_only = any(
+            "token_conditioning.token_pos_embedding.weight" in k and v.shape[0] == 2
+            for k, v in normalized.items()
+        )
+        if d_model >= 550:
+            return "large"
+        elif d_model >= 400:
+            return "small-notime" if elo_only else "small"
+        else:
+            return "tiny"
+
+    module = _load_model_module(model_py)
+    device = torch.device(args.device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = ckpt.get("model", ckpt)
+    if any(k.startswith("_orig_mod.") for k in state.keys()):
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+
+    config_name = args.config
+    if config_name == "auto":
+        config_name = _detect_config(state)
+        print(f"Auto-detected model config: {config_name}")
+    config_name = config_name.replace("-v2", "")
+
+    _config_map = {
+        "large":       module.CONFIG_LARGE,
+        "tiny":        module.CONFIG_TINY,
+        "small-notime": module.CONFIG_SMALL_NOTIME,
+    }
+    config = dict(_config_map.get(config_name, module.CONFIG_SMALL))
+    model = module.Chessformer(config).to(device)
+    model.load_state_dict(state)
+    model.eval()
+
+    print(f"Loaded model: {config_name}")
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print()
 
     # Create adapter
-    adapter = MarvinLeelaAdapter(loaded.model).to(args.device)
+    adapter = MarvinLeelaAdapter(model).to(args.device)
     
     # Apply CLI overrides for conditioning defaults
     if args.elo is not None:
