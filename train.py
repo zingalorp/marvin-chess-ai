@@ -222,7 +222,11 @@ def compute_losses(outputs, batch, policy_weight=1.0, value_weight=0.5, time_wei
     value_cls_loss = F.cross_entropy(value_cls_out, batch['y_val_cls'])
     
     # Time loss: cross-entropy on 256 bins (multimodal distribution)
-    time_loss = F.cross_entropy(time_cls_out, batch['time_target_cls'])
+    # time_cls_out is None for no_time_context models (ablation), so time_weight must be 0
+    if time_cls_out is not None:
+        time_loss = F.cross_entropy(time_cls_out, batch['time_target_cls'])
+    else:
+        time_loss = torch.tensor(0.0, device=move_logits.device)
     
     # Start square loss: cross-entropy on 64 squares
     # Target is the source square of the move (policy_target // 64 for regular moves)
@@ -279,15 +283,20 @@ def compute_metrics(outputs, batch) -> Dict[str, torch.Tensor]:
     value_cls_acc = (value_cls_out.argmax(dim=1) == batch['y_val_cls']).float().mean()
     
     # Time classification accuracy (256 bins)
-    time_cls_acc = (time_cls_out.argmax(dim=1) == batch['time_target_cls']).float().mean()
+    time_cls_acc = (
+        (time_cls_out.argmax(dim=1) == batch['time_target_cls']).float().mean()
+        if time_cls_out is not None else torch.tensor(0.0, device=move_logits.device)
+    )
     
     # Time top-5 accuracy (within 5 bins = ~2% of range)
-    time_top5_preds = time_cls_out.topk(5, dim=1).indices
-    time_top5 = (time_top5_preds == batch['time_target_cls'].unsqueeze(1)).any(dim=1).float().mean()
-    
-    # Time "close" accuracy: within 10 bins (~4% of range)
-    time_pred_bin = time_cls_out.argmax(dim=1)
-    time_close = (torch.abs(time_pred_bin - batch['time_target_cls']) <= 10).float().mean()
+    if time_cls_out is not None:
+        time_top5_preds = time_cls_out.topk(5, dim=1).indices
+        time_top5 = (time_top5_preds == batch['time_target_cls'].unsqueeze(1)).any(dim=1).float().mean()
+        time_pred_bin = time_cls_out.argmax(dim=1)
+        time_close = (torch.abs(time_pred_bin - batch['time_target_cls']) <= 10).float().mean()
+    else:
+        time_top5 = torch.tensor(0.0, device=move_logits.device)
+        time_close = torch.tensor(0.0, device=move_logits.device)
     
     # Start square accuracy (for regular moves only) - no data-dependent branching
     regular_move_mask = (policy_target < 4096).float()
@@ -786,6 +795,9 @@ def main() -> None:
         config = copy.deepcopy(CONFIG_TINY)
     elif args.config == "small-notime":
         config = copy.deepcopy(CONFIG_SMALL_NOTIME)
+        if args.time_weight != 0.0:
+            print(f"[config] small-notime: overriding --time-weight {args.time_weight} -> 0.0 (no time head)")
+            args.time_weight = 0.0
     else:  # small (default)
         config = copy.deepcopy(CONFIG_SMALL)
     

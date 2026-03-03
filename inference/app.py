@@ -13,11 +13,6 @@ import io
 from flask import Flask, render_template, render_template_string, request, jsonify, Response
 import time
 
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
-
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_S, START_CLOCK_S
 
 # =============================================================================
@@ -26,7 +21,7 @@ from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, INC_
 def parse_args():
     parser = argparse.ArgumentParser(description="Marvin Chess Inference Server")
     parser.add_argument("--weights", type=str, default=None,
-                        help="Path to model weights (.pt or .onnx file). "
+                        help="Path to model weights (.onnx file). "
                              "Default: inference/marvin_small.onnx")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to run the server on (default: 5000)")

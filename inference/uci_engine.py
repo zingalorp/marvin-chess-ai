@@ -12,16 +12,10 @@ import numpy as np
 import os
 import chess
 
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
-
 from inference.app_settings import DEFAULT_GAME_SETTINGS, DEFAULT_RNG_SEED, START_CLOCK_S
 from inference.engine_logic import choose_engine_move, analyze_position
 from inference.mcts import MCTSResult, _Node
 from inference.runtime import load_default_backend, InferenceBackend
-from inference.backend import PyTorchBackend
 
 
 def _bool_from_uci(value: str) -> bool:
@@ -52,12 +46,10 @@ class _Option:
 
 class UciEngine:
     def __init__(self, checkpoint_path: Path | None = None) -> None:
-        # Load model without compilation for fast startup.
-        # Compilation happens lazily in isready if CompileModel option is true.
+        # Load ONNX model.
         self.backend, _ckpt = load_default_backend(
-            compile_model=False, checkpoint_path=checkpoint_path,
+            checkpoint_path=checkpoint_path,
         )
-        self._model_compiled = False
         print(f"# Model: {_ckpt.name} (config: {self.backend.config_name}, backend: {self.backend.kind})", file=sys.stderr)
         
         # By default use a non-deterministic seed so separate engine processes
@@ -114,30 +106,6 @@ class UciEngine:
 
         self.options = self._build_options()
 
-    def _maybe_compile_model(self) -> None:
-        """Compile model with torch.compile if CompileModel option is enabled (PyTorch only)."""
-        if self._model_compiled:
-            return
-        if not self.settings.get("compile_model", False):
-            return
-        if not isinstance(self.backend, PyTorchBackend):
-            self._model_compiled = True  # Nothing to compile for ONNX
-            return
-        if torch is None:
-            self._model_compiled = True
-            return
-        
-        print("Compiling model with torch.compile...", file=sys.stderr)
-        start = time.time()
-        try:
-            self.backend._model = torch.compile(self.backend._model)
-            self._model_compiled = True
-            elapsed = time.time() - start
-            print(f"Model compilation complete in {elapsed:.1f}s", file=sys.stderr)
-        except Exception as e:
-            print(f"Warning: torch.compile failed: {e}. Using eager mode.", file=sys.stderr)
-            self._model_compiled = True  # Don't retry
-
     def _build_options(self) -> list[_Option]:
         # These mirror the adjustable knobs in `inference/app.py`, excluding attention/UI-only.
         return [
@@ -155,7 +123,6 @@ class UciEngine:
             _Option("HumanElo", "spin", int(self.settings["human_elo"]), min=1200, max=2400),
             _Option("EngineElo", "spin", int(self.settings["engine_elo"]), min=1200, max=2400),
             _Option("UseRealRatings", "check", bool(self.settings.get("use_real_ratings", False))),
-            _Option("CompileModel", "check", bool(self.settings.get("compile_model", False))),
             _Option("SimulateThinkingTime", "check", bool(self.settings.get("simulate_thinking_time", False))),
             _Option("InternalClock", "check", bool(self.settings.get("internal_clock", False))),
             _Option("DebugClocks", "check", bool(self.settings.get("debug_clocks", False))),
@@ -423,8 +390,6 @@ class UciEngine:
             set_setting("engine_elo", int(float(value)))
         elif name_key == "userealratings":
             set_setting("use_real_ratings", _bool_from_uci(value))
-        elif name_key == "compilemodel":
-            set_setting("compile_model", _bool_from_uci(value))
         elif name_key == "simulatethinkingtime":
             set_setting("simulate_thinking_time", _bool_from_uci(value))
         elif name_key == "internalclock":
@@ -946,7 +911,6 @@ class UciEngine:
             if line == "uci":
                 self._handle_uci()
             elif line == "isready":
-                self._maybe_compile_model()
                 self._print("readyok")
             elif line.startswith("setoption"):
                 self._handle_setoption(line)

@@ -6,15 +6,12 @@ Model and config can be selected via:
 2. Editing the defaults below
 
 Available models (in inference/ folder):
-- marvin_large.pt           (large, ~49M params)
-- marvin_small.pt           (small, ~23M params)
-- marvin_tiny.pt            (tiny, ~5M params)
-- marvin_large.onnx         (large, ONNX format)
-- marvin_small.onnx         (small, ONNX format)
-- marvin_tiny.onnx          (tiny, ONNX format)
+- marvin_large.onnx         (large, ~49M params)
+- marvin_small.onnx         (small, ~23M params)
+- marvin_tiny.onnx          (tiny, ~5M params)
 
 Available configs:
-- "auto"  : Auto-detect from checkpoint (recommended)
+- "auto"  : Auto-detect from filename (recommended)
 - "tiny"  : Tiny (~5M params)
 - "small" : Small (~23M params)
 - "large" : Large (~49M params)

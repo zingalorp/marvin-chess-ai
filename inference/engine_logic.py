@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING, Callable, Union
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import chess
-
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
 
 from inference.chessformer_policy import PolicyOutput, choose_move
 from inference.encoding import ContextOptions, build_history_from_position, canonicalize, make_model_batch
@@ -34,12 +29,10 @@ def _canonical_to_real_move(move: chess.Move, real_turn: chess.Color) -> chess.M
     return chess.Move(_mirror_square(move.from_square), _mirror_square(move.to_square), promotion=move.promotion)
 
 
-# --- numpy-friendly helpers (work with both np.ndarray and torch.Tensor) ---
+# --- numpy helpers ---
 
-def _as_numpy(x: "Union[np.ndarray, torch.Tensor]") -> np.ndarray:
-    """Convert to numpy array, handling torch tensors gracefully."""
-    if torch is not None and isinstance(x, torch.Tensor):
-        return x.detach().float().cpu().numpy()
+def _as_numpy(x: np.ndarray) -> np.ndarray:
+    """Ensure numpy float32 array."""
     return np.asarray(x, dtype=np.float32)
 
 
@@ -51,7 +44,7 @@ def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return (e / np.sum(e, axis=axis, keepdims=True)).astype(np.float32)
 
 
-def _softmax_1d(x: "Union[np.ndarray, torch.Tensor]") -> np.ndarray:
+def _softmax_1d(x: np.ndarray) -> np.ndarray:
     """1-D softmax returning numpy array."""
     a = _as_numpy(x).ravel()
     return _softmax_np(a)

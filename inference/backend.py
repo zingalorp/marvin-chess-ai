@@ -1,71 +1,27 @@
 """
-Unified inference backend abstraction for PyTorch and ONNX models.
+ONNX inference backend for Chessformer models.
 
-Both backends expose the same interface:
-    backend(batch_dict, return_promo=True) -> tuple of 7 tensors/arrays
+The backend exposes a simple callable interface:
+    backend(batch_dict, return_promo=True) -> tuple of 7 numpy arrays
 
 The tuple contains:
     (move_logits, value_out, value_cls_out, value_error_out,
      time_cls_out, start_square_logits, promo_logits)
 
-PyTorchBackend outputs are torch tensors on the backend's device.
-OnnxBackend outputs are numpy arrays (no torch dependency required).
+All outputs are numpy arrays (no PyTorch dependency required).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Union
 
 import numpy as np
-
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
-
-
-if torch is not None:
-    class PyTorchBackend:
-        """Wraps a torch.nn.Module for inference with autocast + inference_mode."""
-
-        def __init__(self, model: "torch.nn.Module", device: "torch.device", config_name: str) -> None:
-            self._model = model
-            self._device = device
-            self._config_name = config_name
-
-        # ------------------------------------------------------------------
-        @property
-        def device(self) -> "torch.device":
-            return self._device
-
-        @property
-        def config_name(self) -> str:
-            return self._config_name
-
-        @property
-        def kind(self) -> str:
-            return "pytorch"
-
-        # ------------------------------------------------------------------
-        def __call__(self, batch: "dict[str, torch.Tensor]", return_promo: bool = True) -> tuple:
-            with torch.inference_mode():
-                with torch.autocast(device_type=self._device.type, enabled=(self._device.type == "cuda")):
-                    return self._model(batch, return_promo=return_promo)
-
-else:
-    # Sentinel so imports don't break; will error at instantiation if used.
-    class PyTorchBackend:  # type: ignore[no-redef]
-        """Stub — PyTorch is not installed."""
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            raise ImportError("PyTorch is required for PyTorchBackend. Install it or use ONNX weights.")
 
 
 class OnnxBackend:
     """Wraps an ONNX Runtime InferenceSession.
 
-    Accepts batch dicts of either numpy arrays or torch tensors and always
-    returns **numpy arrays**, so the ONNX path never requires PyTorch.
+    Accepts batch dicts of numpy arrays and returns numpy arrays.
     """
 
     # Ordered output names matching the 7-tuple convention.
@@ -91,14 +47,10 @@ class OnnxBackend:
         "legal_mask",
     )
 
-    def __init__(self, session_path: str | Path, device: "Union[str, torch.device]" = "cpu", config_name: str = "") -> None:
+    def __init__(self, session_path: str | Path, device: str = "cpu", config_name: str = "") -> None:
         import onnxruntime as ort
 
-        # Normalise device to a plain string ("cpu" / "cuda").
-        if torch is not None and isinstance(device, torch.device):
-            device_str = device.type
-        else:
-            device_str = str(device).split(":")[0] if device else "cpu"
+        device_str = str(device).split(":")[0] if device else "cpu"
 
         self._session_path = str(session_path)
         self._device_str = device_str
@@ -142,12 +94,9 @@ class OnnxBackend:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _to_numpy(t: "Union[np.ndarray, Any]", target_dtype: str | None = None) -> np.ndarray:
-        """Convert an array-like (numpy or torch tensor) to numpy, coercing dtype if needed."""
-        if torch is not None and isinstance(t, torch.Tensor):
-            arr = t.detach().cpu().numpy()
-        else:
-            arr = np.asarray(t)
+    def _to_numpy(t: np.ndarray, target_dtype: str | None = None) -> np.ndarray:
+        """Ensure array has the dtype expected by the ONNX session."""
+        arr = np.asarray(t)
         if target_dtype is not None:
             onnx_to_np = {
                 "tensor(float)": np.float32,
@@ -162,7 +111,7 @@ class OnnxBackend:
                 arr = arr.astype(np_dtype)
         return arr
 
-    def __call__(self, batch: "dict[str, Union[np.ndarray, Any]]", return_promo: bool = True) -> tuple:
+    def __call__(self, batch: dict[str, np.ndarray], return_promo: bool = True) -> tuple:
         # Build the ONNX feed dict from the batch, matching expected input names.
         feed: dict[str, np.ndarray] = {}
         for name in self._INPUT_NAMES:
@@ -198,5 +147,5 @@ class OnnxBackend:
             else:
                 raise
 
-        # Return plain numpy arrays — no torch conversion.
+        # Return plain numpy arrays.
         return tuple(raw_outputs)

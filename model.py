@@ -926,13 +926,14 @@ class Chessformer(nn.Module):
         
         # Time head: 256-bin classification with attention pooling
         # Time distribution is multimodal (instant moves, short thinks, long thinks)
-        self.time_pooling = AttentionPooling(d_model, context_dim=None)
-        
-        self.time_head = nn.Sequential(
-            nn.Linear(d_model, 256, bias=False),
-            Mish(),
-            nn.Linear(256, NUM_TIME_BINS),  # logits for 256 time bins
-        )
+        # Omitted for no_time_context models (ablation study — no time info in or out)
+        if not self.no_time_context:
+            self.time_pooling = AttentionPooling(d_model, context_dim=None)
+            self.time_head = nn.Sequential(
+                nn.Linear(d_model, 256, bias=False),
+                Mish(),
+                nn.Linear(256, NUM_TIME_BINS),  # logits for 256 time bins
+            )
         
         self.apply(self._init_weights)
 
@@ -1098,9 +1099,12 @@ class Chessformer(nn.Module):
         value_error_feat = self.value_error_pool(x_squares)
         value_error_out = self.value_error_head(value_error_feat)
         
-        # Time uses attention pooling
-        time_pooled = self.time_pooling(x_squares)    # (B, d_model)
-        time_cls_out = self.time_head(time_pooled)     # (B, 256) time bin logits
+        # Time uses attention pooling (absent for no_time_context models)
+        if self.no_time_context:
+            time_cls_out = None
+        else:
+            time_pooled = self.time_pooling(x_squares)    # (B, d_model)
+            time_cls_out = self.time_head(time_pooled)     # (B, 256) time bin logits
         
         if return_promo:
             return move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits, promo_logits

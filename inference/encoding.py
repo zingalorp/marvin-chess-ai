@@ -3,15 +3,9 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Iterable, List, Optional, Tuple, Union
+from typing import Deque, Iterable, List, Optional, Tuple
 
 import numpy as np
-
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
-
 import chess
 
 
@@ -154,24 +148,17 @@ def make_model_batch(
     time_history_s: Optional[List[float]] = None,
     ctx: ContextOptions,
     tc_cat: Optional[int] = None,
-    device: Union[str, "torch.device", None] = None,
-) -> dict[str, "np.ndarray | torch.Tensor"]:
-    """Builds the exact tensor batch expected by `ChessformerV2.forward`.
+    device: str | None = None,
+) -> dict[str, np.ndarray]:
+    """Builds the exact numpy batch expected by the ONNX inference backend.
 
-    When ``device`` is a string (e.g. ``"cpu"``, ``"cuda"``) **or** when
-    PyTorch is not installed, the returned dict contains NumPy arrays so
-    that the ONNX backend can run without a PyTorch dependency.
-
-    When ``device`` is a ``torch.device`` instance, the returned dict
-    contains torch tensors on that device (legacy behaviour).
+    Returns a dict of numpy arrays, each with a leading batch dimension of 1.
 
     Notes:
     - Mirrors training: board_history + legal_moves are canonicalized, but castling/ep/scalars
       are taken from the *actual* board (see `process_pgn_v2`).
     - `legal_mask` excludes resign/flag for UCI play.
     """
-
-    use_numpy = torch is None or isinstance(device, str) or device is None
 
     if time_history_s is None:
         time_history_s = [0.0] * HISTORY_LEN
@@ -238,31 +225,17 @@ def make_model_batch(
     if board.ep_square is not None:
         ep_mask_arr[int(board.ep_square)] = 1.0
 
-    if use_numpy:
-        batch: dict = {
-            "board_history": np.array(board_history, dtype=np.int64),
-            "time_history": np.array(time_history_s, dtype=np.float32) / 60.0,
-            "rep_flags": np.array(repetition_flags, dtype=np.float32),
-            "castling": np.array(castling_list, dtype=np.float32),
-            "ep_mask": ep_mask_arr,
-            "scalars": np.array(scalars_list, dtype=np.float32),
-            "tc_cat": np.array(int(tc_cat), dtype=np.int64),
-            "legal_mask": legal_mask,
-        }
-        # Add batch dimension.
-        batch = {k: np.expand_dims(v, 0) for k, v in batch.items()}
-    else:
-        batch = {
-            "board_history": torch.tensor(board_history, dtype=torch.long),
-            "time_history": torch.tensor(np.array(time_history_s, dtype=np.float32) / 60.0),
-            "rep_flags": torch.tensor(repetition_flags, dtype=torch.float32),
-            "castling": torch.tensor(castling_list, dtype=torch.float32),
-            "ep_mask": torch.from_numpy(ep_mask_arr),
-            "scalars": torch.tensor(scalars_list, dtype=torch.float32),
-            "tc_cat": torch.tensor(int(tc_cat), dtype=torch.long),
-            "legal_mask": torch.from_numpy(legal_mask),
-        }
-        # Add batch dimension.
-        batch = {k: v.unsqueeze(0).to(device) for k, v in batch.items()}
+    batch: dict[str, np.ndarray] = {
+        "board_history": np.array(board_history, dtype=np.int64),
+        "time_history": np.array(time_history_s, dtype=np.float32) / 60.0,
+        "rep_flags": np.array(repetition_flags, dtype=np.float32),
+        "castling": np.array(castling_list, dtype=np.float32),
+        "ep_mask": ep_mask_arr,
+        "scalars": np.array(scalars_list, dtype=np.float32),
+        "tc_cat": np.array(int(tc_cat), dtype=np.int64),
+        "legal_mask": legal_mask,
+    }
+    # Add batch dimension.
+    batch = {k: np.expand_dims(v, 0) for k, v in batch.items()}
 
     return batch

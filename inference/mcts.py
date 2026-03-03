@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import time
 import chess
-
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
 
 from inference.chessformer_policy import PolicyOutput
 from inference.encoding import ContextOptions, HISTORY_LEN, canonicalize, encode_board, make_model_batch
@@ -118,10 +113,8 @@ def _time_bin_mid_seconds(bin_idx: np.ndarray, *, active_clock_s: float) -> np.n
     return (scaled_mid * scaled_mid) * max(1e-6, active_clock_s)
 
 
-def _as_numpy(x: "Union[np.ndarray, object]") -> np.ndarray:
-    """Convert to numpy, handling torch tensors if torch is available."""
-    if torch is not None and isinstance(x, torch.Tensor):
-        return x.detach().float().cpu().numpy()
+def _as_numpy(x: np.ndarray) -> np.ndarray:
+    """Ensure numpy float32 array."""
     return np.asarray(x, dtype=np.float32)
 
 

@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import numpy as np
-
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
 
 
 PROMO_INDEX_TO_CHAR = {0: "q", 1: "r", 2: "b", 3: "n"}
@@ -20,10 +15,8 @@ class SampleResult:
     prob: float
 
 
-def _to_numpy_1d(x: "Union[np.ndarray, torch.Tensor]") -> np.ndarray:
-    """Convert a 1-D tensor/array to a numpy float array."""
-    if torch is not None and isinstance(x, torch.Tensor):
-        return x.detach().float().cpu().numpy()
+def _to_numpy_1d(x: np.ndarray) -> np.ndarray:
+    """Ensure a 1-D numpy float array."""
     return np.asarray(x, dtype=np.float64)
 
 
@@ -56,7 +49,7 @@ def _top_p_filter(probs: np.ndarray, top_p: float) -> np.ndarray:
 
 
 def sample_from_logits(
-    logits: "Union[np.ndarray, torch.Tensor]",
+    logits: np.ndarray,
     *,
     temperature: float = 1.0,
     top_p: float = 1.0,
@@ -82,7 +75,7 @@ def sample_from_logits(
 
 
 def select_promo(
-    promo_logits_row: "Union[np.ndarray, torch.Tensor]",
+    promo_logits_row: np.ndarray,
     *,
     temperature: float,
     top_p: float,

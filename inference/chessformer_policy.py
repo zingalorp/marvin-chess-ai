@@ -4,12 +4,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore[assignment]
-
 import chess
 
 from inference.encoding import ContextOptions, canonicalize, make_model_batch
