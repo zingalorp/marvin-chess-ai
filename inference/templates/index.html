@@ -216,7 +216,7 @@
         .cg-wrap { width: 500px; height: 500px; }
 
         /* ── eval bar ── */
-        .board-with-eval { display: flex; gap: 0; align-items: stretch; }
+        .board-with-eval { display: flex; gap: 0; align-items: flex-start; }
         #eval-bar {
             width: 22px;
             background: #1e1e1e;
@@ -226,7 +226,8 @@
             overflow: hidden;
             cursor: default;
             flex-shrink: 0;
-            height: 500px;
+            height: 497px;
+            box-sizing: border-box;
             display: flex;
             flex-direction: column;
         }
@@ -268,8 +269,9 @@
         .clock-row {
             display: flex;
             justify-content: flex-end;
-            width: 522px;
-            margin: 1px 0;
+            width: 514px;              /* ← tweak this to shift clocks left/right */
+            box-sizing: border-box;
+            margin: 8px 0;
         }
         .clock-display {
             font-family: 'JetBrains Mono', monospace;
@@ -279,6 +281,7 @@
             min-width: 72px;
             text-align: center;
             letter-spacing: 1px;
+            box-sizing: border-box;
         }
         .clock-white { background: #c8c8c8; color: #0d0d0d; }
         .clock-black { background: #1e1e1e; color: #aaa; border: 1px solid #2a2a2a; }
@@ -391,11 +394,19 @@
         /* ════════════════════════════
            Controls
            ════════════════════════════ */
+        .controls-row {
+            display: flex;
+            align-items: center;
+            width: 514px;              /* ← tweak this to shift clocks left/right */
+            margin-top: 2px;
+            gap: 0;
+        }
         .controls {
             display: flex;
             gap: 3px;
             justify-content: center;
-            margin-top: 4px;
+            flex: 1;
+            min-width: 0;
         }
         .btn {
             background: #1a1a1a;
@@ -450,7 +461,8 @@
             background: #141414;
             border: 1px solid #2a2a2a;
             position: relative;
-            min-height: 32px;
+            /* allow container to grow with textarea */
+            min-height: 64px;
             width: 522px;
         }
         #pgn-text {
@@ -462,8 +474,8 @@
             padding: 8px 28px 8px 8px;
             white-space: pre-wrap;
             width: 100%;
-            min-height: 28px;
-            max-height: 280px;
+            min-height: 48px;          /* start small but expand */
+            max-height: 171px;
             overflow-y: auto;
             background: transparent;
             border: none;
@@ -546,20 +558,12 @@
     <div class="settings-panel">
         <div class="section-header">Game Setup</div>
 
-        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="setting-label" style="margin:0">
-                Auto Play
-                <span class="info-icon" title="Engine automatically plays its moves when it's the engine's turn">ⓘ</span>
-            </div>
-            <input type="checkbox" id="i-autoplay" onchange="toggleAutoPlayPanel()">
-        </div>
-
         <div class="setting-group" style="margin-bottom:4px">
             <div class="setting-label">
                 Engine Elo <span id="v-eelo" class="setting-val">2400</span>
                 <span class="info-icon" title="Rating level the model is conditioned to play at. Higher = stronger play.">ⓘ</span>
             </div>
-            <input type="range" id="i-eelo" min="1200" max="2600" step="50" value="2400">
+            <input type="range" id="i-eelo" min="1200" max="2400" step="50" value="2400">
         </div>
 
         <div class="lock-btn" id="lock-toggle" onclick="toggleEloLock()">
@@ -572,7 +576,7 @@
                 Human Elo <span id="v-helo" class="setting-val">2400</span>
                 <span class="info-icon" title="Rating the model assumes the opponent is playing at. Affects how it models your expected moves.">ⓘ</span>
             </div>
-            <input type="range" id="i-helo" min="1200" max="2600" step="50" value="2400">
+            <input type="range" id="i-helo" min="1200" max="2400" step="50" value="2400">
         </div>
 
         <div class="section-header">Time Control</div>
@@ -593,7 +597,38 @@
             <input type="range" id="i-inc" min="0" max="30" step="1" value="0">
         </div>
 
-        <!-- Auto-play sub-settings (hidden by default) -->
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Real Time
+                <span class="info-icon" title="Use actual wall clock elapsed time for your moves instead of model predictions. Enables the ticking clock display.">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-realtime">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Use Mode Time
+                <span class="info-icon" title="Use the single most likely predicted time bin instead of sampling. Affects clock tracking for all moves.">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-modetime">
+        </div>
+
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="setting-label" style="margin:0">
+                Use Expected Time
+                <span class="info-icon" title="Use the mean of the top-p time distribution instead of sampling. Affects clock tracking for all moves.">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-exptime">
+        </div>
+
+        <!-- Auto Play toggle + its sub-settings -->
+        <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+            <div class="setting-label" style="margin:0">
+                Auto Play
+                <span class="info-icon" title="Engine automatically plays its moves when it's the engine's turn">ⓘ</span>
+            </div>
+            <input type="checkbox" id="i-autoplay" onchange="toggleAutoPlayPanel()">
+        </div>
         <div id="autoplay-settings" style="display:none;">
             <div class="setting-group" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
                 <div class="setting-label" style="margin:0; flex:1">Play As</div>
@@ -613,30 +648,6 @@
                     <span class="info-icon" title="Engine waits for its predicted thinking time before making a move">ⓘ</span>
                 </div>
                 <input type="checkbox" id="i-simulate-thinking-time">
-            </div>
-
-            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="setting-label" style="margin:0">
-                    Real Time
-                    <span class="info-icon" title="Use actual wall clock elapsed time for your moves instead of model predictions. Enables the ticking clock display.">ⓘ</span>
-                </div>
-                <input type="checkbox" id="i-realtime">
-            </div>
-
-            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="setting-label" style="margin:0">
-                    Use Mode Time
-                    <span class="info-icon" title="Use the single most likely predicted time bin instead of sampling">ⓘ</span>
-                </div>
-                <input type="checkbox" id="i-modetime">
-            </div>
-
-            <div class="setting-group" style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="setting-label" style="margin:0">
-                    Use Expected Time
-                    <span class="info-icon" title="Use the mean of the top-p time distribution instead of sampling">ⓘ</span>
-                </div>
-                <input type="checkbox" id="i-exptime">
             </div>
         </div><!-- end autoplay-settings -->
 
@@ -812,30 +823,27 @@
             </div>
             <div id="board-wrap">
                 <div id="board" class="cg-wrap"></div>
+                <div id="promo-dialog">
+                    <div class="promo-piece" data-piece="q"></div>
+                    <div class="promo-piece" data-piece="r"></div>
+                    <div class="promo-piece" data-piece="b"></div>
+                    <div class="promo-piece" data-piece="n"></div>
+                </div>
             </div>
         </div>
 
-        <div id="promo-dialog">
-            <div class="promo-piece" data-piece="q"></div>
-            <div class="promo-piece" data-piece="r"></div>
-            <div class="promo-piece" data-piece="b"></div>
-            <div class="promo-piece" data-piece="n"></div>
-        </div>
-
-        <!-- Bottom clock -->
-        <div class="clock-row" id="clock-row-bottom">
+        <div class="controls-row">
+            <div class="controls">
+                <button class="btn" onclick="nav('start')" title="Go to start (Home)">⏮</button>
+                <button class="btn" onclick="nav('prev')" title="Previous move (←)">◀</button>
+                <button class="btn" onclick="nav('next')" title="Next move (→)">▶</button>
+                <button class="btn" onclick="nav('end')" title="Go to end (End)">⏭</button>
+                <div style="width:6px"></div>
+                <button class="btn btn-analyze" id="btn-mcts-analyze" onclick="runMctsAnalysis()" title="Run MCTS search on the current position (works without auto-play)">🔍 Analyze</button>
+                <div style="width:6px"></div>
+                <button class="btn btn-reset" onclick="resetGame()" title="Start a new game">New</button>
+            </div>
             <div class="clock-display clock-white" id="clock-bottom">5:00</div>
-        </div>
-
-        <div class="controls">
-            <button class="btn" onclick="nav('start')" title="Go to start (Home)">⏮</button>
-            <button class="btn" onclick="nav('prev')" title="Previous move (←)">◀</button>
-            <button class="btn" onclick="nav('next')" title="Next move (→)">▶</button>
-            <button class="btn" onclick="nav('end')" title="Go to end (End)">⏭</button>
-            <div style="width:6px"></div>
-            <button class="btn btn-analyze" id="btn-mcts-analyze" onclick="runMctsAnalysis()" title="Run MCTS search on the current position (works without auto-play)">🔍 Analyze</button>
-            <div style="width:6px"></div>
-            <button class="btn btn-reset" onclick="resetGame()" title="Start a new game">New</button>
         </div>
         <div id="status"></div>
 
@@ -1762,14 +1770,34 @@ $('#pgn-text').on('paste', function() {
     }, 100);
 });
 
+// automatically grow textarea height to fit content (up to max-height)
+$('#pgn-text').on('input', function() {
+    // reset to auto so scrollHeight shrink is possible
+    this.style.height = 'auto';
+    var h = Math.min(this.scrollHeight, 480);
+    this.style.height = h + 'px';
+});
+
 function loadPgn(pgnText) {
     $.ajax({
         url: '/load_pgn', type: 'POST', contentType: 'application/json',
         data: JSON.stringify({ pgn: pgnText }),
         success: function(data) {
             evalHistory = [];
+            // Sync time control sliders if the PGN had a TimeControl header
+            if (data.start_clock_s != null) {
+                var sc = Math.round(data.start_clock_s / 10) * 10;
+                $('#i-startclock').val(sc);
+                $('#v-startclock').text(sc);
+            }
+            if (data.inc_s != null) {
+                var inc = Math.round(data.inc_s);
+                $('#i-inc').val(inc);
+                $('#v-inc').text(inc);
+            }
             updateUI(data);
-            $('#status').text('PGN loaded — use ← → to navigate and explore with Marvin');
+            var tcNote = data.tc_label ? ' [TC: ' + data.tc_label + ']' : '';
+            $('#status').text('PGN loaded — use ← → to navigate and explore with Marvin' + tcNote);
         },
         error: function(xhr) {
             var msg = xhr.responseJSON ? xhr.responseJSON.error : 'Failed to parse PGN';

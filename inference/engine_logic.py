@@ -124,7 +124,7 @@ def analyze_position(
     # For analysis only: unmask resign/flag so we can inspect their probabilities.
     batch_for_rf = dict(batch)
     if "legal_mask" in batch_for_rf:
-        lm = batch_for_rf["legal_mask"].copy()
+        lm = _as_numpy(batch_for_rf["legal_mask"]).copy()
         if lm.shape[-1] > 4097:
             lm[..., 4096] = True
             lm[..., 4097] = True

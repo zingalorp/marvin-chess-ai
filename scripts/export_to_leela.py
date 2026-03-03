@@ -935,7 +935,7 @@ def main():
         description="Export Marvin Chessformer to lc0-compatible .pb.gz format"
     )
     parser.add_argument(
-        "--checkpoint", type=str, default="inference/marvin_large.pt",
+        "--input", "-i", type=str, default="inference/marvin_large.pt",
         help="Path to Marvin .pt checkpoint"
     )
     parser.add_argument(
@@ -973,8 +973,12 @@ def main():
     )
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parent
-    checkpoint_path = Path(args.checkpoint)
+    # scripts/ sits one level below the repository root.  The earlier version
+    # only inserted the scripts/ directory on sys.path, which meant
+    # ``import inference`` failed because the package lives in the parent
+    # directory.  Use parent.parent so the workspace root is added instead.
+    repo_root = Path(__file__).resolve().parent.parent
+    checkpoint_path = Path(args.input)
     if not checkpoint_path.is_absolute():
         checkpoint_path = repo_root / checkpoint_path
 
@@ -990,7 +994,8 @@ def main():
     print(f"Device: {args.device}")
     print()
 
-    # Add repo root to path so model.py can be imported
+    # Add repo root to path so ``inference`` and any sibling modules are
+    # available; also allows importing model.py by relative path.
     sys.path.insert(0, str(repo_root))
 
     # Load Marvin model using the model_loader

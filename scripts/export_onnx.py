@@ -80,6 +80,7 @@ def export_to_onnx(
     device: str = "cuda",
     opset_version: int = 14,
     batch_size: int = 1,
+    weights_path: Path | None = None,
 ):
     """Export Chessformer to ONNX format.
     
@@ -93,6 +94,7 @@ def export_to_onnx(
         repo_root=REPO_ROOT,
         device=device,
         compile_model=False,  # Don't compile for export
+        checkpoint_path=weights_path,
     )
     print(f"  Loaded from: {checkpoint_path}")
     print(f"  Config: {loaded.config_name}")
@@ -291,6 +293,12 @@ def main():
         help="ONNX opset version (default: 14 for compatibility)"
     )
     parser.add_argument(
+        "--input", "-i",
+        type=Path,
+        default=None,
+        help="Path to a specific .pt checkpoint (defaults to config.py default)"
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="Validate ONNX outputs against PyTorch"
@@ -308,6 +316,7 @@ def main():
         output_path=args.output,
         device=args.device,
         opset_version=args.opset,
+        weights_path=args.input,
     )
     
     # Validate

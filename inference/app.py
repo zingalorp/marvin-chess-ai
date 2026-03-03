@@ -246,7 +246,8 @@ def format_stats_html(data: dict) -> str:
     policy_html = f"<div class='panel'><h3>Policy (Effective)</h3><div class='policy-scroll'>{rows}</div>{extras}</div>"
 
     w, d, l = root_wdl_white['w'], root_wdl_white['d'], root_wdl_white['l']
-    wdl_html = f"<div class='panel'><h3>WDL</h3><div style='display:flex;height:6px;overflow:hidden;margin-bottom:4px;'><div style='width:{w*100:.1f}%;background:#c8c8c8'></div><div style='width:{d*100:.1f}%;background:#555'></div><div style='width:{l*100:.1f}%;background:#1e1e1e;border:1px solid #333'></div></div><div class='sub'>W {w:.1%} &nbsp; D {d:.1%} &nbsp; L {l:.1%}</div></div>"
+    _wdl_panel_bar = _wdl_bar(w, d, l, None)
+    wdl_html = f"<div class='panel'><h3>WDL</h3>{_wdl_panel_bar}</div>"
     
     value_white = (1.0 - data['value']) if stm_is_black else data['value']
     val_html = f"<div class='panel'><h3>Value (Win%)</h3><div class='big-val'>{value_white:.1%} <span class='err'>±{data['value_error']:.1%}</span></div></div>"
@@ -694,27 +695,81 @@ def load_pgn():
         if game is None:
             return jsonify({"error": "Could not parse PGN"}), 400
 
-        # Replay moves into history
+        # ── Parse TimeControl header (e.g. "300+5", "600+0") ──────────────────
+        import re as _re
+        tc_start_s: float | None = None
+        tc_inc_s: float | None = None
+        tc_label: str = ""
+        tc_header = game.headers.get("TimeControl", "").strip()
+        if tc_header and tc_header not in ("-", "?", ""):
+            m = _re.match(r'^(\d+)\+(\d+)$', tc_header)
+            if m:
+                tc_start_s = float(m.group(1))
+                tc_inc_s = float(m.group(2))
+                tc_label = tc_header
+
+        # Apply parsed TC to game settings if found
+        if tc_start_s is not None:
+            game_settings["start_clock_s"] = tc_start_s
+        if tc_inc_s is not None:
+            game_settings["inc_s"] = tc_inc_s
+        _clear_pos_cache()
+
+        # Effective values (may be newly updated from PGN or pre-existing)
+        effective_start_s = float(game_settings.get("start_clock_s", START_CLOCK_S))
+        effective_inc_s = float(game_settings.get("inc_s", INC_S))
+        # Default per-move time when %clk is unavailable: ~1/40th of start clock
+        fallback_time_s = max(1.0, effective_start_s / 40.0)
+
+        # ── Replay moves, extracting %clk times where available ───────────────
         board = chess.Board()
         new_history = []
-        for move in game.mainline_moves():
+        # Track last seen clock per color. Bootstrap with the game start clock.
+        prev_clock: dict[chess.Color, float | None] = {
+            chess.WHITE: effective_start_s,
+            chess.BLACK: effective_start_s,
+        }
+
+        for node in game.mainline():
+            move = node.move
             if move not in board.legal_moves:
                 break
+            color = board.turn  # color that is about to move (before push)
+            clk_after = node.clock()  # remaining seconds after the move, or None
+
+            if clk_after is not None:
+                prev = prev_clock[color]
+                if prev is not None:
+                    # time_spent = clock_before − clock_after
+                    # (Lichess %clk is remaining time AFTER the move, BEFORE increment is added)
+                    time_spent = max(0.0, prev - clk_after)
+                else:
+                    time_spent = fallback_time_s
+                pred_time_s = time_spent
+                prev_clock[color] = clk_after
+            else:
+                pred_time_s = fallback_time_s
+
             new_history.append({
                 'uci': move.uci(),
-                'pred_time_s': 0.0,
-                'pred_time_prob': 0.0,
+                'pred_time_s': pred_time_s,
+                'pred_time_prob': 1.0 if clk_after is not None else 0.0,
                 'prev_stats_html': '<div style="padding:10px; color:#aaa">Imported move</div>',
             })
             board.push(move)
 
         game_state["history"] = new_history
         game_state["cursor"] = 0  # Start at beginning so user can navigate
-        _clear_pos_cache()
         _clear_mcts_tree()
 
         board_at_cursor = get_board_at_cursor()
-        return prepare_response(board_at_cursor)
+        resp = prepare_response(board_at_cursor)
+        # Inject TC info into the response so the frontend can sync sliders
+        resp_data = resp.get_json()
+        resp_data["start_clock_s"] = effective_start_s if tc_start_s is not None else None
+        resp_data["inc_s"] = effective_inc_s if tc_inc_s is not None else None
+        resp_data["tc_label"] = tc_label
+        return jsonify(resp_data)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400

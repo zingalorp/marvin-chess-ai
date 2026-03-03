@@ -100,24 +100,31 @@ class OnnxBackend:
         else:
             device_str = str(device).split(":")[0] if device else "cpu"
 
-        providers: list[str] = []
-        if device_str == "cuda":
-            providers.append("CUDAExecutionProvider")
-        providers.append("CPUExecutionProvider")
-
-        self._session = ort.InferenceSession(str(session_path), providers=providers)
+        self._session_path = str(session_path)
         self._device_str = device_str
         self._config_name = config_name
 
+        self._session, self._input_meta = self._create_session()
+
+    def _create_session(self):
+        import onnxruntime as ort
+
+        providers: list[str] = []
+        if self._device_str == "cuda":
+            providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+
+        session = ort.InferenceSession(self._session_path, providers=providers)
+
         # Cache the actual provider in use.
-        active = self._session.get_providers()
+        active = session.get_providers()
         if "CUDAExecutionProvider" in active:
             print(f"[OnnxBackend] Using CUDAExecutionProvider")
         else:
             print(f"[OnnxBackend] Using CPUExecutionProvider")
 
-        # Build input-name → dtype map from the session metadata.
-        self._input_meta = {inp.name: inp for inp in self._session.get_inputs()}
+        input_meta = {inp.name: inp for inp in session.get_inputs()}
+        return session, input_meta
 
     # ------------------------------------------------------------------
     @property
@@ -166,7 +173,30 @@ class OnnxBackend:
             feed[name] = self._to_numpy(batch[name], target_dtype)
 
         output_names = list(self._OUTPUT_NAMES)
-        raw_outputs = self._session.run(output_names, feed)
+        try:
+            raw_outputs = self._session.run(output_names, feed)
+        except Exception as e:
+            # CUDA context loss (e.g. CUBLAS_STATUS_NOT_INITIALIZED) can happen after
+            # a GPU driver event.  Recreate the ONNX session and retry once.
+            err_str = str(e)
+            if any(kw in err_str for kw in ("CUBLAS", "CUDA", "CudaCall", "cudnn", "ONNXRuntimeError")):
+                print(f"[OnnxBackend] CUDA error detected, recreating session: {err_str[:120]}")
+                try:
+                    self._session, self._input_meta = self._create_session()
+                    # Rebuild feed dict with fresh input metadata.
+                    feed = {}
+                    for name in self._INPUT_NAMES:
+                        if name not in batch:
+                            continue
+                        meta = self._input_meta.get(name)
+                        target_dtype = meta.type if meta is not None else None
+                        feed[name] = self._to_numpy(batch[name], target_dtype)
+                    raw_outputs = self._session.run(output_names, feed)
+                    print("[OnnxBackend] Session recreated and retry succeeded.")
+                except Exception as retry_exc:
+                    raise RuntimeError(f"[OnnxBackend] Session recreation failed: {retry_exc}") from retry_exc
+            else:
+                raise
 
         # Return plain numpy arrays — no torch conversion.
         return tuple(raw_outputs)

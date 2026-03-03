@@ -76,14 +76,14 @@ def main():
         description="Export a training checkpoint to BF16 inference weights"
     )
     parser.add_argument(
-        "input", 
-        type=Path, 
+        "--input", "-i",
+        type=Path,
+        required=True,
         help="Path to input checkpoint (.pt file)"
     )
     parser.add_argument(
-        "output", 
-        type=Path, 
-        nargs="?",
+        "--output", "-o",
+        type=Path,
         default=None,
         help="Output path (default: inference/<input_name>_bf16.pt)"
     )
