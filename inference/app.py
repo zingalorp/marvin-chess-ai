@@ -87,7 +87,9 @@ def _softmax_1d(x) -> np.ndarray:
     a = a - np.max(a)
     e = np.exp(a)
     return (e / np.sum(e)).astype(np.float32)
-def _time_bin_to_seconds(bin_idx: int, active_clock_s: float) -> float:
+def _time_bin_to_seconds(bin_idx: int, active_clock_s: float, time_budget_cap: float | None = None) -> float:
+    if time_budget_cap is not None and time_budget_cap > 0:
+        active_clock_s = min(active_clock_s, time_budget_cap)
     scaled_mid = (bin_idx + 0.5) / 256.0
     # Inverse of sqrt scaling: target = sqrt(time_ratio), so time_ratio = target^2
     return float((scaled_mid ** 2) * max(1e-6, active_clock_s))
@@ -945,10 +947,6 @@ def update_settings():
         game_settings['show_mcts_stats'] = bool(data['show_mcts_stats'])
     if 'show_arrows' in data:
         game_settings['show_arrows'] = bool(data['show_arrows'])
-    if 'opening_temperature' in data:
-        game_settings['opening_temperature'] = float(data['opening_temperature'])
-    if 'opening_length' in data:
-        game_settings['opening_length'] = int(float(data['opening_length']))
 
     # Sampling-related settings changes should reset the per-position sampled-time cache.
     if any(k in data for k in ('time_temperature', 'time_top_p', 'use_real_time', 'use_mode_time', 'use_expected_time')):

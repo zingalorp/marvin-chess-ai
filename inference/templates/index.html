@@ -703,22 +703,6 @@
             <input type="range" id="i-ttopp" min="0.5" max="1.0" step="0.01" value="0.95">
         </div>
 
-        <div class="setting-group">
-            <div class="setting-label">
-                Opening Temp <span id="v-otemp" class="setting-val">1.2</span>
-                <span class="info-icon" title="Higher temperature during the opening phase for more variety in first moves.">ⓘ</span>
-            </div>
-            <input type="range" id="i-otemp" min="0" max="2.0" step="0.1" value="1.2">
-        </div>
-
-        <div class="setting-group">
-            <div class="setting-label">
-                Opening Length <span id="v-olen" class="setting-val">10</span>
-                <span class="info-icon" title="Number of plies (half-moves) to use the opening temperature before switching to normal.">ⓘ</span>
-            </div>
-            <input type="range" id="i-olen" min="0" max="30" step="1" value="10">
-        </div>
-
         <!-- MCTS Section -->
         <div class="section-header">Search (MCTS)</div>
 
@@ -1546,8 +1530,6 @@ function sendSettings() {
         time_temperature: $('#i-ttemp').val(),
         top_p: $('#i-topp').val(),
         time_top_p: $('#i-ttopp').val(),
-        opening_temperature: $('#i-otemp').val(),
-        opening_length: $('#i-olen').val(),
         use_mcts: $('#i-use-mcts').is(':checked'),
         show_mcts_stats: $('#i-mcts-stats').is(':checked'),
         mcts_simulations: mctsSimsActual,
@@ -1574,8 +1556,6 @@ function sendSettings() {
     $('#v-ttemp').text(payload.time_temperature);
     $('#v-topp').text(payload.top_p);
     $('#v-ttopp').text(payload.time_top_p);
-    $('#v-otemp').text(payload.opening_temperature);
-    $('#v-olen').text(payload.opening_length);
     $('#v-eelo').text(payload.engine_elo);
     $('#v-helo').text(payload.human_elo);
     $('#v-startclock').text(payload.start_clock_s);
@@ -1689,8 +1669,6 @@ $('#i-temp').on('input', function() { $('#v-temp').text($(this).val()); });
 $('#i-ttemp').on('input', function() { $('#v-ttemp').text($(this).val()); });
 $('#i-topp').on('input', function() { $('#v-topp').text($(this).val()); });
 $('#i-ttopp').on('input', function() { $('#v-ttopp').text($(this).val()); });
-$('#i-otemp').on('input', function() { $('#v-otemp').text($(this).val()); });
-$('#i-olen').on('input', function() { $('#v-olen').text($(this).val()); });
 $('#i-mcts-sims').on('input', function() { $('#v-mcts-sims').text(sliderToSims($(this).val())); });
 $('#i-mcts-cpuct').on('input', function() { $('#v-mcts-cpuct').text($(this).val()); });
 $('#i-mcts-k').on('input', function() { $('#v-mcts-k').text($(this).val()); });
@@ -1705,8 +1683,6 @@ makeEditable('#v-temp', '#i-temp');
 makeEditable('#v-topp', '#i-topp');
 makeEditable('#v-ttemp', '#i-ttemp');
 makeEditable('#v-ttopp', '#i-ttopp');
-makeEditable('#v-otemp', '#i-otemp');
-makeEditable('#v-olen', '#i-olen');
 makeEditable('#v-eelo', '#i-eelo');
 makeEditable('#v-helo', '#i-helo');
 makeEditable('#v-startclock', '#i-startclock');
@@ -1728,7 +1704,7 @@ $('#i-helo').on('input', function() {
 });
 
 // Change events -> sendSettings
-$('#i-autoplay, #i-arrows, #i-playmode, #i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-otemp, #i-olen, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-tree-reuse, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-startclock, #i-inc').on('change', function() {
+$('#i-autoplay, #i-arrows, #i-playmode, #i-temp, #i-ttemp, #i-topp, #i-ttopp, #i-use-mcts, #i-mcts-stats, #i-mcts-sims, #i-mcts-cpuct, #i-mcts-k, #i-mcts-depth, #i-mcts-adaptive, #i-mcts-ascale, #i-mcts-tree-reuse, #i-mcts-ft, #i-eelo, #i-helo, #i-simulate-thinking-time, #i-realtime, #i-modetime, #i-exptime, #i-startclock, #i-inc').on('change', function() {
     sendSettings();
 });
 
@@ -1899,8 +1875,6 @@ function updateUI(data) {
         $('#i-ttemp').val(s.time_temperature); $('#v-ttemp').text(s.time_temperature);
         $('#i-topp').val(s.top_p); $('#v-topp').text(s.top_p);
         $('#i-ttopp').val(s.time_top_p); $('#v-ttopp').text(s.time_top_p);
-        if (s.opening_temperature !== undefined) { $('#i-otemp').val(s.opening_temperature); $('#v-otemp').text(s.opening_temperature); }
-        if (s.opening_length !== undefined) { $('#i-olen').val(s.opening_length); $('#v-olen').text(s.opening_length); }
 
         $('#i-arrows').prop('checked', s.show_arrows !== false);
         showArrows = s.show_arrows !== false;

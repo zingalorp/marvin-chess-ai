@@ -19,6 +19,33 @@ if TYPE_CHECKING:
 PROMO_INDEX = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
 
 
+def dynamic_temperature(settings: dict, current_ply: int) -> float:
+    """Compute temperature with smooth exponential decay from temp_start → temp_min.
+
+    Replaces the old step-function opening temperature logic.  The decay curve
+    is: T(ply) = temp_min + (temp_start - temp_min) * exp(-decay_rate * ply).
+
+    When temp_start / temp_min are **not** set (web app path), both default to
+    ``settings["temperature"]`` and this function returns the slider value as-is.
+    The decay only activates in the UCI engine path where configs set them.
+
+    Settings used:
+        temp_start      – initial (high) temperature at ply 0  (default: settings["temperature"])
+        temp_min        – floor temperature to decay towards   (default: settings["temperature"])
+        temp_decay_rate – controls how quickly decay happens   (default: 0.10)
+                          ~0.10 → half-life ≈ 7 plies, ~0.05 → half-life ≈ 14 plies
+    """
+    base_temp = float(settings["temperature"])
+    temp_start = float(settings.get("temp_start", base_temp))
+    temp_min = float(settings.get("temp_min", base_temp))
+    decay_rate = float(settings.get("temp_decay_rate", 0.10))
+
+    if temp_start <= temp_min or decay_rate <= 0:
+        return temp_min
+
+    return temp_min + (temp_start - temp_min) * math.exp(-decay_rate * current_ply)
+
+
 def _mirror_square(sq: int) -> int:
     return sq ^ 56
 
@@ -50,10 +77,24 @@ def _softmax_1d(x: np.ndarray) -> np.ndarray:
     return _softmax_np(a)
 
 
-def _time_bin_to_seconds(bin_idx: int, active_clock_s: float) -> float:
+def _time_bin_to_seconds(bin_idx: int, active_clock_s: float, time_budget_cap: float | None = None) -> float:
+    """Convert a time-prediction bin index back to seconds.
+
+    *time_budget_cap*: when set, clamps *active_clock_s* to at most this value
+    before scaling.  This prevents inflated clocks (remaining > initial base
+    due to increment accumulation) from producing out-of-distribution time
+    predictions.  Typically set to the game's original base time.
+
+    NOTE (training mismatch): Training encodes time_ratio = time_spent /
+    active_clock where active_clock can exceed base time.  Clamping here
+    keeps inference in-distribution for the *model's* typical inputs, but
+    is not a perfect inverse of training.  A future retraining pass that
+    also clamps in the dataset would eliminate this asymmetry.
+    """
+    if time_budget_cap is not None and time_budget_cap > 0:
+        active_clock_s = min(active_clock_s, time_budget_cap)
     scaled_mid = (bin_idx + 0.5) / 256.0
     return float((scaled_mid**2) * max(1e-6, active_clock_s))
-
 
 
 def analyze_position(
@@ -122,6 +163,10 @@ def analyze_position(
             lm[..., 4096] = True
             lm[..., 4097] = True
         batch_for_rf["legal_mask"] = lm
+
+    # Cap for time decoding: don't let inflated clocks (increment accumulation)
+    # produce OOD time predictions.  Use the game's base time as upper bound.
+    _time_budget_cap: float | None = tc_base_s
 
     (m_logits, v_raw, v_cls, v_err, t_logits, _ss_logits, p_logits) = backend(batch, return_promo=True)
     (m_logits_rf, *_rest) = backend(batch_for_rf, return_promo=False)
@@ -192,7 +237,7 @@ def analyze_position(
         t_probs_pre = _softmax_np(t_logits_np_pre)
         bins_pre = np.arange(len(t_probs_pre), dtype=np.float32)
         expected_bin_pre = float(np.dot(t_probs_pre, bins_pre))
-        expected_time_pre = _time_bin_to_seconds(int(round(expected_bin_pre)), active_clock_s)
+        expected_time_pre = _time_bin_to_seconds(int(round(expected_bin_pre)), active_clock_s, _time_budget_cap)
         # Prepend this time to the parent's history (newest first, drop oldest).
         child_time_history_s = [expected_time_pre] + list(time_history_s[:-1]) if time_history_s else [expected_time_pre] + [0.0] * 7
 
@@ -249,7 +294,7 @@ def analyze_position(
 
     # Mode (Argmax)
     mode_bin = int(np.argmax(t_probs_raw))
-    mode_time_s = _time_bin_to_seconds(mode_bin, active_clock_s)
+    mode_time_s = _time_bin_to_seconds(mode_bin, active_clock_s, _time_budget_cap)
 
     t_sorted_idx = np.argsort(t_probs)[::-1]
     t_cumsum = np.cumsum(t_probs[t_sorted_idx])
@@ -262,7 +307,7 @@ def analyze_position(
     total_prob_mass = 0.0
 
     for idx in t_active_idx:
-        sec = _time_bin_to_seconds(int(idx), active_clock_s)
+        sec = _time_bin_to_seconds(int(idx), active_clock_s, _time_budget_cap)
         prob = float(t_probs[idx])
         time_dist.append({"sec": sec, "prob": prob})
 
@@ -287,7 +332,7 @@ def analyze_position(
             rng=rng,
         )
         time_sample_bin = int(time_sample.move_index)
-        time_sample_s = _time_bin_to_seconds(time_sample_bin, active_clock_s)
+        time_sample_s = _time_bin_to_seconds(time_sample_bin, active_clock_s, _time_budget_cap)
         time_sample_prob = float(time_sample.prob)
 
     # Use the analysis forward-pass logits where resign/flag are unmasked.
@@ -488,12 +533,8 @@ def choose_engine_move(
     else:
         _fb, bh, rf = build_history_from_position(chess.Board(initial_fen), moves_uci)
         
-        # Use opening temperature during opening phase for more varied openings
-        opening_length = int(settings.get("opening_length", 10))
-        if current_ply < opening_length:
-            effective_temperature = float(settings.get("opening_temperature", settings["temperature"]))
-        else:
-            effective_temperature = float(settings["temperature"])
+        # Dynamic temperature: smooth exponential decay from temp_start → temp_min
+        effective_temperature = dynamic_temperature(settings, current_ply)
         
         out = choose_move(
             backend=backend,

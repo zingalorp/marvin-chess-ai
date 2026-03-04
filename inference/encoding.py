@@ -186,8 +186,15 @@ def make_model_batch(
 
     # Use actual clock times directly - no scaling for bullet games.
     # The model will see the real time values even for bullet (<180s).
-    active_clock_norm = math.log1p(max(0.0, ctx.active_clock_s)) / 10.0
-    opp_clock_norm = math.log1p(max(0.0, ctx.opponent_clock_s)) / 10.0
+    # Clamp remaining clock to tc_base_s when available to prevent
+    # increment-inflated clocks from being out-of-distribution.
+    _active_for_scalar = ctx.active_clock_s
+    _opp_for_scalar = ctx.opponent_clock_s
+    if ctx.tc_base_s is not None and ctx.tc_base_s > 0:
+        _active_for_scalar = min(_active_for_scalar, ctx.tc_base_s)
+        _opp_for_scalar = min(_opp_for_scalar, ctx.tc_base_s)
+    active_clock_norm = math.log1p(max(0.0, _active_for_scalar)) / 10.0
+    opp_clock_norm = math.log1p(max(0.0, _opp_for_scalar)) / 10.0
     
     # Clamp increments to known values for better time prediction generalization.
     # The model struggles with rare increment values it wasn't trained on.

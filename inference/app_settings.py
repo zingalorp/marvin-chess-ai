@@ -9,8 +9,10 @@ DEFAULT_GAME_SETTINGS: dict = {
     "time_temperature": 0.9,
     "top_p": 0.95,
     "time_top_p": 0.95,
-    "opening_temperature": 1.2,
-    "opening_length": 10,
+    # Dynamic temperature decay (temp_start/temp_min/temp_decay_rate) is NOT
+    # set here — it only applies to the UCI engine path (lichess-bot configs).
+    # When these keys are absent, dynamic_temperature() falls through to the
+    # plain "temperature" value, which is what the web app slider controls.
     "human_elo": 1800,
     "engine_elo": 1800,
     "human_color": chess.WHITE,

@@ -127,10 +127,11 @@ jobs:
             |--------|------|---------|-------------|
             | Temperature | string | 0.9 | Move sampling temperature. Lower = more deterministic, higher = more random |
             | TopP | string | 0.95 | Nucleus sampling threshold. Only considers moves in top P probability mass |
-            | TimeTemperature | string | 0.5 | Temperature for time prediction sampling |
+            | TimeTemperature | string | 0.9 | Temperature for time prediction sampling |
             | TimeTopP | string | 0.95 | Top-P for time prediction |
-            | OpeningTemperature | string | 1.2 | Higher temperature in opening for variety |
-            | OpeningLength | spin | 10 | Number of plies to use opening temperature (0-100) |
+            | TempStart | string | 1.2 | Initial (high) temperature at ply 0 for dynamic decay |
+            | TempMin | string | 0.9 | Floor temperature that the dynamic decay approaches |
+            | TempDecayRate | string | 0.10 | Decay rate for temperature (0.10 ≈ half-life of 7 plies) |
             
             #### Elo & Ratings
             | Option | Type | Default | Description |

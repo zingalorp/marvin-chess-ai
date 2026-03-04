@@ -115,8 +115,9 @@ class UciEngine:
             _Option("TopP", "string", str(self.settings["top_p"])),
             _Option("TimeTemperature", "string", str(self.settings["time_temperature"])),
             _Option("TimeTopP", "string", str(self.settings["time_top_p"])),
-            _Option("OpeningTemperature", "string", str(self.settings.get("opening_temperature", 1.2))),
-            _Option("OpeningLength", "spin", int(self.settings.get("opening_length", 10)), min=0, max=100),
+            _Option("TempStart", "string", str(self.settings.get("temp_start", self.settings["temperature"]))),
+            _Option("TempMin", "string", str(self.settings.get("temp_min", self.settings["temperature"]))),
+            _Option("TempDecayRate", "string", str(self.settings.get("temp_decay_rate", 0.10))),
             _Option("UseModeTime", "check", bool(self.settings["use_mode_time"])),
             _Option("UseExpectedTime", "check", bool(self.settings["use_expected_time"])),
             _Option("UseRealTime", "check", bool(self.settings.get("use_real_time", False))),
@@ -374,10 +375,12 @@ class UciEngine:
             set_setting("time_temperature", float(value))
         elif name_key == "timetopp":
             set_setting("time_top_p", float(value))
-        elif name_key == "openingtemperature":
-            set_setting("opening_temperature", float(value))
-        elif name_key == "openinglength":
-            set_setting("opening_length", int(float(value)))
+        elif name_key == "tempstart":
+            set_setting("temp_start", float(value))
+        elif name_key == "tempmin":
+            set_setting("temp_min", float(value))
+        elif name_key == "tempdecayrate":
+            set_setting("temp_decay_rate", float(value))
         elif name_key == "usemodetime":
             set_setting("use_mode_time", _bool_from_uci(value))
         elif name_key == "useexpectedtime":
