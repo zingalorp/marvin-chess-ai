@@ -114,6 +114,28 @@ CONFIG_SMALL_NOTIME = {
     "no_time_context": True,
 }
 
+# Small-NoTime-NoHist config (~23M params, same as Small-NoTime but without board history)
+# No time context AND no board history — only the current position is seen.
+# Ablation to measure the contribution of move-history information.
+CONFIG_SMALL_NOTIME_NOHIST = {
+    "d_model": 448,
+    "n_layers": 12,
+    "n_heads": 14,
+    "d_head": 32,
+    "d_ff": 448,
+    "dropout": 0.1,
+    "max_rel_dist": 7,
+    "history_len": 1,
+    "num_piece_types": 13,
+    "num_tc_cats": 3,
+    "embedding_ffn": True,
+    "smolgen": True,
+    "smolgen_hidden": 256,
+    "smolgen_per_head": 256,
+    "no_time_context": True,
+    "no_board_history": True,
+}
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
     def __init__(self, dim, eps=1e-6):
@@ -843,6 +865,7 @@ class Chessformer(nn.Module):
         self.config = config
         d_model = config['d_model']
         self.no_time_context = config.get('no_time_context', False)
+        self.no_board_history = config.get('no_board_history', False)
         
         # Token-based conditioning
         if self.no_time_context:
@@ -970,6 +993,11 @@ class Chessformer(nn.Module):
         
         B = board_history.shape[0]
         device = board_history.device
+        
+        # Strip history if model only uses current position
+        if self.no_board_history:
+            board_history = board_history[:, :1, :]  # keep only current position
+            rep_flags = rep_flags[:, :1]              # keep only current rep flag
         
         # Encode square inputs - board state only
         x = self.input_encoder(board_history, rep_flags, castling, ep_mask)
@@ -1134,7 +1162,7 @@ if __name__ == "__main__":
     print("MODEL CONFIGS")
     print("=" * 60)
     
-    for name, config in [("TINY", CONFIG_TINY), ("SMALL", CONFIG_SMALL), ("LARGE", CONFIG_LARGE), ("SMALL_NOTIME", CONFIG_SMALL_NOTIME)]:
+    for name, config in [("TINY", CONFIG_TINY), ("SMALL", CONFIG_SMALL), ("LARGE", CONFIG_LARGE), ("SMALL_NOTIME", CONFIG_SMALL_NOTIME), ("SMALL_NOTIME_NOHIST", CONFIG_SMALL_NOTIME_NOHIST)]:
         print(f"\n--- CONFIG_{name} ---")
         model = Chessformer(config)
         print(f"Parameters: {count_parameters(model):,}")

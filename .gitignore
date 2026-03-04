@@ -9,9 +9,6 @@
 !process_pgn.py
 !process_pgn_player.py
 
-# Evaluation
-!compare_ACPL.py
-
 # Inference
 !inference/
 !inference/*.py
