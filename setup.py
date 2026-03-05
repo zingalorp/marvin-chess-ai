@@ -21,10 +21,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 REPO_ID = "holymolyyy/marvin"
 FILENAME = "marvin_small.onnx"
+HF_SUBFOLDER = "small"  # file lives at small/marvin_small.onnx in the HF repo
 DEST = Path(__file__).parent / "inference" / FILENAME
 
 HF_URL = (
-    f"https://huggingface.co/{REPO_ID}/resolve/main/{FILENAME}"
+    f"https://huggingface.co/{REPO_ID}/resolve/main/{HF_SUBFOLDER}/{FILENAME}"
 )
 
 EXPECTED_SIZE_MB = 92  # rough expected size – used for a progress sanity check
@@ -63,11 +64,17 @@ def _download_hf(dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = hf_hub_download(
         repo_id=REPO_ID,
-        filename=FILENAME,
+        filename=f"{HF_SUBFOLDER}/{FILENAME}",
         local_dir=str(dest.parent),
     )
-    # hf_hub_download already writes to local_dir/filename, so no copy needed
-    _ = tmp  # path returned; file is already at dest
+    # hf_hub_download writes to local_dir/small/marvin_small.onnx; move it up one level
+    downloaded = dest.parent / HF_SUBFOLDER / FILENAME
+    if downloaded.exists() and not dest.exists():
+        downloaded.rename(dest)
+        try:
+            downloaded.parent.rmdir()  # remove the now-empty small/ dir
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
