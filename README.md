@@ -23,11 +23,25 @@ Three sizes:
 
 ## Installation
 
+### Linux / macOS
+
 ```bash
 git clone https://github.com/zingalorp/marvin-chess-ai.git
 cd marvin-chess-ai
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+python setup.py          # downloads inference/marvin_small.onnx (~92 MB) from Hugging Face
+```
+
+### Windows
+
+```powershell
+git clone https://github.com/zingalorp/marvin-chess-ai.git
+cd marvin-chess-ai
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python setup.py          # downloads inference/marvin_small.onnx (~92 MB) from Hugging Face
 ```
 
 ## Usage
@@ -66,7 +80,7 @@ git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git && cd l
 | Option | Value | Notes |
 |---|---|---|
 | nodes | `1` | Policy-only play; can be increased for stronger play|
-| `--backend` | `onnx-cuda`, `onnx-dml`, or `onnx-cpu` | Required |
+| `--backend` | `onnx-dml` or `onnx-cpu` | Required |
 | `--PolicyTemperature` | `0.0-1.0` | Lower = less random |
 | `--MiniBatchSize` | `1` | When nodes is set to 1
 

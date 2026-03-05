@@ -32,3 +32,6 @@ pydantic
 onnx
 onnxscript
 onnxruntime-gpu  # Provides CUDAExecutionProvider (requires cuDNN 9.x)
+
+# --- Hugging Face (model weight downloads) ---
+huggingface_hub
