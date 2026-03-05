@@ -23,7 +23,7 @@ Three sizes:
 
 ## Installation
 
-### Linux / macOS
+### Linux
 
 ```bash
 git clone https://github.com/zingalorp/marvin-chess-ai.git
