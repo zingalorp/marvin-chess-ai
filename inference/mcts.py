@@ -217,10 +217,16 @@ class MCTSSettings:
     # Leela uses ~0.1 by default when playing weaker opponents.
     contempt: float = 0.15
 
-    # First Play Urgency (FPU): for unvisited children, use (parent_q - fpu_reduction)
-    # as the value term (in the *parent player's* perspective) instead of implicitly using 0.0.
+    # First Play Urgency (FPU): for unvisited children, use
+    #   FPU = -parent_Q - fpu_reduction * sqrt(visited_policy)
+    # as the value term. This matches lc0's "reduction" strategy.
     # Set to 0.0 to keep legacy behavior.
-    fpu_reduction: float = 0.20
+    fpu_reduction: float = 0.33
+
+    # Batch size: how many leaves to gather before a single NN evaluation.
+    # Larger batch = better GPU utilisation but more virtual-loss distortion.
+    # 0 or 1 = unbatched (original behavior).
+    batch_size: int = 1
 
     # Tree reuse: if True, preserve tree across searches for the same game
     tree_reuse: bool = False
@@ -236,7 +242,7 @@ class MCTSResult:
 
 
 class _Node:
-    __slots__ = ("prior", "visit_count", "value_sum", "children", "expanded", "pred_time_s")
+    __slots__ = ("prior", "visit_count", "value_sum", "children", "expanded", "pred_time_s", "n_in_flight")
 
     def __init__(self, prior: float) -> None:
         self.prior = float(prior)
@@ -245,6 +251,11 @@ class _Node:
         self.children: Dict[chess.Move, _Node] = {}
         self.expanded = False
         self.pred_time_s = 0.0
+        self.n_in_flight = 0  # virtual loss counter (lc0-style)
+
+    def n_started(self) -> int:
+        """N + n_in_flight — used in PUCT denominator (lc0: GetNStarted)."""
+        return self.visit_count + self.n_in_flight
 
     def q(self) -> float:
         return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
@@ -331,25 +342,47 @@ def find_subtree_by_move_sequence(
 
 
 def _select_child(node: _Node, *, c_puct: float, fpu_reduction: float) -> Tuple[chess.Move, _Node]:
+    """PUCT selection with lc0-style FPU and virtual-loss-aware visit counts.
+
+    Key differences from naive PUCT:
+    * The exploration denominator uses ``n_started()`` (= N + n_in_flight)
+      so that in-flight paths in the current batch are discouraged.
+    * FPU uses the "reduction" strategy:
+        FPU = −parent_Q − fpu_reduction × √(visited_policy)
+      where visited_policy = Σ prior(child) for children with N > 0.
+      This matches lc0's default (fpu_value=0.330).
+    * FPU is applied based on *real* visit_count (not n_started), matching
+      lc0: a node with n=0 but n_in_flight>0 still gets FPU as its Q.
+    """
     assert node.children
-    sqrt_n = np.sqrt(max(1, node.visit_count))
+    # lc0: puct_mult = cpuct * sqrt(max(children_visits, 1))
+    # children_visits = parent.n - 1 (the parent's own expansion visit)
+    # For simplicity we use max(1, parent.n_started) which is close enough.
+    sqrt_n = np.sqrt(max(1, node.n_started()))
 
     parent_q = node.q()
     use_fpu = float(fpu_reduction) > 0.0
+
+    # Compute visited_policy for FPU (sum of priors of visited children)
+    visited_policy = 0.0
+    if use_fpu:
+        for child in node.children.values():
+            if child.visit_count > 0:  # real visits, NOT n_started
+                visited_policy += child.prior
 
     best_move: Optional[chess.Move] = None
     best_child: Optional[_Node] = None
     best_score = -1e30
 
     for mv, child in node.children.items():
-        u = c_puct * child.prior * (sqrt_n / (1 + child.visit_count))
-        # `child.q()` is stored from the perspective of the player *to move at the child*.
-        # At the parent, we choose moves for the current player, so we negate.
+        # Exploration term uses n_started (includes virtual loss)
+        u = c_puct * child.prior * (sqrt_n / (1 + child.n_started()))
+        # Value term:
+        # - For visited nodes: negate child Q (opponent's perspective)
+        # - For unvisited nodes: FPU reduction
         if use_fpu and child.visit_count == 0:
-            # FPU uses a pessimistic initial value for unvisited children.
-            # parent_q is from the parent's side-to-move; that's the value perspective we
-            # want for move selection at this node.
-            v_term = float(parent_q - fpu_reduction)
+            # lc0 FPU: -parent_Q - fpu_reduction * sqrt(visited_policy)
+            v_term = float(-parent_q - fpu_reduction * np.sqrt(visited_policy))
         else:
             v_term = float(-child.q())
 
@@ -393,6 +426,265 @@ def _prune_priors(priors: Dict[chess.Move, float], *, max_children: int) -> Dict
     if s <= 0:
         return {mv: 1.0 / len(items) for mv, _ in items}
     return {mv: float(p / s) for mv, p in items}
+
+
+##############################################################################
+# Batched MCTS helpers (lc0-style virtual-loss gathering)
+##############################################################################
+
+@dataclass
+class _LeafInfo:
+    """One leaf selected during batch gathering."""
+    path: list  # list[_Node] from root to leaf
+    board: Optional[chess.Board]  # board state at the leaf (None for collisions)
+    time_history: Optional[list]
+    terminal_value: Optional[float]  # not None ⇒ terminal node
+    is_collision: bool
+
+
+def _gather_batch(
+    root: _Node,
+    board: chess.Board,
+    *,
+    batch_size: int,
+    c_puct: float,
+    fpu_reduction: float,
+    max_depth: int,
+    time_history_s: Optional[list],
+) -> list[_LeafInfo]:
+    """Select up to *batch_size* leaves using virtual loss for diversification.
+
+    Mimics lc0's ``PickNodesToExtend``:
+
+    * Walk the tree from root using PUCT (which sees ``n_started``).
+    * At the leaf, increment ``n_in_flight`` along the **entire path** so that
+      the next selection in this batch is discouraged from the same path.
+    * If a leaf has ``visit_count == 0`` **and** ``n_in_flight > 0`` (already
+      claimed by an earlier path in this batch), mark it as a **collision**.
+      Collisions have their virtual loss cancelled later with no value backup.
+    """
+    leaves: list[_LeafInfo] = []
+
+    for _ in range(batch_size):
+        node = root
+        b = board.copy(stack=True)
+        th = list(time_history_s) if time_history_s is not None else None
+        path: list[_Node] = [node]
+        tv: Optional[float] = None
+
+        depth = 0
+        while node.expanded and node.children and depth < max_depth:
+            mv, child = _select_child(
+                node, c_puct=c_puct, fpu_reduction=fpu_reduction,
+            )
+            b.push(mv)
+            if th is not None:
+                th = [float(getattr(node, "pred_time_s", 0.0))] + th[:-1]
+            node = child
+            path.append(node)
+            depth += 1
+
+            tv = _terminal_value_for_side_to_move(b)
+            if tv is not None:
+                break
+
+        if tv is None:
+            tv = _terminal_value_for_side_to_move(b)
+
+        # Collision detection (lc0: TryStartScoreUpdate CAS for n=0 nodes)
+        # Only one path can claim an unexpanded leaf. If a second path reaches
+        # the same unexpanded node, it's a collision.
+        is_collision = False
+        if tv is None and not node.expanded and node.visit_count == 0 and node.n_in_flight > 0:
+            is_collision = True
+
+        # Apply virtual loss along the ENTIRE path (lc0: IncrementNInFlight)
+        for n in path:
+            n.n_in_flight += 1
+
+        if is_collision:
+            leaves.append(_LeafInfo(
+                path=path, board=None, time_history=None,
+                terminal_value=None, is_collision=True,
+            ))
+        elif tv is not None:
+            leaves.append(_LeafInfo(
+                path=path, board=b, time_history=th,
+                terminal_value=tv, is_collision=False,
+            ))
+        else:
+            leaves.append(_LeafInfo(
+                path=path, board=b.copy(stack=True), time_history=th,
+                terminal_value=None, is_collision=False,
+            ))
+
+    return leaves
+
+
+def _evaluate_batch(
+    leaves: list[_LeafInfo],
+    *,
+    backend: "InferenceBackend",
+    ctx: ContextOptions,
+    root_turn: chess.Color,
+    contempt: float,
+    max_children: int,
+) -> list[Optional[Tuple[Dict[chess.Move, float], float, float]]]:
+    """Evaluate all non-terminal, non-collision leaves in a SINGLE batched NN call.
+
+    Returns a list parallel to *leaves*. Entries are None for terminals/collisions
+    and (priors, value, time_s) for evaluated leaves.
+    """
+    results: list[Optional[Tuple[Dict[chess.Move, float], float, float]]] = [None] * len(leaves)
+
+    # Collect indices that need NN evaluation
+    eval_indices: list[int] = []
+    batch_inputs: list[dict[str, np.ndarray]] = []
+
+    for i, leaf in enumerate(leaves):
+        if leaf.is_collision or leaf.terminal_value is not None:
+            continue
+        # Build the input for this position
+        brd = leaf.board
+        assert brd is not None
+        board_history, repetition_flags = _history_from_board(brd)
+        eff_ctx = _ctx_for_side_to_move(
+            ctx, root_turn=root_turn, node_turn=brd.turn,
+            halfmove_clock=int(brd.halfmove_clock),
+        )
+        single_batch = make_model_batch(
+            board=brd,
+            board_history=board_history,
+            repetition_flags=repetition_flags,
+            time_history_s=leaf.time_history,
+            ctx=eff_ctx,
+            device=backend.device,
+        )
+        eval_indices.append(i)
+        batch_inputs.append(single_batch)
+
+    if not batch_inputs:
+        return results
+
+    # Stack all single-sample batches into one mega-batch
+    if len(batch_inputs) == 1:
+        mega_batch = batch_inputs[0]
+    else:
+        mega_batch = {
+            key: np.concatenate([b[key] for b in batch_inputs], axis=0)
+            for key in batch_inputs[0]
+        }
+
+    # Single NN forward pass for all leaves
+    move_logits_all, _v_raw, v_cls_all, _v_err, t_logits_all, _ss, promo_logits_all = backend(
+        mega_batch, return_promo=True,
+    )
+
+    # Split results back to individual positions
+    for batch_idx, leaf_idx in enumerate(eval_indices):
+        leaf = leaves[leaf_idx]
+        brd = leaf.board
+        assert brd is not None
+
+        move_logits = _as_numpy(move_logits_all[batch_idx])
+        promo_p = _softmax_np(_as_numpy(promo_logits_all[batch_idx]), axis=-1)
+
+        wdl = _softmax_np(_as_numpy(v_cls_all[batch_idx]))
+        value = float(wdl[2] - wdl[0] - contempt * wdl[1])
+
+        t_probs = _softmax_np(_as_numpy(t_logits_all[batch_idx]))
+        bin_idx = np.arange(t_probs.shape[0], dtype=np.float32)
+        eff_ctx = _ctx_for_side_to_move(
+            ctx, root_turn=root_turn, node_turn=brd.turn,
+            halfmove_clock=int(brd.halfmove_clock),
+        )
+        bin_seconds = _time_bin_mid_seconds(bin_idx, active_clock_s=float(eff_ctx.active_clock_s))
+        exp_time_s = float(np.sum(t_probs * bin_seconds))
+
+        real_turn = brd.turn
+        canonical = canonicalize(brd)
+
+        logits_list: list[float] = []
+        moves_list: list[chess.Move] = []
+
+        for mv in canonical.legal_moves:
+            base_idx = mv.from_square * 64 + mv.to_square
+            logit = float(move_logits[base_idx])
+            if mv.promotion is not None and 56 <= mv.to_square <= 63:
+                file_idx = mv.to_square - 56
+                p_idx = _PROMO_INDEX.get(mv.promotion, 0)
+                promo_prob = float(promo_p[file_idx, p_idx])
+                logit += float(np.log(max(1e-8, promo_prob)))
+            real_mv = _canonical_to_real_move(mv, real_turn)
+            moves_list.append(real_mv)
+            logits_list.append(logit)
+
+        if not moves_list:
+            results[leaf_idx] = ({}, value, exp_time_s)
+            continue
+
+        x = np.array(logits_list, dtype=np.float64)
+        x = x - float(np.max(x))
+        probs = np.exp(x)
+        probs = probs / float(np.sum(probs) + 1e-12)
+
+        priors = {mv: float(p) for mv, p in zip(moves_list, probs)}
+        priors = _prune_priors(priors, max_children=max_children)
+        results[leaf_idx] = (priors, value, exp_time_s)
+
+    return results
+
+
+def _backprop_batch(
+    leaves: list[_LeafInfo],
+    eval_results: list[Optional[Tuple[Dict[chess.Move, float], float, float]]],
+) -> int:
+    """Backpropagate results and cancel virtual loss for all leaves.
+
+    For each leaf:
+    * **Collision**: cancel virtual loss (n_in_flight -= 1) along the path.
+      NO value backup.  (lc0: CancelSharedCollisions)
+    * **Terminal**: backup the terminal value, remove virtual loss.
+    * **NN-evaluated**: expand the node, backup the NN value, remove virtual loss.
+
+    Returns the number of non-collision leaves (real work done).
+    """
+    real_count = 0
+
+    for i, leaf in enumerate(leaves):
+        if leaf.is_collision:
+            # Cancel virtual loss only — no backup (lc0: CancelScoreUpdate)
+            for n in leaf.path:
+                n.n_in_flight -= 1
+            continue
+
+        real_count += 1
+        result = eval_results[i]
+        node = leaf.path[-1]  # the leaf node
+
+        if leaf.terminal_value is not None:
+            leaf_value = float(leaf.terminal_value)
+        else:
+            assert result is not None
+            priors, leaf_value, leaf_time_s = result
+            node.pred_time_s = float(leaf_time_s)
+            if not node.expanded:
+                for mv2, p2 in priors.items():
+                    node.children[mv2] = _Node(p2)
+                node.expanded = True
+
+        # Backup: walk path from leaf to root.
+        # lc0 uses incremental mean: Q += (v - Q) / (n + 1)
+        # We use sum-based storage: value_sum += v, visit_count += 1
+        # Both are equivalent since q() = value_sum / visit_count.
+        v = leaf_value
+        for n in reversed(leaf.path):
+            n.visit_count += 1
+            n.value_sum += v
+            n.n_in_flight -= 1  # remove virtual loss (lc0: FinalizeScoreUpdate)
+            v = -v  # flip for opponent
+
+    return real_count
 
 
 def mcts_choose_move(
@@ -507,97 +799,170 @@ def mcts_choose_move(
     # Run simulations
     sims = max(1, int(settings.simulations))
     max_depth = max(1, int(settings.max_depth))
+    batch_size = max(1, int(getattr(settings, "batch_size", 1)))
 
     # Lightweight diagnostics counters (minimal overhead)
     done = 0
     node_count = 1 + len(root.children)  # count the root + immediate root children
     start_time = time.time()
-    while done < sims:
-        if stop_check is not None and stop_check():
-            break
 
-        # --- Select a leaf ---
-        node = root
-        b = board.copy(stack=True)
-        th = list(time_history_s) if time_history_s is not None else None
-        path: list[_Node] = [node]
-
-        depth = 0
-        while node.expanded and node.children and depth < max_depth:
-            mv, child = _select_child(
-                node,
-                c_puct=float(settings.c_puct),
-                fpu_reduction=float(getattr(settings, "fpu_reduction", 0.0)),
-            )
-            b.push(mv)
-            if th is not None:
-                th = [float(getattr(node, "pred_time_s", 0.0))] + th[:-1]
-            node = child
-            path.append(node)
-            depth += 1
-
-            tv = _terminal_value_for_side_to_move(b)
-            if tv is not None:
+    if batch_size <= 1:
+        # ── Unbatched path (original behavior) ─────────────────────────────
+        while done < sims:
+            if stop_check is not None and stop_check():
                 break
 
-        tv = _terminal_value_for_side_to_move(b)
+            # --- Select a leaf ---
+            node = root
+            b = board.copy(stack=True)
+            th = list(time_history_s) if time_history_s is not None else None
+            path: list[_Node] = [node]
 
-        # --- Evaluate the leaf ---
-        if tv is not None:
-            leaf_value = float(tv)
-        else:
-            priors2, leaf_value, leaf_time_s = _evaluate_position(
+            depth = 0
+            while node.expanded and node.children and depth < max_depth:
+                mv, child = _select_child(
+                    node,
+                    c_puct=float(settings.c_puct),
+                    fpu_reduction=float(settings.fpu_reduction),
+                )
+                b.push(mv)
+                if th is not None:
+                    th = [float(getattr(node, "pred_time_s", 0.0))] + th[:-1]
+                node = child
+                path.append(node)
+                depth += 1
+
+                tv = _terminal_value_for_side_to_move(b)
+                if tv is not None:
+                    break
+
+            tv = _terminal_value_for_side_to_move(b)
+
+            # --- Evaluate the leaf ---
+            if tv is not None:
+                leaf_value = float(tv)
+            else:
+                priors2, leaf_value, leaf_time_s = _evaluate_position(
+                    backend=backend,
+                    board=b,
+                    ctx=ctx,
+                    root_turn=root_turn,
+                    time_history_s=th,
+                    contempt=float(settings.contempt),
+                )
+                node.pred_time_s = float(leaf_time_s)
+
+                priors2 = _prune_priors(priors2, max_children=int(settings.max_children))
+                if not node.expanded:
+                    for mv2, p2 in priors2.items():
+                        node.children[mv2] = _Node(p2)
+                    node.expanded = True
+                    node_count += len(priors2)
+
+            # --- Backup ---
+            v = leaf_value
+            for n in reversed(path):
+                n.visit_count += 1
+                n.value_sum += v
+                v = -v
+
+            done += 1
+
+            # Call progress callback with current stats
+            if progress_callback is not None and root.children:
+                try:
+                    progress_stats = []
+                    for m in root.children:
+                        child = root.children[m]
+                        try:
+                            san = board.san(m)
+                        except Exception:
+                            san = m.uci()
+                        progress_stats.append({
+                            "move": m.uci(),
+                            "san": san,
+                            "visits": child.visit_count,
+                            "q": -child.q() if child.visit_count > 0 else 0.0,
+                            "prior": child.prior
+                        })
+                    progress_stats.sort(key=lambda x: x["visits"], reverse=True)
+                    progress_callback({
+                        "done": done,
+                        "total": sims,
+                        "root_value": root_value,
+                        "children": progress_stats[:20]
+                    })
+                except Exception:
+                    pass
+    else:
+        # ── Batched path (lc0-style virtual loss gathering) ────────────────
+        _progress_interval = max(1, batch_size)  # callback once per batch
+
+        while done < sims:
+            if stop_check is not None and stop_check():
+                break
+
+            # How many leaves to gather this iteration (don't overshoot sims)
+            cur_batch = min(batch_size, sims - done)
+
+            # 1. Gather a mini-batch of leaves using virtual loss
+            leaves = _gather_batch(
+                root, board,
+                batch_size=cur_batch,
+                c_puct=float(settings.c_puct),
+                fpu_reduction=float(settings.fpu_reduction),
+                max_depth=max_depth,
+                time_history_s=time_history_s,
+            )
+
+            # 2. Batched NN evaluation (single GPU call)
+            eval_results = _evaluate_batch(
+                leaves,
                 backend=backend,
-                board=b,
                 ctx=ctx,
                 root_turn=root_turn,
-                time_history_s=th,
                 contempt=float(settings.contempt),
+                max_children=int(settings.max_children),
             )
-            node.pred_time_s = float(leaf_time_s)
 
-            priors2 = _prune_priors(priors2, max_children=int(settings.max_children))
-            if not node.expanded:
-                for mv2, p2 in priors2.items():
-                    node.children[mv2] = _Node(p2)
-                node.expanded = True
-                node_count += len(priors2)
+            # 3. Backpropagate all results + cancel collisions
+            real_done = _backprop_batch(leaves, eval_results)
 
-        # --- Backup ---
-        v = leaf_value
-        for n in reversed(path):
-            n.visit_count += 1
-            n.value_sum += v
-            v = -v
+            # Count expanded nodes
+            for leaf, res in zip(leaves, eval_results):
+                if res is not None and not leaf.is_collision:
+                    priors_dict = res[0]
+                    if priors_dict:
+                        node_count += len(priors_dict)
 
-        done += 1
-        
-        # Call progress callback with current stats
-        if progress_callback is not None and root.children:
-            try:
-                progress_stats = []
-                for m in root.children:
-                    child = root.children[m]
-                    try:
-                        san = board.san(m)
-                    except Exception:
-                        san = m.uci()
-                    progress_stats.append({
-                        "move": m.uci(),
-                        "san": san,
-                        "visits": child.visit_count,
-                        "q": -child.q() if child.visit_count > 0 else 0.0,
-                        "prior": child.prior
+            done += real_done
+
+            # Progress callback (once per batch for efficiency)
+            if progress_callback is not None and root.children:
+                try:
+                    progress_stats = []
+                    for m in root.children:
+                        child = root.children[m]
+                        try:
+                            san = board.san(m)
+                        except Exception:
+                            san = m.uci()
+                        progress_stats.append({
+                            "move": m.uci(),
+                            "san": san,
+                            "visits": child.visit_count,
+                            "q": -child.q() if child.visit_count > 0 else 0.0,
+                            "prior": child.prior
+                        })
+                    progress_stats.sort(key=lambda x: x["visits"], reverse=True)
+                    progress_callback({
+                        "done": done,
+                        "total": sims,
+                        "root_value": root_value,
+                        "children": progress_stats[:20]
                     })
-                progress_stats.sort(key=lambda x: x["visits"], reverse=True)
-                progress_callback({
-                    "done": done,
-                    "total": sims,
-                    "root_value": root_value,
-                    "children": progress_stats[:20]  # Limit to top 20 for efficiency
-                })
-            except Exception:
-                pass  # Progress callback must never break MCTS
+                except Exception:
+                    pass
 
     if not root.children:
         return MCTSResult(

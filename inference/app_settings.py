@@ -41,6 +41,8 @@ DEFAULT_GAME_SETTINGS: dict = {
     "mcts_adaptive": False,
     "mcts_adaptive_scale": 30.0,
     "mcts_contempt": 0.15,  # Penalize draws to avoid drawish positions when ahead
+    "mcts_fpu_reduction": 0.33,  # First Play Urgency reduction (lc0-style)
+    "mcts_batch_size": 16,  # Batched NN evaluation (1 = unbatched, 16-32 = ~5x faster on GPU)
     "mcts_simulate_time": False,  # Simulate remaining thinking time after MCTS completes
     "mcts_start_ply": 0,  # Ply at which MCTS kicks in (0 = from start, higher = skip opening for variety)
     "mcts_tree_reuse": True,  # Reuse search tree from previous position for better follow-up moves

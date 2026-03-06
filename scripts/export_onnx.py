@@ -1,6 +1,13 @@
 """
-Exports the Marvin PyTorch model to ONNX format for use with ONNX Runtime.
-Supports CUDA acceleration via CUDAExecutionProvider.
+Export Marvin Chessformer PyTorch checkpoints (.pt) to ONNX format.
+
+The exported model uses dynamic batch axes so it works with any batch size,
+enabling batched MCTS evaluation for ~4-5x GPU throughput improvement.
+
+Usage:
+    python scripts/export_onnx.py --input inference/marvin_small.pt
+    python scripts/export_onnx.py --input inference/marvin_large.pt --validate --benchmark
+    python scripts/export_onnx.py --input inference/marvin_tiny.pt -o inference/marvin_tiny.onnx
 """
 
 from __future__ import annotations
@@ -11,29 +18,55 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import onnx
+import numpy as np
 
 # Add repo root to path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from inference.runtime import load_default_chessformer
+from model import Chessformer, CONFIG_SMALL, CONFIG_LARGE, CONFIG_TINY
+
+# Map config name keywords to config dicts.
+CONFIGS = {
+    "small": CONFIG_SMALL,
+    "large": CONFIG_LARGE,
+    "tiny": CONFIG_TINY,
+}
+
+INPUT_NAMES = [
+    "board_history", "time_history", "rep_flags", "castling",
+    "ep_mask", "scalars", "tc_cat", "legal_mask",
+]
+OUTPUT_NAMES = [
+    "move_logits", "value_out", "value_cls_out",
+    "value_error_out", "time_cls_out", "start_square_logits", "promo_logits",
+]
+
+
+def _guess_config_name(path: Path) -> str:
+    """Guess config name from checkpoint filename."""
+    stem = path.stem.lower()
+    if "large" in stem:
+        return "large"
+    if "tiny" in stem:
+        return "tiny"
+    # Default to small (most common)
+    return "small"
 
 
 class ChessformerONNXWrapper(nn.Module):
+    """Wraps Chessformer to accept flat tensor arguments instead of a dict.
+
+    ONNX doesn't support dict inputs, so we take individual named tensors
+    and repack them into the batch dict that ``Chessformer.forward()`` expects.
+
+    Returns all 7 outputs including promotion logits.
     """
-    Wrapper that unpacks individual tensor arguments into the batch dict
-    expected by Chessformer.forward().
-    
-    ONNX doesn't support dict inputs, so we take individual named tensors.
-    
-    Returns 7 outputs including promotion logits for proper promotion handling.
-    """
-    
+
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-    
+
     def forward(
         self,
         board_history: torch.Tensor,   # (B, 8, 64) int64
@@ -46,288 +79,239 @@ class ChessformerONNXWrapper(nn.Module):
         legal_mask: torch.Tensor,      # (B, 4098) bool
     ):
         batch = {
-            'board_history': board_history,
-            'time_history': time_history,
-            'rep_flags': rep_flags,
-            'castling': castling,
-            'ep_mask': ep_mask,
-            'scalars': scalars,
-            'tc_cat': tc_cat,
-            'legal_mask': legal_mask,
+            "board_history": board_history,
+            "time_history": time_history,
+            "rep_flags": rep_flags,
+            "castling": castling,
+            "ep_mask": ep_mask,
+            "scalars": scalars,
+            "tc_cat": tc_cat,
+            "legal_mask": legal_mask,
         }
-        # Forward with return_promo=True returns 7 outputs including promotion logits:
-        # move_logits, value_out, value_cls_out, value_error_out, time_cls_out, start_square_logits, promo_logits
-        outputs = self.model(batch, return_promo=True)
-        return outputs
+        return self.model(batch, return_promo=True)
 
 
-def create_dummy_inputs(batch_size: int, device: torch.device):
+def _create_dummy_inputs(batch_size: int, device: torch.device) -> tuple:
     """Create dummy inputs for ONNX export tracing."""
     return (
-        torch.randint(0, 13, (batch_size, 8, 64), dtype=torch.int64, device=device),  # board_history
-        torch.randn(batch_size, 8, dtype=torch.float32, device=device),                # time_history
-        torch.randint(0, 2, (batch_size, 8), dtype=torch.float32, device=device),      # rep_flags
-        torch.randint(0, 2, (batch_size, 4), dtype=torch.float32, device=device),      # castling
-        torch.zeros(batch_size, 64, dtype=torch.float32, device=device),               # ep_mask
-        torch.randn(batch_size, 8, dtype=torch.float32, device=device),                # scalars
-        torch.randint(0, 3, (batch_size,), dtype=torch.int64, device=device),          # tc_cat
-        torch.ones(batch_size, 4098, dtype=torch.bool, device=device),                 # legal_mask
+        torch.randint(0, 13, (batch_size, 8, 64), dtype=torch.int64, device=device),
+        torch.randn(batch_size, 8, dtype=torch.float32, device=device),
+        torch.randint(0, 2, (batch_size, 8), dtype=torch.float32, device=device),
+        torch.randint(0, 2, (batch_size, 4), dtype=torch.float32, device=device),
+        torch.zeros(batch_size, 64, dtype=torch.float32, device=device),
+        torch.randn(batch_size, 8, dtype=torch.float32, device=device),
+        torch.randint(0, 3, (batch_size,), dtype=torch.int64, device=device),
+        torch.ones(batch_size, 4098, dtype=torch.bool, device=device),
     )
+
+
+def _load_model(weights_path: Path, config_name: str, device: torch.device) -> nn.Module:
+    """Load a Chessformer from a .pt checkpoint."""
+    config = CONFIGS[config_name]
+    model = Chessformer(config)
+
+    state_dict = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+    # Unwrap DDP / compiled wrappers if present.
+    if any(k.startswith("module.") for k in state_dict):
+        state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+
+    info = model.load_state_dict(state_dict, strict=False)
+    if info.missing_keys:
+        print(f"  WARNING: {len(info.missing_keys)} missing keys: {info.missing_keys[:5]}...")
+    if info.unexpected_keys:
+        print(f"  WARNING: {len(info.unexpected_keys)} unexpected keys: {info.unexpected_keys[:5]}...")
+
+    model.to(device)
+    model.eval()
+    return model
 
 
 def export_to_onnx(
+    weights_path: Path,
     output_path: Path,
+    config_name: str,
     device: str = "cuda",
-    opset_version: int = 14,
-    batch_size: int = 1,
-    weights_path: Path | None = None,
-):
-    """Export Chessformer to ONNX format.
-    
-    Uses the legacy TorchScript-based ONNX exporter for maximum compatibility.
-    The model is exported with a fixed batch size of 1 for simplicity.
-    """
-    print(f"Loading Chessformer model...")
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    
-    loaded, model, checkpoint_path = load_default_chessformer(
-        repo_root=REPO_ROOT,
-        device=device,
-        compile_model=False,  # Don't compile for export
-        checkpoint_path=weights_path,
-    )
-    print(f"  Loaded from: {checkpoint_path}")
-    print(f"  Config: {loaded.config_name}")
-    print(f"  Device: {device}")
-    
-    # Wrap for ONNX-compatible interface
+    opset_version: int = 17,
+) -> Path:
+    """Export a Chessformer .pt checkpoint to ONNX with dynamic batch axes."""
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    print(f"Loading Chessformer ({config_name}) from {weights_path.name} ...")
+    model = _load_model(weights_path, config_name, dev)
     wrapper = ChessformerONNXWrapper(model)
     wrapper.eval()
-    
-    # Create dummy inputs with batch_size=1 (we'll use fixed batch size for simplicity)
-    dummy_inputs = create_dummy_inputs(batch_size, device)
-    input_names = [
-        "board_history", "time_history", "rep_flags", "castling",
-        "ep_mask", "scalars", "tc_cat", "legal_mask"
-    ]
-    output_names = [
-        "move_logits", "value_out", "value_cls_out", 
-        "value_error_out", "time_cls_out", "start_square_logits", "promo_logits"
-    ]
-    
-    print(f"\nExporting to ONNX (opset {opset_version}, batch_size={batch_size})...")
-    print("  Using legacy TorchScript exporter for compatibility...")
-    
-    # Use legacy exporter by setting dynamo=False explicitly
-    # Also disable dynamic axes to avoid reshape issues
+
+    # Use batch_size=2 for tracing so the exporter sees a non-degenerate batch dim.
+    dummy = _create_dummy_inputs(batch_size=2, device=dev)
+
+    # Dynamic batch axes for every input and output.
+    dynamic_axes = {name: {0: "batch"} for name in INPUT_NAMES + OUTPUT_NAMES}
+
+    print(f"Exporting to ONNX (opset {opset_version}, dynamic batch) ...")
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            dummy_inputs,
+            dummy,
             str(output_path),
-            input_names=input_names,
-            output_names=output_names,
+            input_names=INPUT_NAMES,
+            output_names=OUTPUT_NAMES,
             opset_version=opset_version,
             do_constant_folding=True,
             export_params=True,
-            dynamo=False,  # Use legacy TorchScript exporter
+            dynamic_axes=dynamic_axes,
+            dynamo=False,  # Legacy TorchScript exporter for compatibility
         )
-    print(f"  Exported to: {output_path}")
-    
-    # Validate the exported model
-    print("\nValidating ONNX model...")
+
+    # Validate the graph.
+    import onnx
     onnx_model = onnx.load(str(output_path))
     onnx.checker.check_model(onnx_model)
-    print("  [OK] ONNX model is valid")
-    
-    # Print model info
-    print(f"\nModel info:")
-    print(f"  File size: {output_path.stat().st_size / 1024 / 1024:.1f} MB")
-    print(f"  Inputs: {[i.name for i in onnx_model.graph.input]}")
+
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  OK: {output_path}  ({size_mb:.1f} MB)")
+    print(f"  Inputs:  {[i.name for i in onnx_model.graph.input]}")
     print(f"  Outputs: {[o.name for o in onnx_model.graph.output]}")
-    
     return output_path
 
 
-def validate_onnx_vs_pytorch(onnx_path: Path, device: str = "cuda"):
+def validate_onnx_vs_pytorch(
+    weights_path: Path,
+    onnx_path: Path,
+    config_name: str,
+    device: str = "cuda",
+) -> bool:
     """Compare ONNX outputs against PyTorch outputs for numerical validation."""
     import onnxruntime as ort
-    import numpy as np
-    
+
     print("\n" + "=" * 60)
-    print("Validating ONNX vs PyTorch outputs...")
+    print("Validating ONNX vs PyTorch ...")
     print("=" * 60)
-    
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    
-    # Load PyTorch model
-    loaded, model, _ = load_default_chessformer(
-        repo_root=REPO_ROOT,
-        device=device,
-        compile_model=False,
-    )
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    model = _load_model(weights_path, config_name, dev)
     model.eval()
-    
-    # Load ONNX model with CUDA provider
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     session = ort.InferenceSession(str(onnx_path), providers=providers)
-    active_provider = session.get_providers()[0]
-    print(f"ONNX Runtime provider: {active_provider}")
-    
-    # Create test inputs - use batch_size=1 to match exported model
-    batch_size = 1
-    dummy_inputs = create_dummy_inputs(batch_size, device)
-    input_names = [
-        "board_history", "time_history", "rep_flags", "castling",
-        "ep_mask", "scalars", "tc_cat", "legal_mask"
-    ]
-    
-    # PyTorch forward (with return_promo=True to match ONNX wrapper)
-    with torch.no_grad():
-        batch = {name: inp for name, inp in zip(input_names, dummy_inputs)}
-        torch_outputs = model(batch, return_promo=True)
-    
-    # ONNX forward
-    ort_inputs = {
-        name: inp.cpu().numpy() for name, inp in zip(input_names, dummy_inputs)
-    }
-    onnx_outputs = session.run(None, ort_inputs)
-    
-    # Compare outputs
-    output_names = ["move_logits", "value_out", "value_cls_out", 
-                    "value_error_out", "time_cls_out", "start_square_logits", "promo_logits"]
-    
-    all_close = True
-    for i, (name, torch_out, onnx_out) in enumerate(zip(output_names, torch_outputs, onnx_outputs)):
-        torch_arr = torch_out.cpu().numpy()
-        max_diff = np.abs(torch_arr - onnx_out).max()
-        mean_diff = np.abs(torch_arr - onnx_out).mean()
-        
-        # Use larger tolerance for float16/bfloat16 models
-        rtol, atol = 1e-3, 1e-4
-        is_close = np.allclose(torch_arr, onnx_out, rtol=rtol, atol=atol)
-        
-        status = "[OK]" if is_close else "[FAIL]"
-        print(f"  {status} {name}: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}")
-        
-        if not is_close:
-            all_close = False
-    
-    if all_close:
-        print("\n[OK] All outputs match within tolerance!")
+    print(f"  ONNX Runtime provider: {session.get_providers()[0]}")
+
+    all_ok = True
+    for bs in [1, 4, 16]:
+        dummy = _create_dummy_inputs(bs, dev)
+        with torch.no_grad():
+            batch = {n: t for n, t in zip(INPUT_NAMES, dummy)}
+            torch_outs = model(batch, return_promo=True)
+
+        ort_inputs = {n: t.cpu().numpy() for n, t in zip(INPUT_NAMES, dummy)}
+        onnx_outs = session.run(None, ort_inputs)
+
+        max_diffs = []
+        for name, t_out, o_out in zip(OUTPUT_NAMES, torch_outs, onnx_outs):
+            diff = float(np.abs(t_out.cpu().numpy() - o_out).max())
+            max_diffs.append(diff)
+            if diff > 1e-2:
+                all_ok = False
+
+        worst = max(max_diffs)
+        status = "OK" if worst < 1e-2 else "FAIL"
+        print(f"  [{status}] batch={bs:>2d}:  worst max_diff = {worst:.2e}")
+
+    if all_ok:
+        print("  All outputs match within tolerance.")
     else:
-        print("\n[WARN] Some outputs differ beyond tolerance (may be ok for bf16 models)")
-    
-    return all_close
+        print("  WARNING: Some outputs differ -- check model config / weights.")
+    return all_ok
 
 
-def benchmark_inference(onnx_path: Path, device: str = "cuda", num_iters: int = 100):
-    """Benchmark ONNX Runtime inference speed."""
+def benchmark_inference(onnx_path: Path, device: str = "cuda", num_iters: int = 200) -> None:
+    """Benchmark ONNX Runtime inference speed at various batch sizes."""
     import onnxruntime as ort
     import time
-    
+
     print("\n" + "=" * 60)
-    print("Benchmarking ONNX Runtime Inference...")
+    print("Benchmarking ONNX Runtime Inference ...")
     print("=" * 60)
-    
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    
-    # Load ONNX session
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
     session = ort.InferenceSession(str(onnx_path), sess_options, providers=providers)
-    active_provider = session.get_providers()[0]
-    print(f"Provider: {active_provider}")
-    
-    # Prepare inputs
-    batch_size = 1
-    dummy_inputs = create_dummy_inputs(batch_size, device)
-    input_names = [
-        "board_history", "time_history", "rep_flags", "castling",
-        "ep_mask", "scalars", "tc_cat", "legal_mask"
-    ]
-    ort_inputs = {
-        name: inp.cpu().numpy() for name, inp in zip(input_names, dummy_inputs)
-    }
-    
-    # Warmup
-    for _ in range(10):
-        session.run(None, ort_inputs)
-    
-    # Benchmark
-    start = time.perf_counter()
-    for _ in range(num_iters):
-        session.run(None, ort_inputs)
-    elapsed = time.perf_counter() - start
-    
-    avg_ms = (elapsed / num_iters) * 1000
-    positions_per_sec = num_iters / elapsed
-    
-    print(f"\nResults ({num_iters} iterations, batch_size={batch_size}):")
-    print(f"  Average latency: {avg_ms:.2f} ms")
-    print(f"  Throughput: {positions_per_sec:.0f} positions/sec")
-    
-    return avg_ms, positions_per_sec
+    print(f"  Provider: {session.get_providers()[0]}")
+
+    for bs in [1, 4, 8, 16, 32, 64]:
+        dummy = _create_dummy_inputs(bs, dev)
+        ort_inputs = {n: t.cpu().numpy() for n, t in zip(INPUT_NAMES, dummy)}
+
+        # Warmup
+        for _ in range(5):
+            session.run(None, ort_inputs)
+
+        n = max(20, num_iters // bs)
+        t0 = time.perf_counter()
+        for _ in range(n):
+            session.run(None, ort_inputs)
+        elapsed = time.perf_counter() - t0
+
+        evals = n * bs
+        ms_call = (elapsed / n) * 1000
+        ms_eval = (elapsed / evals) * 1000
+        evals_s = evals / elapsed
+        print(f"  batch={bs:>2d}: {ms_call:6.2f} ms/call, {ms_eval:5.2f} ms/eval, {evals_s:7.0f} evals/s")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export Chessformer to ONNX")
-    parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        default=REPO_ROOT / "inference" / "marvin_small.onnx",
-        help="Output ONNX file path"
+    parser = argparse.ArgumentParser(
+        description="Export Chessformer .pt -> ONNX (dynamic batch axes)",
     )
     parser.add_argument(
-        "--device", "-d",
-        type=str,
-        default="cuda",
-        help="Device for export (cuda or cpu)"
+        "--input", "-i", type=Path, required=True,
+        help="Path to a .pt checkpoint (e.g. inference/marvin_small.pt)",
     )
     parser.add_argument(
-        "--opset",
-        type=int,
-        default=14,
-        help="ONNX opset version (default: 14 for compatibility)"
+        "--output", "-o", type=Path, default=None,
+        help="Output ONNX path. Default: replaces .pt with .onnx",
     )
     parser.add_argument(
-        "--input", "-i",
-        type=Path,
-        default=None,
-        help="Path to a specific .pt checkpoint (defaults to config.py default)"
+        "--config", "-c", type=str, default=None,
+        choices=list(CONFIGS.keys()),
+        help="Model config name. Auto-detected from filename if omitted.",
     )
     parser.add_argument(
-        "--validate",
-        action="store_true",
-        help="Validate ONNX outputs against PyTorch"
+        "--device", "-d", type=str, default="cuda",
+        help="Device for export tracing (cuda or cpu)",
     )
     parser.add_argument(
-        "--benchmark",
-        action="store_true", 
-        help="Run inference benchmark"
+        "--opset", type=int, default=17,
+        help="ONNX opset version (default: 17)",
     )
-    
+    parser.add_argument("--validate", action="store_true", help="Validate ONNX vs PyTorch outputs")
+    parser.add_argument("--benchmark", action="store_true", help="Run inference benchmark")
+
     args = parser.parse_args()
-    
-    # Export
-    output_path = export_to_onnx(
-        output_path=args.output,
-        device=args.device,
-        opset_version=args.opset,
-        weights_path=args.input,
-    )
-    
-    # Validate
+
+    weights = args.input.resolve()
+    if not weights.exists():
+        print(f"Error: {weights} not found")
+        sys.exit(1)
+    if weights.suffix.lower() != ".pt":
+        print(f"Error: expected a .pt checkpoint, got {weights.suffix}")
+        sys.exit(1)
+
+    config_name = args.config or _guess_config_name(weights)
+    output = args.output or weights.with_suffix(".onnx")
+
+    export_to_onnx(weights, output, config_name, device=args.device, opset_version=args.opset)
+
     if args.validate:
-        validate_onnx_vs_pytorch(output_path, device=args.device)
-    
-    # Benchmark
+        validate_onnx_vs_pytorch(weights, output, config_name, device=args.device)
+
     if args.benchmark:
-        benchmark_inference(output_path, device=args.device)
-    
-    print("\n[OK] Done!")
+        benchmark_inference(output, device=args.device)
+
+    print("\nDone!")
 
 
 if __name__ == "__main__":

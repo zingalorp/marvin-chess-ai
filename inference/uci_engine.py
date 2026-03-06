@@ -158,8 +158,9 @@ class UciEngine:
             _Option("MCTSMaxDepth", "spin", int(self.settings["mcts_max_depth"]), min=1, max=512),
             _Option("MCTSAdaptive", "check", bool(self.settings["mcts_adaptive"])),
             _Option("MCTSAdaptiveScale", "string", str(self.settings["mcts_adaptive_scale"])),
-            _Option("MCTSFPU", "string", str(self.settings.get("mcts_fpu_reduction", 0.0))),
+            _Option("MCTSFPU", "string", str(self.settings.get("mcts_fpu_reduction", 0.33))),
             _Option("MCTSContempt", "string", str(self.settings.get("mcts_contempt", 0.15))),
+            _Option("MCTSBatchSize", "spin", int(self.settings.get("mcts_batch_size", 16)), min=1, max=256),
             _Option("MCTSSimulateTime", "check", bool(self.settings.get("mcts_simulate_time", False))),
             _Option("MCTSStartPly", "spin", int(self.settings.get("mcts_start_ply", 0)), min=0, max=100),
             _Option("MCTSTreeReuse", "check", bool(self.settings.get("mcts_tree_reuse", False))),
@@ -452,6 +453,8 @@ class UciEngine:
             set_setting("mcts_fpu_reduction", float(value))
         elif name_key == "mctscontempt":
             set_setting("mcts_contempt", float(value))
+        elif name_key == "mctsbatchsize":
+            set_setting("mcts_batch_size", int(float(value)))
         elif name_key == "mctssimulatetime":
             set_setting("mcts_simulate_time", _bool_from_uci(value))
         elif name_key == "mctsstartply":
