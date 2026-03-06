@@ -800,6 +800,10 @@ def mcts_choose_move(
     sims = max(1, int(settings.simulations))
     max_depth = max(1, int(settings.max_depth))
     batch_size = max(1, int(getattr(settings, "batch_size", 1)))
+    # Batching only helps on GPU; fall back to unbatched on CPU to avoid
+    # the numpy stack/concat overhead with no parallelism benefit.
+    if batch_size > 1 and getattr(backend, "device", "cpu") == "cpu":
+        batch_size = 1
 
     # Lightweight diagnostics counters (minimal overhead)
     done = 0
